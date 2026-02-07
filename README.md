@@ -3,9 +3,9 @@
   <tr>
     <td align="left" valign="bottom" style="border: none; padding-right: 30px;">
 <pre>
-▐▀▀▀▀▀▀▀▀▌
-▐ fRISCy ▌&nbsp;&nbsp;&nbsp;&nbsp;<strong>fast oci runtime for the browser</strong>
-▐▄▄▄▄▄▄▄▄▌
+▐▀▀▀▀▀▀▀▌
+▐ fRISCy ⸎&nbsp;&nbsp; <strong>fast risc-v runtime for the browser</strong>
+▐▄▄▄▄▄▄▄▌
 </pre>
       <br>
       <strong>        friscy runs docker containers in WebAssembly by:</strong>

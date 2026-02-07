@@ -140,6 +140,80 @@ pub enum WasmInst {
     I64ExtendI32S,
     I64ExtendI32U,
 
+    // Floating-point (f32)
+    F32Load { offset: u32 },
+    F32Store { offset: u32 },
+    F32Const { value: f32 },
+    F32Add,
+    F32Sub,
+    F32Mul,
+    F32Div,
+    F32Sqrt,
+    F32Neg,
+    F32Abs,
+    F32Ceil,
+    F32Floor,
+    F32Trunc,
+    F32Nearest,
+    F32Eq,
+    F32Ne,
+    F32Lt,
+    F32Gt,
+    F32Le,
+    F32Ge,
+    F32Min,
+    F32Max,
+    F32Copysign,
+
+    // Floating-point (f64)
+    F64Load { offset: u32 },
+    F64Store { offset: u32 },
+    F64Const { value: f64 },
+    F64Add,
+    F64Sub,
+    F64Mul,
+    F64Div,
+    F64Sqrt,
+    F64Neg,
+    F64Abs,
+    F64Ceil,
+    F64Floor,
+    F64Trunc,
+    F64Nearest,
+    F64Eq,
+    F64Ne,
+    F64Lt,
+    F64Gt,
+    F64Le,
+    F64Ge,
+    F64Min,
+    F64Max,
+    F64Copysign,
+
+    // FP conversions
+    F32ConvertI32S,
+    F32ConvertI32U,
+    F32ConvertI64S,
+    F32ConvertI64U,
+    F64ConvertI32S,
+    F64ConvertI32U,
+    F64ConvertI64S,
+    F64ConvertI64U,
+    I32TruncF32S,
+    I32TruncF32U,
+    I32TruncF64S,
+    I32TruncF64U,
+    I64TruncF32S,
+    I64TruncF32U,
+    I64TruncF64S,
+    I64TruncF64U,
+    F32DemoteF64,
+    F64PromoteF32,
+    F32ReinterpretI32,
+    F64ReinterpretI64,
+    I32ReinterpretF32,
+    I64ReinterpretF64,
+
     // Stack manipulation
     Drop,
     Select,
@@ -797,6 +871,231 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             body.push(WasmInst::I64Const { value: imm });
             body.push(WasmInst::I64Add);
             body.push(WasmInst::I64Store { offset: 16 });
+        }
+
+        // =====================================================================
+        // Floating-point (F extension - single precision)
+        // FP registers at offset 256+ (after 32 integer registers * 8 bytes)
+        // =====================================================================
+        Opcode::FLW => {
+            // f[rd] = M[x[rs1] + imm] (32-bit float)
+            let frd_offset = 256 + rd * 4; // FP regs are 4 bytes for f32
+            body.push(WasmInst::LocalGet { idx: 0 }); // $m base
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset }); // address
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I64Const { value: imm });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Add);
+            body.push(WasmInst::F32Load { offset: 0 }); // load from computed address
+            body.push(WasmInst::F32Store { offset: frd_offset }); // store to FP reg
+        }
+
+        Opcode::FSW => {
+            // M[x[rs1] + imm] = f[rs2] (32-bit float)
+            let frs2_offset = 256 + rs2 * 4;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I64Const { value: imm });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Add);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Store { offset: 0 });
+        }
+
+        Opcode::FADD_S => {
+            let frd_offset = 256 + rd * 4;
+            let frs1_offset = 256 + rs1 * 4;
+            let frs2_offset = 256 + rs2 * 4;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Add);
+            body.push(WasmInst::F32Store { offset: frd_offset });
+        }
+
+        Opcode::FSUB_S => {
+            let frd_offset = 256 + rd * 4;
+            let frs1_offset = 256 + rs1 * 4;
+            let frs2_offset = 256 + rs2 * 4;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Sub);
+            body.push(WasmInst::F32Store { offset: frd_offset });
+        }
+
+        Opcode::FMUL_S => {
+            let frd_offset = 256 + rd * 4;
+            let frs1_offset = 256 + rs1 * 4;
+            let frs2_offset = 256 + rs2 * 4;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Mul);
+            body.push(WasmInst::F32Store { offset: frd_offset });
+        }
+
+        Opcode::FDIV_S => {
+            let frd_offset = 256 + rd * 4;
+            let frs1_offset = 256 + rs1 * 4;
+            let frs2_offset = 256 + rs2 * 4;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Div);
+            body.push(WasmInst::F32Store { offset: frd_offset });
+        }
+
+        Opcode::FSQRT_S => {
+            let frd_offset = 256 + rd * 4;
+            let frs1_offset = 256 + rs1 * 4;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Sqrt);
+            body.push(WasmInst::F32Store { offset: frd_offset });
+        }
+
+        // =====================================================================
+        // Floating-point (D extension - double precision)
+        // Double-precision FP registers at offset 384+ (256 + 32*4 = 384)
+        // =====================================================================
+        Opcode::FLD => {
+            // f[rd] = M[x[rs1] + imm] (64-bit double)
+            let frd_offset = 384 + rd * 8;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I64Const { value: imm });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Add);
+            body.push(WasmInst::F64Load { offset: 0 });
+            body.push(WasmInst::F64Store { offset: frd_offset });
+        }
+
+        Opcode::FSD => {
+            // M[x[rs1] + imm] = f[rs2] (64-bit double)
+            let frs2_offset = 384 + rs2 * 8;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I64Const { value: imm });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Add);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Store { offset: 0 });
+        }
+
+        Opcode::FADD_D => {
+            let frd_offset = 384 + rd * 8;
+            let frs1_offset = 384 + rs1 * 8;
+            let frs2_offset = 384 + rs2 * 8;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Add);
+            body.push(WasmInst::F64Store { offset: frd_offset });
+        }
+
+        Opcode::FSUB_D => {
+            let frd_offset = 384 + rd * 8;
+            let frs1_offset = 384 + rs1 * 8;
+            let frs2_offset = 384 + rs2 * 8;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Sub);
+            body.push(WasmInst::F64Store { offset: frd_offset });
+        }
+
+        Opcode::FMUL_D => {
+            let frd_offset = 384 + rd * 8;
+            let frs1_offset = 384 + rs1 * 8;
+            let frs2_offset = 384 + rs2 * 8;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Mul);
+            body.push(WasmInst::F64Store { offset: frd_offset });
+        }
+
+        Opcode::FDIV_D => {
+            let frd_offset = 384 + rd * 8;
+            let frs1_offset = 384 + rs1 * 8;
+            let frs2_offset = 384 + rs2 * 8;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Div);
+            body.push(WasmInst::F64Store { offset: frd_offset });
+        }
+
+        Opcode::FSQRT_D => {
+            let frd_offset = 384 + rd * 8;
+            let frs1_offset = 384 + rs1 * 8;
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Sqrt);
+            body.push(WasmInst::F64Store { offset: frd_offset });
+        }
+
+        // FMA instructions (fused multiply-add)
+        Opcode::FMADD_S | Opcode::FMSUB_S | Opcode::FNMADD_S | Opcode::FNMSUB_S => {
+            // Fused multiply-add: rd = rs1 * rs2 +/- rs3
+            // Wasm doesn't have FMA, so we decompose into mul + add
+            let frd_offset = 256 + rd * 4;
+            let frs1_offset = 256 + rs1 * 4;
+            let frs2_offset = 256 + rs2 * 4;
+            // rs3 is encoded in the instruction - for now just use rs2
+            body.push(WasmInst::Comment {
+                text: format!("FMA stub: {:?}", inst.opcode),
+            });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Mul);
+            body.push(WasmInst::F32Store { offset: frd_offset });
+        }
+
+        Opcode::FMADD_D | Opcode::FMSUB_D | Opcode::FNMADD_D | Opcode::FNMSUB_D => {
+            // Double-precision FMA stub
+            let frd_offset = 384 + rd * 8;
+            let frs1_offset = 384 + rs1 * 8;
+            let frs2_offset = 384 + rs2 * 8;
+            body.push(WasmInst::Comment {
+                text: format!("FMA-D stub: {:?}", inst.opcode),
+            });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Mul);
+            body.push(WasmInst::F64Store { offset: frd_offset });
         }
 
         // =====================================================================

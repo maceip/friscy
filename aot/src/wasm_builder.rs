@@ -612,13 +612,234 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
             func.instruction(&Instruction::Select);
         }
 
+        // Floating-point (f32)
+        WasmInst::F32Load { offset } => {
+            func.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
+                offset: *offset as u64,
+                align: 2,
+                memory_index: 0,
+            }));
+        }
+        WasmInst::F32Store { offset } => {
+            func.instruction(&Instruction::F32Store(wasm_encoder::MemArg {
+                offset: *offset as u64,
+                align: 2,
+                memory_index: 0,
+            }));
+        }
+        WasmInst::F32Const { value } => {
+            func.instruction(&Instruction::F32Const(*value));
+        }
+        WasmInst::F32Add => {
+            func.instruction(&Instruction::F32Add);
+        }
+        WasmInst::F32Sub => {
+            func.instruction(&Instruction::F32Sub);
+        }
+        WasmInst::F32Mul => {
+            func.instruction(&Instruction::F32Mul);
+        }
+        WasmInst::F32Div => {
+            func.instruction(&Instruction::F32Div);
+        }
+        WasmInst::F32Sqrt => {
+            func.instruction(&Instruction::F32Sqrt);
+        }
+        WasmInst::F32Neg => {
+            func.instruction(&Instruction::F32Neg);
+        }
+        WasmInst::F32Abs => {
+            func.instruction(&Instruction::F32Abs);
+        }
+        WasmInst::F32Ceil => {
+            func.instruction(&Instruction::F32Ceil);
+        }
+        WasmInst::F32Floor => {
+            func.instruction(&Instruction::F32Floor);
+        }
+        WasmInst::F32Trunc => {
+            func.instruction(&Instruction::F32Trunc);
+        }
+        WasmInst::F32Nearest => {
+            func.instruction(&Instruction::F32Nearest);
+        }
+        WasmInst::F32Eq => {
+            func.instruction(&Instruction::F32Eq);
+        }
+        WasmInst::F32Ne => {
+            func.instruction(&Instruction::F32Ne);
+        }
+        WasmInst::F32Lt => {
+            func.instruction(&Instruction::F32Lt);
+        }
+        WasmInst::F32Gt => {
+            func.instruction(&Instruction::F32Gt);
+        }
+        WasmInst::F32Le => {
+            func.instruction(&Instruction::F32Le);
+        }
+        WasmInst::F32Ge => {
+            func.instruction(&Instruction::F32Ge);
+        }
+        WasmInst::F32Min => {
+            func.instruction(&Instruction::F32Min);
+        }
+        WasmInst::F32Max => {
+            func.instruction(&Instruction::F32Max);
+        }
+        WasmInst::F32Copysign => {
+            func.instruction(&Instruction::F32Copysign);
+        }
+
+        // Floating-point (f64)
+        WasmInst::F64Load { offset } => {
+            func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                offset: *offset as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
+        WasmInst::F64Store { offset } => {
+            func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                offset: *offset as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
+        WasmInst::F64Const { value } => {
+            func.instruction(&Instruction::F64Const(*value));
+        }
+        WasmInst::F64Add => {
+            func.instruction(&Instruction::F64Add);
+        }
+        WasmInst::F64Sub => {
+            func.instruction(&Instruction::F64Sub);
+        }
+        WasmInst::F64Mul => {
+            func.instruction(&Instruction::F64Mul);
+        }
+        WasmInst::F64Div => {
+            func.instruction(&Instruction::F64Div);
+        }
+        WasmInst::F64Sqrt => {
+            func.instruction(&Instruction::F64Sqrt);
+        }
+        WasmInst::F64Neg => {
+            func.instruction(&Instruction::F64Neg);
+        }
+        WasmInst::F64Abs => {
+            func.instruction(&Instruction::F64Abs);
+        }
+        WasmInst::F64Ceil => {
+            func.instruction(&Instruction::F64Ceil);
+        }
+        WasmInst::F64Floor => {
+            func.instruction(&Instruction::F64Floor);
+        }
+        WasmInst::F64Trunc => {
+            func.instruction(&Instruction::F64Trunc);
+        }
+        WasmInst::F64Nearest => {
+            func.instruction(&Instruction::F64Nearest);
+        }
+        WasmInst::F64Eq => {
+            func.instruction(&Instruction::F64Eq);
+        }
+        WasmInst::F64Ne => {
+            func.instruction(&Instruction::F64Ne);
+        }
+        WasmInst::F64Lt => {
+            func.instruction(&Instruction::F64Lt);
+        }
+        WasmInst::F64Gt => {
+            func.instruction(&Instruction::F64Gt);
+        }
+        WasmInst::F64Le => {
+            func.instruction(&Instruction::F64Le);
+        }
+        WasmInst::F64Ge => {
+            func.instruction(&Instruction::F64Ge);
+        }
+        WasmInst::F64Min => {
+            func.instruction(&Instruction::F64Min);
+        }
+        WasmInst::F64Max => {
+            func.instruction(&Instruction::F64Max);
+        }
+        WasmInst::F64Copysign => {
+            func.instruction(&Instruction::F64Copysign);
+        }
+
+        // FP conversions
+        WasmInst::F32ConvertI32S => {
+            func.instruction(&Instruction::F32ConvertI32S);
+        }
+        WasmInst::F32ConvertI32U => {
+            func.instruction(&Instruction::F32ConvertI32U);
+        }
+        WasmInst::F32ConvertI64S => {
+            func.instruction(&Instruction::F32ConvertI64S);
+        }
+        WasmInst::F32ConvertI64U => {
+            func.instruction(&Instruction::F32ConvertI64U);
+        }
+        WasmInst::F64ConvertI32S => {
+            func.instruction(&Instruction::F64ConvertI32S);
+        }
+        WasmInst::F64ConvertI32U => {
+            func.instruction(&Instruction::F64ConvertI32U);
+        }
+        WasmInst::F64ConvertI64S => {
+            func.instruction(&Instruction::F64ConvertI64S);
+        }
+        WasmInst::F64ConvertI64U => {
+            func.instruction(&Instruction::F64ConvertI64U);
+        }
+        WasmInst::I32TruncF32S => {
+            func.instruction(&Instruction::I32TruncF32S);
+        }
+        WasmInst::I32TruncF32U => {
+            func.instruction(&Instruction::I32TruncF32U);
+        }
+        WasmInst::I32TruncF64S => {
+            func.instruction(&Instruction::I32TruncF64S);
+        }
+        WasmInst::I32TruncF64U => {
+            func.instruction(&Instruction::I32TruncF64U);
+        }
+        WasmInst::I64TruncF32S => {
+            func.instruction(&Instruction::I64TruncF32S);
+        }
+        WasmInst::I64TruncF32U => {
+            func.instruction(&Instruction::I64TruncF32U);
+        }
+        WasmInst::I64TruncF64S => {
+            func.instruction(&Instruction::I64TruncF64S);
+        }
+        WasmInst::I64TruncF64U => {
+            func.instruction(&Instruction::I64TruncF64U);
+        }
+        WasmInst::F32DemoteF64 => {
+            func.instruction(&Instruction::F32DemoteF64);
+        }
+        WasmInst::F64PromoteF32 => {
+            func.instruction(&Instruction::F64PromoteF32);
+        }
+        WasmInst::F32ReinterpretI32 => {
+            func.instruction(&Instruction::F32ReinterpretI32);
+        }
+        WasmInst::F64ReinterpretI64 => {
+            func.instruction(&Instruction::F64ReinterpretI64);
+        }
+        WasmInst::I32ReinterpretF32 => {
+            func.instruction(&Instruction::I32ReinterpretF32);
+        }
+        WasmInst::I64ReinterpretF64 => {
+            func.instruction(&Instruction::I64ReinterpretF64);
+        }
+
         // Comments are no-ops
         WasmInst::Comment { .. } => {}
-
-        // Unimplemented instructions
-        _ => {
-            // Skip unimplemented for now
-        }
     }
 
     Ok(())

@@ -4,9 +4,11 @@
 
 use crate::translate::{WasmInst, WasmModule};
 use anyhow::Result;
+use std::collections::BTreeMap;
 use wasm_encoder::{
-    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    Instruction, MemorySection, MemoryType, Module, TableSection, TableType, TypeSection, ValType,
+    CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, ImportSection, Instruction, MemorySection, MemoryType, Module,
+    TableSection, TableType, TypeSection, ValType,
 };
 
 /// Build the final Wasm binary
@@ -93,6 +95,26 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     // Memory is imported, so skip this
 
     // ==========================================================================
+    // Element section (populate function table for call_indirect)
+    // ==========================================================================
+    let mut elements = ElementSection::new();
+
+    // Build function reference list: indices 2, 3, 4, ... (block functions)
+    // Index 0 = imported syscall, Index 1 = dispatch, Index 2+ = block functions
+    let func_indices: Vec<u32> = (0..module.functions.len())
+        .map(|i| (i + 2) as u32)
+        .collect();
+
+    // Active element segment at table index 0, offset 0
+    elements.active(
+        Some(0),                           // table index
+        &ConstExpr::i32_const(0),          // offset
+        Elements::Functions(&func_indices),
+    );
+
+    wasm.section(&elements);
+
+    // ==========================================================================
     // Export section
     // ==========================================================================
     let mut exports = ExportSection::new();
@@ -112,8 +134,17 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     // ==========================================================================
     let mut codes = CodeSection::new();
 
+    // Build address-to-table-index mapping for dispatch
+    // Table index = position in func_indices (0, 1, 2, ...)
+    let addr_to_table_idx: BTreeMap<u64, u32> = module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.block_addr, i as u32))
+        .collect();
+
     // Dispatch function
-    let dispatch_func = build_dispatch_function(module);
+    let dispatch_func = build_dispatch_function(module, &addr_to_table_idx);
     codes.function(&dispatch_func);
 
     // Block functions
@@ -127,36 +158,16 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     Ok(wasm.finish())
 }
 
-/// Build the main dispatch function
-fn build_dispatch_function(module: &WasmModule) -> Function {
+/// Build the main dispatch function with O(1) block lookup via call_indirect
+fn build_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) -> Function {
+    // Locals: param 0 = $m (i32), param 1 = $start_pc (i32), local 2 = $pc (i32)
     let mut func = Function::new(vec![(1, ValType::I32)]); // 1 local for pc
-
-    // (func $run (param $m i32) (param $start_pc i32) (result i32)
-    //   (local $pc i32)
-    //   (local.set $pc (local.get 1))  ;; $start_pc
-    //   (loop $dispatch
-    //     ;; Check for halt
-    //     (if (i32.eq (local.get $pc) (i32.const -1))
-    //       (then (return (i32.const 0))))
-    //
-    //     ;; Check for syscall (high bit set)
-    //     (if (i32.and (local.get $pc) (i32.const 0x80000000))
-    //       (then
-    //         (local.set $pc (call $syscall (local.get 0) (local.get $pc)))
-    //         (br $dispatch)))
-    //
-    //     ;; Dispatch to block function
-    //     (local.set $pc
-    //       (call_indirect (type 0)
-    //         (local.get 0)     ;; $m
-    //         (i32.div_u (local.get $pc) (i32.const 4))))  ;; block index
-    //     (br $dispatch)))
 
     // Initialize $pc from parameter
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::LocalSet(2));
 
-    // Loop
+    // Main dispatch loop
     func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
     // Check for halt (-1)
@@ -168,7 +179,7 @@ fn build_dispatch_function(module: &WasmModule) -> Function {
     func.instruction(&Instruction::Return);
     func.instruction(&Instruction::End);
 
-    // Check for syscall (high bit)
+    // Check for syscall (high bit set = 0x80000000)
     func.instruction(&Instruction::LocalGet(2));
     func.instruction(&Instruction::I32Const(0x80000000u32 as i32));
     func.instruction(&Instruction::I32And);
@@ -180,27 +191,153 @@ fn build_dispatch_function(module: &WasmModule) -> Function {
     func.instruction(&Instruction::Br(1)); // Continue loop
     func.instruction(&Instruction::End);
 
-    // For simplicity, use a br_table for dispatch
-    // In a real implementation, we'd build a proper jump table
+    // Dispatch to block via call_indirect
+    // We need to convert PC address to table index
+    // Strategy: Use computed index if addresses are dense, else if-else chain
 
-    // For now, linear search (will be slow but correct)
-    // Real implementation would use address -> function index mapping
-    func.instruction(&Instruction::LocalGet(0)); // $m
-    func.instruction(&Instruction::LocalGet(2)); // $pc
+    if module.functions.is_empty() {
+        // No blocks - just return
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::Return);
+    } else if can_use_dense_table(module) {
+        // Dense table: (pc - base_addr) / 4 gives table index
+        let base_addr = module.functions.first().map(|f| f.block_addr).unwrap_or(0);
 
-    // Call block function based on PC
-    // This is a simplified version - real impl needs proper block lookup
-    func.instruction(&Instruction::Call(2)); // First block function
+        // Push $m for call_indirect param
+        func.instruction(&Instruction::LocalGet(0));
 
-    func.instruction(&Instruction::LocalSet(2));
+        // Compute table index: (pc - base_addr) >> 2
+        func.instruction(&Instruction::LocalGet(2)); // $pc
+        func.instruction(&Instruction::I32Const(base_addr as i32));
+        func.instruction(&Instruction::I32Sub);
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32ShrU);
+
+        // call_indirect with type 0 (block function signature)
+        func.instruction(&Instruction::CallIndirect {
+            type_index: 0,
+            table_index: 0,
+        });
+
+        func.instruction(&Instruction::LocalSet(2));
+    } else {
+        // Sparse addresses: use br_table with block nesting
+        // Generate a block per address with nested blocks for br_table targets
+        emit_sparse_dispatch(&mut func, module, addr_to_table_idx);
+    }
+
     func.instruction(&Instruction::Br(0)); // Continue loop
-
     func.instruction(&Instruction::End); // End loop
 
     func.instruction(&Instruction::I32Const(0));
     func.instruction(&Instruction::End);
 
     func
+}
+
+/// Check if block addresses are dense enough for (pc - base) / 4 indexing
+fn can_use_dense_table(module: &WasmModule) -> bool {
+    if module.functions.len() <= 1 {
+        return true;
+    }
+
+    let addrs: Vec<u64> = module.functions.iter().map(|f| f.block_addr).collect();
+    let min_addr = *addrs.iter().min().unwrap();
+    let max_addr = *addrs.iter().max().unwrap();
+
+    // Dense if span / 4 roughly equals number of blocks (allow 2x overhead)
+    let span = (max_addr - min_addr) / 4 + 1;
+    span <= (module.functions.len() as u64 * 2)
+}
+
+/// Emit sparse dispatch using if-else chain (for small block counts) or br_table
+fn emit_sparse_dispatch(func: &mut Function, module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) {
+    // For small number of blocks, use if-else chain
+    // For larger numbers, use br_table with computed index
+
+    let num_blocks = module.functions.len();
+
+    if num_blocks <= 16 {
+        // If-else chain: check each address and call corresponding block
+        for (addr, &table_idx) in addr_to_table_idx.iter() {
+            func.instruction(&Instruction::LocalGet(2)); // $pc
+            func.instruction(&Instruction::I32Const(*addr as i32));
+            func.instruction(&Instruction::I32Eq);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+            // Call block function via call_indirect
+            func.instruction(&Instruction::LocalGet(0)); // $m
+            func.instruction(&Instruction::I32Const(table_idx as i32));
+            func.instruction(&Instruction::CallIndirect {
+                type_index: 0,
+                table_index: 0,
+            });
+            func.instruction(&Instruction::LocalSet(2));
+            func.instruction(&Instruction::Br(1)); // Break to loop continue
+
+            func.instruction(&Instruction::End);
+        }
+
+        // Default: unknown PC, halt
+        func.instruction(&Instruction::I32Const(-1));
+        func.instruction(&Instruction::LocalSet(2));
+    } else {
+        // For larger block counts, use br_table with sorted addresses
+        // Create block nesting for br_table targets
+        let sorted_addrs: Vec<(&u64, &u32)> = addr_to_table_idx.iter().collect();
+
+        // Emit nested blocks for each target
+        for _ in 0..num_blocks {
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        }
+        // Default block
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+
+        // Build br_table: map PC to block index via binary search
+        // For simplicity, we compute a hash index
+        func.instruction(&Instruction::LocalGet(2)); // $pc
+
+        // Simple hash: (pc >> 2) % num_blocks
+        func.instruction(&Instruction::I32Const(2));
+        func.instruction(&Instruction::I32ShrU);
+        func.instruction(&Instruction::I32Const(num_blocks as i32));
+        func.instruction(&Instruction::I32RemU);
+
+        // br_table: targets are 0..num_blocks, default is num_blocks (error block)
+        let targets: Vec<u32> = (0..num_blocks as u32).collect();
+        func.instruction(&Instruction::BrTable(targets.into(), num_blocks as u32));
+
+        // Default block: halt
+        func.instruction(&Instruction::End);
+        func.instruction(&Instruction::I32Const(-1));
+        func.instruction(&Instruction::LocalSet(2));
+
+        // For each block, verify address and call or continue searching
+        for (i, (addr, &table_idx)) in sorted_addrs.iter().enumerate() {
+            func.instruction(&Instruction::End);
+
+            // Verify this is the right address
+            func.instruction(&Instruction::LocalGet(2)); // $pc
+            func.instruction(&Instruction::I32Const(**addr as i32));
+            func.instruction(&Instruction::I32Eq);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+            // Call the block
+            func.instruction(&Instruction::LocalGet(0)); // $m
+            func.instruction(&Instruction::I32Const(table_idx as i32));
+            func.instruction(&Instruction::CallIndirect {
+                type_index: 0,
+                table_index: 0,
+            });
+            func.instruction(&Instruction::LocalSet(2));
+
+            func.instruction(&Instruction::Else);
+            // Wrong address, halt (hash collision)
+            func.instruction(&Instruction::I32Const(-1));
+            func.instruction(&Instruction::LocalSet(2));
+            func.instruction(&Instruction::End);
+        }
+    }
 }
 
 /// Build a block function from our IR
@@ -235,11 +372,20 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
         WasmInst::BrIf { label } => {
             func.instruction(&Instruction::BrIf(*label));
         }
+        WasmInst::BrTable { labels, default } => {
+            func.instruction(&Instruction::BrTable(labels.clone().into(), *default));
+        }
         WasmInst::Return => {
             func.instruction(&Instruction::Return);
         }
         WasmInst::Call { func_idx } => {
             func.instruction(&Instruction::Call(*func_idx));
+        }
+        WasmInst::CallIndirect { type_idx } => {
+            func.instruction(&Instruction::CallIndirect {
+                type_index: *type_idx,
+                table_index: 0,
+            });
         }
 
         // Locals

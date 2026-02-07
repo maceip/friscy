@@ -1061,6 +1061,213 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
 
+        // =====================================================================
+        // Atomics (A extension) - single-threaded implementation
+        // For Wasm without threads, these are just regular load/modify/store
+        // =====================================================================
+
+        // Load-Reserved Word: rd = M[rs1], set reservation
+        Opcode::LR_W => {
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 }); // $m for store
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset }); // address
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I32Load { offset: 0 }); // load 32-bit
+                body.push(WasmInst::I64ExtendI32S); // sign-extend to 64-bit
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+            // In single-threaded mode, reservation always succeeds
+        }
+
+        // Store-Conditional Word: M[rs1] = rs2, rd = 0 (success) or 1 (fail)
+        Opcode::SC_W => {
+            // Store the value
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs2_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Store { offset: 0 });
+
+            // Always succeed in single-threaded mode: rd = 0
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Const { value: 0 });
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+        }
+
+        // Load-Reserved Doubleword
+        Opcode::LR_D => {
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset });
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I64Load { offset: 0 });
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+        }
+
+        // Store-Conditional Doubleword
+        Opcode::SC_D => {
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs2_offset });
+            body.push(WasmInst::I64Store { offset: 0 });
+
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Const { value: 0 });
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+        }
+
+        // Atomic swap word: rd = M[rs1]; M[rs1] = rs2
+        Opcode::AMOSWAP_W => {
+            if rd != 0 {
+                // Load old value
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset });
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I32Load { offset: 0 });
+                body.push(WasmInst::I64ExtendI32S);
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+            // Store new value
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs2_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Store { offset: 0 });
+        }
+
+        // Atomic add word: rd = M[rs1]; M[rs1] = M[rs1] + rs2
+        Opcode::AMOADD_W => {
+            // Load old value to rd
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset });
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I32Load { offset: 0 });
+                body.push(WasmInst::I64ExtendI32S);
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+            // Compute and store new value
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Load { offset: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs2_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I32Add);
+            body.push(WasmInst::I32Store { offset: 0 });
+        }
+
+        // Atomic XOR/AND/OR word
+        Opcode::AMOXOR_W => {
+            emit_amo_op_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32Xor);
+        }
+        Opcode::AMOAND_W => {
+            emit_amo_op_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32And);
+        }
+        Opcode::AMOOR_W => {
+            emit_amo_op_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32Or);
+        }
+
+        // Atomic min/max word (signed/unsigned) - stub for now
+        Opcode::AMOMIN_W | Opcode::AMOMAX_W | Opcode::AMOMINU_W | Opcode::AMOMAXU_W => {
+            body.push(WasmInst::Comment {
+                text: format!("AMO min/max stub: {:?}", inst.opcode),
+            });
+            // For now, just do a swap
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset });
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I32Load { offset: 0 });
+                body.push(WasmInst::I64ExtendI32S);
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+        }
+
+        // 64-bit atomics (doubleword)
+        Opcode::AMOSWAP_D => {
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset });
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I64Load { offset: 0 });
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs2_offset });
+            body.push(WasmInst::I64Store { offset: 0 });
+        }
+
+        Opcode::AMOADD_D => {
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset });
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I64Load { offset: 0 });
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs1_offset });
+            body.push(WasmInst::I32WrapI64);
+            body.push(WasmInst::I64Load { offset: 0 });
+            body.push(WasmInst::LocalGet { idx: 0 });
+            body.push(WasmInst::I64Load { offset: rs2_offset });
+            body.push(WasmInst::I64Add);
+            body.push(WasmInst::I64Store { offset: 0 });
+        }
+
+        Opcode::AMOXOR_D => {
+            emit_amo_op_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64Xor);
+        }
+        Opcode::AMOAND_D => {
+            emit_amo_op_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64And);
+        }
+        Opcode::AMOOR_D => {
+            emit_amo_op_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64Or);
+        }
+
+        Opcode::AMOMIN_D | Opcode::AMOMAX_D | Opcode::AMOMINU_D | Opcode::AMOMAXU_D => {
+            body.push(WasmInst::Comment {
+                text: format!("AMO min/max-D stub: {:?}", inst.opcode),
+            });
+            if rd != 0 {
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::LocalGet { idx: 0 });
+                body.push(WasmInst::I64Load { offset: rs1_offset });
+                body.push(WasmInst::I32WrapI64);
+                body.push(WasmInst::I64Load { offset: 0 });
+                body.push(WasmInst::I64Store { offset: rd_offset });
+            }
+        }
+
         // FMA instructions (fused multiply-add)
         Opcode::FMADD_S | Opcode::FMSUB_S | Opcode::FNMADD_S | Opcode::FNMSUB_S => {
             // Fused multiply-add: rd = rs1 * rs2 +/- rs3
@@ -1332,4 +1539,62 @@ fn optimize_function(func: &mut WasmFunction) {
 
     // For now, just remove Comment instructions in release mode
     func.body.retain(|inst| !matches!(inst, WasmInst::Comment { .. }));
+}
+
+/// Helper for atomic word operations (XOR, AND, OR)
+fn emit_amo_op_w(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, op: WasmInst) {
+    let rd_offset = rd * 8;
+
+    // Load old value to rd
+    if rd != 0 {
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::I64Load { offset: rs1_offset });
+        body.push(WasmInst::I32WrapI64);
+        body.push(WasmInst::I32Load { offset: 0 });
+        body.push(WasmInst::I64ExtendI32S);
+        body.push(WasmInst::I64Store { offset: rd_offset });
+    }
+
+    // Compute and store new value: M[rs1] = M[rs1] op rs2
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::I32Load { offset: 0 });
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs2_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(op);
+    body.push(WasmInst::I32Store { offset: 0 });
+}
+
+/// Helper for atomic doubleword operations (XOR, AND, OR)
+fn emit_amo_op_d(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, op: WasmInst) {
+    let rd_offset = rd * 8;
+
+    // Load old value to rd
+    if rd != 0 {
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::I64Load { offset: rs1_offset });
+        body.push(WasmInst::I32WrapI64);
+        body.push(WasmInst::I64Load { offset: 0 });
+        body.push(WasmInst::I64Store { offset: rd_offset });
+    }
+
+    // Compute and store new value: M[rs1] = M[rs1] op rs2
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::I64Load { offset: 0 });
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs2_offset });
+    body.push(op);
+    body.push(WasmInst::I64Store { offset: 0 });
 }

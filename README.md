@@ -1,15 +1,30 @@
-```
+<div align="center">
+<table border="0" style="border-collapse: collapse; border-style: hidden;">
+  <tr>
+    <td align="left" valign="bottom" style="border: none; padding-right: 30px;">
+<pre>
 ▐▀▀▀▀▀▀▀▀▌
-▐ fRISCy ▌
+▐ fRISCy ▌&nbsp;&nbsp;&nbsp;&nbsp;<strong>fast oci runtime for the browser</strong>
 ▐▄▄▄▄▄▄▄▄▌
-```
+</pre>
+      <br>
+      <strong>        friscy runs docker containers in WebAssembly by:</strong>
+      <br><br>
+      <div style="font-weight: 600; margin-bottom: 8px;">
+      </div>
+      <ul align="left" style="margin-top: 0;">
+        <li>Cross-compiling containers to RISC-V 64-bit</li>
+        <li>Running them in a userland RISC-V emulator (libriscv)</li>
+      </ul>
+    </td>
+    <td valign="bottom" style="border: none;">
+      <img width="238" height="313" alt="fh" src="https://github.com/user-attachments/assets/aa87c5bc-18ec-470e-8ee8-8a013609bb18" />
+    </td>
+  </tr>
+</table>
+</div>
+<br>
 
-**fast oci runtime for the browser**
-
-friscy runs Docker containers in WebAssembly by:
-1. Cross-compiling containers to RISC-V 64-bit
-2. Running them in a userland RISC-V emulator (libriscv)
-3. Compiling everything to WebAssembly via Emscripten
 
 ## Project Status
 

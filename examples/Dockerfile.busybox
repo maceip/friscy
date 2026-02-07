@@ -1,0 +1,29 @@
+# Dockerfile.busybox - Minimal container using busybox
+#
+# This is the smallest possible container that still provides
+# a functional Unix environment (shell, coreutils, etc.)
+#
+# Build for RISC-V:
+#   docker buildx build --platform linux/riscv64 -f Dockerfile.busybox -t friscy-busybox:riscv64 .
+#
+# Extract and run:
+#   ./container_to_riscv.sh friscy-busybox:riscv64 ./output
+#   friscy --rootfs output/rootfs.tar /bin/busybox sh
+#
+# Or run specific commands:
+#   friscy --rootfs output/rootfs.tar /bin/busybox ls -la /
+#   friscy --rootfs output/rootfs.tar /bin/busybox cat /etc/passwd
+
+FROM busybox:latest
+
+# Add a simple script
+RUN echo '#!/bin/sh' > /hello.sh && \
+    echo 'echo "Hello from busybox in friscy!"' >> /hello.sh && \
+    echo 'echo "Kernel: $(uname -a)"' >> /hello.sh && \
+    echo 'echo "User: $(whoami)"' >> /hello.sh && \
+    echo 'echo ""' >> /hello.sh && \
+    echo 'echo "Files in /bin:"' >> /hello.sh && \
+    echo 'ls /bin | head -10' >> /hello.sh && \
+    chmod +x /hello.sh
+
+ENTRYPOINT ["/bin/sh", "/hello.sh"]

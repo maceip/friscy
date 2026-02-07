@@ -1,0 +1,34 @@
+# Dockerfile.alpine - Example RISC-V container for friscy
+#
+# This demonstrates how to build a container that will run in friscy.
+# Alpine uses musl libc, which produces smaller static binaries.
+#
+# Build for RISC-V:
+#   docker buildx build --platform linux/riscv64 -f Dockerfile.alpine -t friscy-demo:riscv64 .
+#
+# Extract rootfs:
+#   docker create --name temp friscy-demo:riscv64
+#   docker export temp > demo.tar
+#   docker rm temp
+#
+# Run in friscy:
+#   friscy --rootfs demo.tar /app/demo
+
+FROM alpine:latest
+
+# Install build tools
+RUN apk add --no-cache gcc musl-dev
+
+# Create app directory
+WORKDIR /app
+
+# Copy and compile the demo
+COPY guest.cpp /app/demo.cpp
+RUN gcc -static -O2 -o demo demo.cpp -lstdc++
+
+# Clean up build tools to reduce image size
+RUN apk del gcc musl-dev && \
+    rm -rf /var/cache/apk/* /app/demo.cpp
+
+# Set entrypoint
+ENTRYPOINT ["/app/demo"]

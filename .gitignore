@@ -1,0 +1,33 @@
+# Build directories
+build/
+build-native/
+runtime/build/
+runtime/build-native/
+
+# Downloaded dependencies (libriscv)
+vendor/libriscv/
+
+# Emscripten SDK (if installed locally)
+tools/emsdk/
+
+# Go artifacts
+proxy/go.sum
+proxy/proxy
+
+# Rust artifacts
+aot/target/
+aot/Cargo.lock
+
+# Test binaries
+tests/test_http
+tests/test_http_minimal
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

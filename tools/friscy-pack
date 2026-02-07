@@ -13,8 +13,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FRISCY_WASM="${SCRIPT_DIR}/build/friscy.wasm"
-FRISCY_JS="${SCRIPT_DIR}/build/friscy.js"
+RUNTIME_DIR="${SCRIPT_DIR}/../runtime"
+FRISCY_WASM="${RUNTIME_DIR}/build/friscy.wasm"
+FRISCY_JS="${RUNTIME_DIR}/build/friscy.js"
 
 # Colors
 RED='\033[0;31m'
@@ -142,6 +143,60 @@ log "Entrypoint: $RUN_CMD"
 log "Workdir: $WORKDIR"
 
 # =============================================================================
+# Step 2.5: AOT Compilation (optional)
+# =============================================================================
+if [[ "$USE_AOT" == "true" ]]; then
+    log "Running AOT compilation..."
+
+    # Check for rv2wasm
+    RV2WASM="${SCRIPT_DIR}/../aot/target/release/rv2wasm"
+    if [[ ! -f "$RV2WASM" ]]; then
+        RV2WASM="${SCRIPT_DIR}/../aot/target/debug/rv2wasm"
+    fi
+
+    if [[ ! -f "$RV2WASM" ]]; then
+        warn "rv2wasm not found, attempting to build..."
+        if command -v cargo >/dev/null 2>&1; then
+            (cd "${SCRIPT_DIR}/../aot" && cargo build --release) || {
+                warn "Failed to build rv2wasm, skipping AOT"
+                USE_AOT=false
+            }
+            RV2WASM="${SCRIPT_DIR}/../aot/target/release/rv2wasm"
+        else
+            warn "cargo not found, skipping AOT compilation"
+            USE_AOT=false
+        fi
+    fi
+
+    if [[ "$USE_AOT" == "true" && -f "$RV2WASM" ]]; then
+        # Extract rootfs temporarily
+        AOT_TMP=$(mktemp -d)
+        tar -xf "$OUTPUT_DIR/rootfs.tar" -C "$AOT_TMP"
+
+        # Find and compile RISC-V ELF binaries
+        AOT_COUNT=0
+        mkdir -p "$OUTPUT_DIR/aot"
+
+        find "$AOT_TMP" -type f -executable 2>/dev/null | while read -r elf; do
+            # Check if it's a RISC-V ELF
+            if file "$elf" 2>/dev/null | grep -q "RISC-V"; then
+                REL_PATH="${elf#$AOT_TMP}"
+                AOT_OUT="$OUTPUT_DIR/aot${REL_PATH}.wasm"
+                mkdir -p "$(dirname "$AOT_OUT")"
+
+                if "$RV2WASM" "$elf" -o "$AOT_OUT" 2>/dev/null; then
+                    log "  AOT compiled: $REL_PATH"
+                    AOT_COUNT=$((AOT_COUNT + 1))
+                fi
+            fi
+        done
+
+        rm -rf "$AOT_TMP"
+        log "AOT compilation complete: $AOT_COUNT binaries"
+    fi
+fi
+
+# =============================================================================
 # Step 3: Generate manifest
 # =============================================================================
 log "Generating manifest..."
@@ -169,6 +224,8 @@ if [[ -f "$FRISCY_WASM" ]]; then
 else
     warn "Pre-built friscy not found, building..."
     (cd "$SCRIPT_DIR" && ./harness.sh) || err "Failed to build friscy"
+    FRISCY_WASM="${RUNTIME_DIR}/build/friscy.wasm"
+    FRISCY_JS="${RUNTIME_DIR}/build/friscy.js"
     cp "$FRISCY_WASM" "$OUTPUT_DIR/"
     cp "$FRISCY_JS" "$OUTPUT_DIR/"
 fi

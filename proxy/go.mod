@@ -2,6 +2,8 @@ module github.com/maceip/friscy/proxy
 
 go 1.21
 
-require github.com/gorilla/websocket v1.5.1
-
-require golang.org/x/net v0.17.0 // indirect
+require (
+	github.com/containers/gvisor-tap-vsock v0.7.3
+	github.com/quic-go/quic-go v0.41.0
+	github.com/quic-go/webtransport-go v0.6.0
+)

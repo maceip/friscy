@@ -1,13 +1,15 @@
-# friscy
+```
+▐▀▀▀▀▀▀▀▀▌
+▐ fRISCy ▌
+▐▄▄▄▄▄▄▄▄▌
+```
 
-**Docker containers in the browser via RISC-V emulation**
+**fast oci runtime for the browser**
 
 friscy runs Docker containers in WebAssembly by:
 1. Cross-compiling containers to RISC-V 64-bit
 2. Running them in a userland RISC-V emulator (libriscv)
 3. Compiling everything to WebAssembly via Emscripten
-
-This is the **CheerpX model**: userland-only emulation, no kernel boot = instant startup.
 
 ## Project Status
 
@@ -102,9 +104,9 @@ node tests/test_node.js --rootfs alpine.tar /bin/busybox ls -la
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) - System design and data flow
-- [Performance Roadmap](docs/PERFORMANCE_ROADMAP.md) - Implementation status and TODOs
-- [Optimization Ideas](docs/CRAZY_PERF_IDEAS.md) - Advanced performance strategies
+- [Performance Roadmap](docs/ROADMAP.md) - Implementation status and TODOs
+- [Optimization Ideas](docs/ENDZIEL.md) - Advanced performance strategies
 
 ## License
 
-MIT
+Apache 2.0

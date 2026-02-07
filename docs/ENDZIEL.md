@@ -1,6 +1,4 @@
-# Crazy Performance Ideas for friscy
-
-## The Ultimate Goal
+# The Ultimate Goal
 
 **Native-speed container execution in the browser.**
 
@@ -10,7 +8,7 @@ Target: **>90% native speed**
 
 ---
 
-## 🚀 Tier 1: Actually Possible (High Impact)
+## Tier 1: Actually Possible (High Impact)
 
 ### 1. RISC-V → Wasm AOT Compilation
 
@@ -526,7 +524,7 @@ uint64_t load(uint64_t addr) {
 
 ---
 
-## 🔥 Tier 2: Experimental (Requires New Browser Features)
+## Tier 2: Experimental (Requires New Browser Features)
 
 ### 6. Wasm Threads + SharedArrayBuffer
 
@@ -590,7 +588,7 @@ Use Wasm GC (garbage-collected references) for interpreter state:
 
 ---
 
-## 🌌 Tier 3: Science Fiction (Doesn't Exist Yet)
+## Tier 3: Science Fiction (Doesn't Exist Yet)
 
 ### 9. Browser-Native RISC-V Support
 

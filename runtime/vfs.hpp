@@ -295,16 +295,36 @@ public:
     int open(const std::string& path, int flags) {
         auto entry = resolve(path);
         if (!entry) {
-            // TODO: Create file if O_CREAT
-            return -2;  // ENOENT
+            // Create file if O_CREAT
+            if (flags & 0100) {  // O_CREAT
+                entry = create_file(path);
+                if (!entry) return -2;  // ENOENT (parent doesn't exist)
+            } else {
+                return -2;  // ENOENT
+            }
+        } else if (flags & 0100 && flags & 0200) {
+            // O_CREAT | O_EXCL - fail if file exists
+            return -17;  // EEXIST
         }
 
         if (entry->is_dir()) {
             return -21;  // EISDIR
         }
 
+        // O_TRUNC: truncate to zero length
+        if (flags & 01000) {
+            entry->content.clear();
+            entry->size = 0;
+        }
+
         int fd = next_fd_++;
         open_files_[fd] = std::make_unique<FileHandle>(entry, flags, path);
+
+        // O_APPEND: position at end
+        if (flags & 02000) {
+            open_files_[fd]->offset = entry->content.size();
+        }
+
         return fd;
     }
 
@@ -486,12 +506,286 @@ public:
         add_virtual_file(path, std::vector<uint8_t>(content.begin(), content.end()));
     }
 
+    // Create a directory
+    int mkdir(const std::string& path, uint32_t mode) {
+        std::string abs_path = make_absolute(path);
+
+        // Check if it already exists
+        if (resolve_no_symlink(abs_path)) {
+            return -17;  // EEXIST
+        }
+
+        // Check parent exists and is a directory
+        size_t last_slash = abs_path.rfind('/');
+        std::string parent_path = (last_slash == 0) ? "/" : abs_path.substr(0, last_slash);
+        auto parent = resolve(parent_path);
+        if (!parent || !parent->is_dir()) {
+            return -2;  // ENOENT
+        }
+
+        auto entry = std::make_shared<Entry>();
+        entry->type = FileType::Directory;
+        entry->mode = mode & 0777;
+        entry->uid = 0;
+        entry->gid = 0;
+        insert_entry(abs_path, entry);
+        return 0;
+    }
+
+    // Unlink a file or remove a directory
+    int unlink(const std::string& path, int flags = 0) {
+        std::string abs_path = make_absolute(path);
+        if (abs_path == "/") return -16;  // EBUSY
+
+        // Find parent and entry name
+        size_t last_slash = abs_path.rfind('/');
+        std::string parent_path = (last_slash == 0) ? "/" : abs_path.substr(0, last_slash);
+        std::string name = abs_path.substr(last_slash + 1);
+
+        auto parent = resolve(parent_path);
+        if (!parent || !parent->is_dir()) return -2;  // ENOENT
+
+        auto it = parent->children.find(name);
+        if (it == parent->children.end()) return -2;  // ENOENT
+
+        bool is_dir = it->second->is_dir();
+        bool at_removedir = (flags & 0x200) != 0;  // AT_REMOVEDIR
+
+        if (is_dir && !at_removedir) return -21;  // EISDIR
+        if (!is_dir && at_removedir) return -20;  // ENOTDIR
+        if (is_dir && !it->second->children.empty()) return -39;  // ENOTEMPTY
+
+        parent->children.erase(it);
+        return 0;
+    }
+
+    // Create a symlink
+    int symlink(const std::string& target, const std::string& linkpath) {
+        std::string abs_path = make_absolute(linkpath);
+
+        // Check if it already exists
+        if (resolve_no_symlink(abs_path)) {
+            return -17;  // EEXIST
+        }
+
+        auto entry = std::make_shared<Entry>();
+        entry->type = FileType::Symlink;
+        entry->mode = 0777;
+        entry->link_target = target;
+        insert_entry(abs_path, entry);
+        return 0;
+    }
+
+    // Create a hard link
+    int link(const std::string& oldpath, const std::string& newpath) {
+        auto target = resolve(oldpath);
+        if (!target) return -2;  // ENOENT
+        if (target->is_dir()) return -31;  // EMLINK (can't hardlink dirs)
+
+        std::string abs_new = make_absolute(newpath);
+        if (resolve_no_symlink(abs_new)) return -17;  // EEXIST
+
+        // Insert the same entry under a new name
+        insert_entry(abs_new, target);
+        return 0;
+    }
+
+    // Rename a file or directory
+    int rename(const std::string& oldpath, const std::string& newpath) {
+        std::string abs_old = make_absolute(oldpath);
+        std::string abs_new = make_absolute(newpath);
+
+        if (abs_old == "/" || abs_new == "/") return -16;  // EBUSY
+
+        // Find old entry
+        auto entry = resolve_no_symlink(abs_old);
+        if (!entry) return -2;  // ENOENT
+
+        // Remove from old location
+        size_t old_slash = abs_old.rfind('/');
+        std::string old_parent_path = (old_slash == 0) ? "/" : abs_old.substr(0, old_slash);
+        std::string old_name = abs_old.substr(old_slash + 1);
+
+        auto old_parent = resolve(old_parent_path);
+        if (!old_parent) return -2;
+
+        // Check new parent exists
+        size_t new_slash = abs_new.rfind('/');
+        std::string new_parent_path = (new_slash == 0) ? "/" : abs_new.substr(0, new_slash);
+        auto new_parent = resolve(new_parent_path);
+        if (!new_parent || !new_parent->is_dir()) return -2;
+
+        // Remove any existing entry at the destination
+        std::string new_name = abs_new.substr(new_slash + 1);
+        new_parent->children.erase(new_name);
+
+        // Move: remove from old parent, insert in new parent
+        old_parent->children.erase(old_name);
+        entry->name = new_name;
+        new_parent->children[new_name] = entry;
+        return 0;
+    }
+
+    // Truncate a file by path
+    int truncate(const std::string& path, uint64_t length) {
+        auto entry = resolve(path);
+        if (!entry) return -2;  // ENOENT
+        if (!entry->is_file()) return -21;  // EISDIR
+
+        entry->content.resize(length);
+        entry->size = length;
+        return 0;
+    }
+
+    // Truncate an open file by fd
+    int ftruncate(int fd, uint64_t length) {
+        auto it = open_files_.find(fd);
+        if (it == open_files_.end()) return -9;  // EBADF
+
+        auto& fh = it->second;
+        if (!fh->entry->is_file()) return -22;  // EINVAL
+
+        fh->entry->content.resize(length);
+        fh->entry->size = length;
+        if (fh->offset > length) fh->offset = length;
+        return 0;
+    }
+
+    // Positional read (does not change offset)
+    ssize_t pread(int fd, void* buf, size_t count, uint64_t offset) {
+        auto it = open_files_.find(fd);
+        if (it == open_files_.end()) return -9;  // EBADF
+
+        auto& fh = it->second;
+        if (!fh->entry->is_file()) return -21;
+
+        if (offset >= fh->entry->content.size()) return 0;
+        size_t available = fh->entry->content.size() - offset;
+        size_t to_read = std::min(count, available);
+
+        memcpy(buf, fh->entry->content.data() + offset, to_read);
+        return static_cast<ssize_t>(to_read);
+    }
+
+    // Positional write (does not change offset)
+    ssize_t pwrite(int fd, const void* buf, size_t count, uint64_t offset) {
+        auto it = open_files_.find(fd);
+        if (it == open_files_.end()) return -9;  // EBADF
+
+        auto& fh = it->second;
+        if (!fh->entry->is_file()) return -21;
+
+        size_t end_pos = offset + count;
+        if (end_pos > fh->entry->content.size()) {
+            fh->entry->content.resize(end_pos);
+            fh->entry->size = end_pos;
+        }
+
+        memcpy(fh->entry->content.data() + offset, buf, count);
+        return static_cast<ssize_t>(count);
+    }
+
+    // Duplicate a file descriptor
+    int dup(int oldfd) {
+        auto it = open_files_.find(oldfd);
+        if (it != open_files_.end()) {
+            int newfd = next_fd_++;
+            open_files_[newfd] = std::make_unique<FileHandle>(
+                it->second->entry, it->second->flags, it->second->path);
+            open_files_[newfd]->offset = it->second->offset;
+            return newfd;
+        }
+        auto dit = open_dirs_.find(oldfd);
+        if (dit != open_dirs_.end()) {
+            int newfd = next_fd_++;
+            open_dirs_[newfd] = std::make_unique<DirHandle>(
+                dit->second->entry, dit->second->path);
+            open_dirs_[newfd]->index = dit->second->index;
+            return newfd;
+        }
+        return -9;  // EBADF
+    }
+
+    // Duplicate a file descriptor to a specific fd
+    int dup2(int oldfd, int newfd) {
+        if (oldfd == newfd) return newfd;
+        // Close newfd if open
+        close(newfd);
+
+        auto it = open_files_.find(oldfd);
+        if (it != open_files_.end()) {
+            open_files_[newfd] = std::make_unique<FileHandle>(
+                it->second->entry, it->second->flags, it->second->path);
+            open_files_[newfd]->offset = it->second->offset;
+            return newfd;
+        }
+        auto dit = open_dirs_.find(oldfd);
+        if (dit != open_dirs_.end()) {
+            open_dirs_[newfd] = std::make_unique<DirHandle>(
+                dit->second->entry, dit->second->path);
+            open_dirs_[newfd]->index = dit->second->index;
+            return newfd;
+        }
+        return -9;  // EBADF
+    }
+
+    // Open a pipe end (0 = read, 1 = write)
+    int open_pipe(std::shared_ptr<Entry> pipe_entry, int end) {
+        int fd = next_fd_++;
+        int flags = (end == 0) ? 0 : 1;  // O_RDONLY or O_WRONLY
+        open_files_[fd] = std::make_unique<FileHandle>(pipe_entry, flags, "[pipe]");
+        return fd;
+    }
+
+    // Check if fd is open
+    bool is_open(int fd) const {
+        return open_files_.count(fd) > 0 || open_dirs_.count(fd) > 0;
+    }
+
+    // Get entry for an open fd (for fstat)
+    std::shared_ptr<Entry> get_entry(int fd) {
+        auto it = open_files_.find(fd);
+        if (it != open_files_.end()) return it->second->entry;
+        auto dit = open_dirs_.find(fd);
+        if (dit != open_dirs_.end()) return dit->second->entry;
+        return nullptr;
+    }
+
+    // Get the path of an open fd
+    std::string get_path(int fd) const {
+        auto it = open_files_.find(fd);
+        if (it != open_files_.end()) return it->second->path;
+        auto dit = open_dirs_.find(fd);
+        if (dit != open_dirs_.end()) return dit->second->path;
+        return "";
+    }
+
 private:
     std::shared_ptr<Entry> root_;
     std::string cwd_;
     int next_fd_ = 3;  // 0, 1, 2 reserved for stdin/out/err
     std::unordered_map<int, std::unique_ptr<FileHandle>> open_files_;
     std::unordered_map<int, std::unique_ptr<DirHandle>> open_dirs_;
+
+    // Create a new regular file, returns null if parent doesn't exist
+    std::shared_ptr<Entry> create_file(const std::string& path) {
+        std::string abs_path = make_absolute(path);
+
+        size_t last_slash = abs_path.rfind('/');
+        std::string parent_path = (last_slash == 0) ? "/" : abs_path.substr(0, last_slash);
+
+        auto parent = resolve(parent_path);
+        if (!parent || !parent->is_dir()) return nullptr;
+
+        auto entry = std::make_shared<Entry>();
+        entry->type = FileType::Regular;
+        entry->mode = 0644;
+        entry->uid = 0;
+        entry->gid = 0;
+        entry->size = 0;
+        insert_entry(abs_path, entry);
+        return entry;
+    }
 
     static uint64_t parse_octal(const uint8_t* p, size_t len) {
         uint64_t val = 0;

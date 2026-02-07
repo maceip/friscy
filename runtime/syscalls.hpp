@@ -202,10 +202,12 @@ static void sys_read(Machine& m) {
 }
 
 static void sys_write(Machine& m) {
+    auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
 
+    // stdout/stderr go to host
     if (fd == 1 || fd == 2) {
         try {
             auto view = m.memory.memview(buf_addr, count);
@@ -218,33 +220,66 @@ static void sys_write(Machine& m) {
         }
         return;
     }
+
+    // VFS file writes
+    if (fs.is_open(fd)) {
+        std::vector<uint8_t> buf(count);
+        m.memory.memcpy_out(buf.data(), buf_addr, count);
+        ssize_t n = fs.write(fd, buf.data(), count);
+        m.set_result(n);
+        return;
+    }
+
     m.set_result(err::BADF);
 }
 
 static void sys_writev(Machine& m) {
+    auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
     auto iov_addr = m.sysarg(1);
     int iovcnt = m.template sysarg<int>(2);
 
-    if (fd != 1 && fd != 2) {
-        m.set_result(err::BADF);
+    // stdout/stderr go to host
+    if (fd == 1 || fd == 2) {
+        size_t total = 0;
+        auto& out = (fd == 1) ? std::cout : std::cerr;
+
+        for (int i = 0; i < iovcnt; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len > 0) {
+                auto view = m.memory.memview(base, len);
+                out.write(reinterpret_cast<const char*>(view.data()), len);
+                total += len;
+            }
+        }
+        out.flush();
+        m.set_result(total);
         return;
     }
 
-    size_t total = 0;
-    auto& out = (fd == 1) ? std::cout : std::cerr;
-
-    for (int i = 0; i < iovcnt; i++) {
-        uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
-        uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
-        if (len > 0) {
-            auto view = m.memory.memview(base, len);
-            out.write(reinterpret_cast<const char*>(view.data()), len);
-            total += len;
+    // VFS file writes
+    if (fs.is_open(fd)) {
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len > 0) {
+                std::vector<uint8_t> buf(len);
+                m.memory.memcpy_out(buf.data(), base, len);
+                ssize_t n = fs.write(fd, buf.data(), len);
+                if (n < 0) {
+                    m.set_result(total > 0 ? (int64_t)total : n);
+                    return;
+                }
+                total += n;
+            }
         }
+        m.set_result(total);
+        return;
     }
-    out.flush();
-    m.set_result(total);
+
+    m.set_result(err::BADF);
 }
 
 static void sys_lseek(Machine& m) {
@@ -321,9 +356,11 @@ static void sys_newfstatat(Machine& m) {
 }
 
 static void sys_fstat(Machine& m) {
+    auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
     auto statbuf_addr = m.sysarg(1);
 
+    // stdin/stdout/stderr are character devices
     if (fd == 0 || fd == 1 || fd == 2) {
         linux_stat64 st = {};
         st.st_dev = 1;
@@ -334,6 +371,29 @@ static void sys_fstat(Machine& m) {
         m.set_result(0);
         return;
     }
+
+    // VFS file descriptors
+    auto entry = fs.get_entry(fd);
+    if (entry) {
+        std::string path = fs.get_path(fd);
+        linux_stat64 st = {};
+        st.st_dev = 1;
+        st.st_ino = std::hash<std::string>{}(path);
+        st.st_mode = static_cast<uint32_t>(entry->type) | entry->mode;
+        st.st_nlink = entry->is_dir() ? 2 : 1;
+        st.st_uid = entry->uid;
+        st.st_gid = entry->gid;
+        st.st_size = entry->size;
+        st.st_blksize = 4096;
+        st.st_blocks = (entry->size + 511) / 512;
+        st.st_mtime_sec = entry->mtime;
+        st.st_atime_sec = entry->mtime;
+        st.st_ctime_sec = entry->mtime;
+        m.memory.memcpy(statbuf_addr, &st, sizeof(st));
+        m.set_result(0);
+        return;
+    }
+
     m.set_result(err::BADF);
 }
 
@@ -482,9 +542,239 @@ static void sys_fcntl(Machine& m) {
     }
 }
 
-static void sys_dup(Machine& m) { m.set_result(err::NOSYS); }
-static void sys_dup3(Machine& m) { m.set_result(err::NOSYS); }
-static void sys_pipe2(Machine& m) { m.set_result(err::NOSYS); }
+static void sys_dup(Machine& m) {
+    auto& fs = get_fs(m);
+    int oldfd = m.template sysarg<int>(0);
+    m.set_result(fs.dup(oldfd));
+}
+
+static void sys_dup3(Machine& m) {
+    auto& fs = get_fs(m);
+    int oldfd = m.template sysarg<int>(0);
+    int newfd = m.template sysarg<int>(1);
+    if (oldfd == newfd) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    m.set_result(fs.dup2(oldfd, newfd));
+}
+
+static void sys_pipe2(Machine& m) {
+    auto& fs = get_fs(m);
+    auto pipefd_addr = m.sysarg(0);
+
+    // Create a pipe using two connected in-memory file handles
+    // Write end writes to a shared buffer, read end reads from it
+    auto pipe_entry = std::make_shared<vfs::Entry>();
+    pipe_entry->type = vfs::FileType::Fifo;
+    pipe_entry->mode = 0600;
+    pipe_entry->size = 0;
+
+    // Allocate two fds - read end and write end
+    int read_fd = fs.open_pipe(pipe_entry, 0);
+    int write_fd = fs.open_pipe(pipe_entry, 1);
+
+    int32_t fds[2] = { read_fd, write_fd };
+    m.memory.memcpy(pipefd_addr, fds, sizeof(fds));
+    m.set_result(0);
+}
+
+static void sys_readv(Machine& m) {
+    auto& fs = get_fs(m);
+    int fd = m.template sysarg<int>(0);
+    auto iov_addr = m.sysarg(1);
+    int iovcnt = m.template sysarg<int>(2);
+
+    if (fd == 0) {
+        m.set_result(0);  // EOF for stdin
+        return;
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+        uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+        if (len > 0) {
+            std::vector<uint8_t> buf(len);
+            ssize_t n = fs.read(fd, buf.data(), len);
+            if (n < 0) {
+                m.set_result(total > 0 ? (int64_t)total : n);
+                return;
+            }
+            if (n > 0) {
+                m.memory.memcpy(base, buf.data(), n);
+                total += n;
+            }
+            if (static_cast<size_t>(n) < len) break;  // Short read
+        }
+    }
+    m.set_result(total);
+}
+
+static void sys_pread64(Machine& m) {
+    auto& fs = get_fs(m);
+    int fd = m.template sysarg<int>(0);
+    auto buf_addr = m.sysarg(1);
+    size_t count = m.sysarg(2);
+    uint64_t offset = m.sysarg(3);
+
+    std::vector<uint8_t> buf(count);
+    ssize_t n = fs.pread(fd, buf.data(), count, offset);
+    if (n > 0) {
+        m.memory.memcpy(buf_addr, buf.data(), n);
+    }
+    m.set_result(n);
+}
+
+static void sys_pwrite64(Machine& m) {
+    auto& fs = get_fs(m);
+    int fd = m.template sysarg<int>(0);
+    auto buf_addr = m.sysarg(1);
+    size_t count = m.sysarg(2);
+    uint64_t offset = m.sysarg(3);
+
+    std::vector<uint8_t> buf(count);
+    m.memory.memcpy_out(buf.data(), buf_addr, count);
+    ssize_t n = fs.pwrite(fd, buf.data(), count, offset);
+    m.set_result(n);
+}
+
+static void sys_ftruncate(Machine& m) {
+    auto& fs = get_fs(m);
+    int fd = m.template sysarg<int>(0);
+    uint64_t length = m.sysarg(1);
+    m.set_result(fs.ftruncate(fd, length));
+}
+
+static void sys_mkdirat(Machine& m) {
+    auto& fs = get_fs(m);
+    int dirfd = m.template sysarg<int>(0);
+    auto path_addr = m.sysarg(1);
+    uint32_t mode = m.template sysarg<uint32_t>(2);
+
+    if (dirfd != AT_FDCWD) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    std::string path;
+    try { path = m.memory.memstring(path_addr); }
+    catch (...) { m.set_result(err::INVAL); return; }
+
+    m.set_result(fs.mkdir(path, mode));
+}
+
+static void sys_unlinkat(Machine& m) {
+    auto& fs = get_fs(m);
+    int dirfd = m.template sysarg<int>(0);
+    auto path_addr = m.sysarg(1);
+    int flags = m.template sysarg<int>(2);
+
+    if (dirfd != AT_FDCWD) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    std::string path;
+    try { path = m.memory.memstring(path_addr); }
+    catch (...) { m.set_result(err::INVAL); return; }
+
+    m.set_result(fs.unlink(path, flags));
+}
+
+static void sys_symlinkat(Machine& m) {
+    auto& fs = get_fs(m);
+    auto target_addr = m.sysarg(0);
+    int newdirfd = m.template sysarg<int>(1);
+    auto linkpath_addr = m.sysarg(2);
+
+    if (newdirfd != AT_FDCWD) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    std::string target, linkpath;
+    try {
+        target = m.memory.memstring(target_addr);
+        linkpath = m.memory.memstring(linkpath_addr);
+    } catch (...) { m.set_result(err::INVAL); return; }
+
+    m.set_result(fs.symlink(target, linkpath));
+}
+
+static void sys_linkat(Machine& m) {
+    auto& fs = get_fs(m);
+    int olddirfd = m.template sysarg<int>(0);
+    auto oldpath_addr = m.sysarg(1);
+    int newdirfd = m.template sysarg<int>(2);
+    auto newpath_addr = m.sysarg(3);
+
+    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    std::string oldpath, newpath;
+    try {
+        oldpath = m.memory.memstring(oldpath_addr);
+        newpath = m.memory.memstring(newpath_addr);
+    } catch (...) { m.set_result(err::INVAL); return; }
+
+    m.set_result(fs.link(oldpath, newpath));
+}
+
+static void sys_renameat(Machine& m) {
+    auto& fs = get_fs(m);
+    int olddirfd = m.template sysarg<int>(0);
+    auto oldpath_addr = m.sysarg(1);
+    int newdirfd = m.template sysarg<int>(2);
+    auto newpath_addr = m.sysarg(3);
+
+    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    std::string oldpath, newpath;
+    try {
+        oldpath = m.memory.memstring(oldpath_addr);
+        newpath = m.memory.memstring(newpath_addr);
+    } catch (...) { m.set_result(err::INVAL); return; }
+
+    m.set_result(fs.rename(oldpath, newpath));
+}
+
+static void sys_sysinfo(Machine& m) {
+    auto info_addr = m.sysarg(0);
+
+    // Linux sysinfo structure (64-bit)
+    struct linux_sysinfo {
+        int64_t  uptime;
+        uint64_t loads[3];
+        uint64_t totalram;
+        uint64_t freeram;
+        uint64_t sharedram;
+        uint64_t bufferram;
+        uint64_t totalswap;
+        uint64_t freeswap;
+        uint16_t procs;
+        uint16_t pad;
+        uint32_t pad2;
+        uint64_t totalhigh;
+        uint64_t freehigh;
+        uint32_t mem_unit;
+    };
+
+    linux_sysinfo si = {};
+    si.uptime = 100;
+    si.totalram = 256ULL * 1024 * 1024;  // 256MB
+    si.freeram = 128ULL * 1024 * 1024;   // 128MB
+    si.procs = 1;
+    si.mem_unit = 1;
+
+    m.memory.memcpy(info_addr, &si, sizeof(si));
+    m.set_result(0);
+}
 
 }  // namespace handlers
 
@@ -534,6 +824,16 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::dup, sys_dup);
     machine.install_syscall_handler(nr::dup3, sys_dup3);
     machine.install_syscall_handler(nr::pipe2, sys_pipe2);
+    machine.install_syscall_handler(nr::readv, sys_readv);
+    machine.install_syscall_handler(nr::pread64, sys_pread64);
+    machine.install_syscall_handler(nr::pwrite64, sys_pwrite64);
+    machine.install_syscall_handler(nr::ftruncate, sys_ftruncate);
+    machine.install_syscall_handler(nr::mkdirat, sys_mkdirat);
+    machine.install_syscall_handler(nr::unlinkat, sys_unlinkat);
+    machine.install_syscall_handler(nr::symlinkat, sys_symlinkat);
+    machine.install_syscall_handler(nr::linkat, sys_linkat);
+    machine.install_syscall_handler(nr::renameat, sys_renameat);
+    machine.install_syscall_handler(nr::sysinfo, sys_sysinfo);
 }
 
 }  // namespace syscalls

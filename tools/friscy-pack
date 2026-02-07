@@ -1,0 +1,360 @@
+#!/bin/bash
+#
+# friscy-pack: Package Docker container for browser execution
+#
+# Usage:
+#   friscy-pack <image> [--output <dir>] [--aot]
+#
+# Examples:
+#   friscy-pack alpine:latest
+#   friscy-pack myapp:riscv64 --output dist/
+#   friscy-pack python:3.11-alpine --aot  # Use AOT compilation
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FRISCY_WASM="${SCRIPT_DIR}/build/friscy.wasm"
+FRISCY_JS="${SCRIPT_DIR}/build/friscy.js"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[friscy-pack]${NC} $1"; }
+warn() { echo -e "${YELLOW}[friscy-pack]${NC} $1"; }
+err()  { echo -e "${RED}[friscy-pack]${NC} $1"; exit 1; }
+
+# Parse arguments
+IMAGE=""
+OUTPUT_DIR="./friscy-bundle"
+USE_AOT=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --output|-o)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --aot)
+            USE_AOT=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: friscy-pack <image> [--output <dir>] [--aot]"
+            echo ""
+            echo "Package a Docker container for browser execution via friscy."
+            echo ""
+            echo "Options:"
+            echo "  --output, -o <dir>  Output directory (default: ./friscy-bundle)"
+            echo "  --aot               Use AOT compilation (faster, experimental)"
+            echo "  --help, -h          Show this help"
+            exit 0
+            ;;
+        *)
+            IMAGE="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$IMAGE" ]]; then
+    err "No image specified. Usage: friscy-pack <image>"
+fi
+
+# Check dependencies
+command -v docker >/dev/null 2>&1 || err "docker is required"
+command -v jq >/dev/null 2>&1 || err "jq is required (apt install jq)"
+
+log "Packaging: $IMAGE"
+log "Output: $OUTPUT_DIR"
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# =============================================================================
+# Step 1: Check if image is RISC-V, if not build it
+# =============================================================================
+log "Checking image architecture..."
+
+# Try to inspect the image
+ARCH=$(docker inspect "$IMAGE" 2>/dev/null | jq -r '.[0].Architecture' || echo "")
+
+if [[ "$ARCH" == "riscv64" ]]; then
+    log "Image is already RISC-V 64-bit"
+    RISCV_IMAGE="$IMAGE"
+else
+    log "Image is $ARCH, need to build for RISC-V..."
+
+    # Check if we have a Dockerfile
+    if [[ -f "Dockerfile" ]]; then
+        RISCV_IMAGE="${IMAGE%:*}:riscv64"
+        log "Building $RISCV_IMAGE from Dockerfile..."
+
+        docker buildx build \
+            --platform linux/riscv64 \
+            --load \
+            -t "$RISCV_IMAGE" \
+            . || err "Failed to build RISC-V image"
+    else
+        # Try to pull multi-arch image
+        RISCV_IMAGE="$IMAGE"
+        log "Pulling $IMAGE for linux/riscv64..."
+        docker pull --platform linux/riscv64 "$IMAGE" 2>/dev/null || \
+            err "Image not available for RISC-V and no Dockerfile found"
+    fi
+fi
+
+# =============================================================================
+# Step 2: Extract container filesystem
+# =============================================================================
+log "Extracting rootfs..."
+
+CONTAINER_NAME="friscy-temp-$$"
+docker create --platform linux/riscv64 --name "$CONTAINER_NAME" "$RISCV_IMAGE" /bin/true >/dev/null
+
+# Export filesystem
+docker export "$CONTAINER_NAME" > "$OUTPUT_DIR/rootfs.tar"
+log "Exported rootfs: $(du -h "$OUTPUT_DIR/rootfs.tar" | cut -f1)"
+
+# Get container config
+CONFIG=$(docker inspect "$CONTAINER_NAME")
+ENTRYPOINT=$(echo "$CONFIG" | jq -r '.[0].Config.Entrypoint // empty | if type == "array" then .[] else . end')
+CMD=$(echo "$CONFIG" | jq -r '.[0].Config.Cmd // empty | if type == "array" then .[] else . end')
+WORKDIR=$(echo "$CONFIG" | jq -r '.[0].Config.WorkingDir // "/"')
+ENV=$(echo "$CONFIG" | jq -r '.[0].Config.Env // [] | .[]')
+
+# Cleanup
+docker rm "$CONTAINER_NAME" >/dev/null
+
+# Determine what to run
+if [[ -n "$ENTRYPOINT" ]]; then
+    RUN_CMD="$ENTRYPOINT $CMD"
+elif [[ -n "$CMD" ]]; then
+    RUN_CMD="$CMD"
+else
+    RUN_CMD="/bin/sh"
+fi
+
+log "Entrypoint: $RUN_CMD"
+log "Workdir: $WORKDIR"
+
+# =============================================================================
+# Step 3: Generate manifest
+# =============================================================================
+log "Generating manifest..."
+
+cat > "$OUTPUT_DIR/manifest.json" << EOF
+{
+  "version": 1,
+  "image": "$IMAGE",
+  "entrypoint": "$(echo $RUN_CMD | head -1)",
+  "workdir": "$WORKDIR",
+  "env": [
+$(echo "$ENV" | sed 's/^/    "/; s/$/"/' | paste -sd ',' | sed 's/,/,\n/g')
+  ],
+  "created": "$(date -Iseconds)"
+}
+EOF
+
+# =============================================================================
+# Step 4: Copy or build friscy runtime
+# =============================================================================
+if [[ -f "$FRISCY_WASM" ]]; then
+    log "Copying pre-built friscy runtime..."
+    cp "$FRISCY_WASM" "$OUTPUT_DIR/"
+    cp "$FRISCY_JS" "$OUTPUT_DIR/"
+else
+    warn "Pre-built friscy not found, building..."
+    (cd "$SCRIPT_DIR" && ./harness.sh) || err "Failed to build friscy"
+    cp "$FRISCY_WASM" "$OUTPUT_DIR/"
+    cp "$FRISCY_JS" "$OUTPUT_DIR/"
+fi
+
+# =============================================================================
+# Step 5: Generate HTML
+# =============================================================================
+log "Generating index.html..."
+
+cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>friscy container</title>
+    <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a2e;
+            color: #eee;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            padding: 1rem;
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+        }
+        h1 { font-size: 1.2rem; font-weight: 500; }
+        .status { font-size: 0.85rem; color: #888; margin-top: 0.25rem; }
+        #terminal-container {
+            flex: 1;
+            padding: 1rem;
+        }
+        #terminal {
+            height: 100%;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            font-size: 1.1rem;
+        }
+        .loading::after {
+            content: '';
+            width: 20px;
+            height: 20px;
+            border: 2px solid #fff;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 1rem;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>friscy container</h1>
+        <div class="status" id="status">Loading...</div>
+    </header>
+    <div id="terminal-container">
+        <div id="terminal" class="loading">Initializing container...</div>
+    </div>
+
+    <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script type="module">
+        import createFriscy from './friscy.js';
+
+        const statusEl = document.getElementById('status');
+        const terminalEl = document.getElementById('terminal');
+
+        async function main() {
+            statusEl.textContent = 'Loading manifest...';
+
+            // Load manifest
+            const manifest = await fetch('./manifest.json').then(r => r.json());
+            statusEl.textContent = `Image: ${manifest.image}`;
+
+            // Initialize terminal
+            terminalEl.innerHTML = '';
+            terminalEl.classList.remove('loading');
+
+            const term = new Terminal({
+                cursorBlink: true,
+                fontSize: 14,
+                fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                theme: {
+                    background: '#0d1117',
+                    foreground: '#c9d1d9',
+                }
+            });
+            const fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+            term.open(terminalEl);
+            fitAddon.fit();
+
+            window.addEventListener('resize', () => fitAddon.fit());
+
+            term.writeln('\x1b[1;32mfriscy\x1b[0m - Container runtime in WebAssembly');
+            term.writeln(`Loading ${manifest.image}...`);
+            term.writeln('');
+
+            // Load rootfs
+            statusEl.textContent = 'Loading rootfs...';
+            const rootfs = await fetch('./rootfs.tar').then(r => r.arrayBuffer());
+            term.writeln(`Loaded rootfs: ${(rootfs.byteLength / 1024 / 1024).toFixed(1)} MB`);
+
+            // Initialize friscy
+            statusEl.textContent = 'Initializing runtime...';
+            const Module = await createFriscy({
+                print: (text) => term.writeln(text),
+                printErr: (text) => term.writeln('\x1b[31m' + text + '\x1b[0m'),
+            });
+
+            // Load rootfs into virtual filesystem
+            const rootfsData = new Uint8Array(rootfs);
+            Module.FS.writeFile('/rootfs.tar', rootfsData);
+
+            // Set up stdin from terminal
+            let inputBuffer = [];
+            let inputResolve = null;
+
+            term.onData((data) => {
+                if (inputResolve) {
+                    inputBuffer.push(...data.split('').map(c => c.charCodeAt(0)));
+                    inputResolve();
+                    inputResolve = null;
+                } else {
+                    inputBuffer.push(...data.split('').map(c => c.charCodeAt(0)));
+                }
+            });
+
+            statusEl.textContent = 'Running...';
+            term.writeln('Starting: ' + manifest.entrypoint);
+            term.writeln('─'.repeat(40));
+
+            // Run the container
+            try {
+                const exitCode = Module.callMain([
+                    '--rootfs', '/rootfs.tar',
+                    '--', manifest.entrypoint
+                ]);
+                term.writeln('');
+                term.writeln(`\x1b[33mProcess exited with code ${exitCode}\x1b[0m`);
+                statusEl.textContent = `Exited (${exitCode})`;
+            } catch (e) {
+                term.writeln('\x1b[31mError: ' + e.message + '\x1b[0m');
+                statusEl.textContent = 'Error';
+            }
+        }
+
+        main().catch(e => {
+            console.error(e);
+            statusEl.textContent = 'Error: ' + e.message;
+        });
+    </script>
+</body>
+</html>
+HTMLEOF
+
+# =============================================================================
+# Step 6: Summary
+# =============================================================================
+echo ""
+log "Bundle created successfully!"
+echo ""
+echo -e "  ${BLUE}Output directory:${NC} $OUTPUT_DIR"
+echo ""
+echo "  Files:"
+ls -lh "$OUTPUT_DIR" | tail -n +2 | while read line; do
+    echo "    $line"
+done
+echo ""
+echo -e "  ${GREEN}To run locally:${NC}"
+echo "    cd $OUTPUT_DIR && python3 -m http.server 8080"
+echo "    # Then open http://localhost:8080"
+echo ""
+echo -e "  ${GREEN}To deploy:${NC}"
+echo "    Upload contents of $OUTPUT_DIR to any static hosting"
+echo ""

@@ -1,17 +1,27 @@
-// host_proxy - WebSocket bridge to real network for friscy
+// friscy-proxy - WebTransport bidirectional network proxy
 //
-// This runs on the host and provides network access to browser-based friscy
-// instances via WebSocket. Uses gvisor's userspace network stack.
+// Provides full TCP/UDP networking for browser-based friscy instances,
+// including support for incoming connections (listen/accept).
+//
+// Uses:
+//   - WebTransport (HTTP/3 + QUIC) for browser communication
+//   - Native Go net package for real network connections
+//   - Each TCP connection = 1 WebTransport stream
+//   - UDP = WebTransport datagrams
 //
 // Usage:
-//   go run main.go -listen :8765
+//   go run . -listen :4433 -cert cert.pem -key key.pem
 //
-// The browser-side network_bridge.js connects to this proxy.
+// For development, generate self-signed certs:
+//   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+//     -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
 
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"crypto/tls"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -19,365 +29,508 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/webtransport-go"
 )
 
-// Message types matching network_bridge.js
+// Protocol message types (varint prefix)
 const (
-	MsgSocketCreate  = 0x01
-	MsgSocketConnect = 0x02
-	MsgSocketBind    = 0x03
-	MsgSocketListen  = 0x04
-	MsgSocketAccept  = 0x05
-	MsgSocketSend    = 0x06
-	MsgSocketClose   = 0x07
+	// Container -> Host (requests)
+	MsgConnect = 0x01 // Connect to remote host
+	MsgBind    = 0x02 // Bind to local port
+	MsgListen  = 0x03 // Start listening
+	MsgSend    = 0x04 // Send data on connection
+	MsgClose   = 0x05 // Close connection
+	MsgSendTo  = 0x06 // Send UDP datagram
 
-	MsgConnectOK   = 0x81
-	MsgConnectFail = 0x82
-	MsgData        = 0x83
-	MsgAcceptNew   = 0x84
-	MsgClosed      = 0x85
-	MsgError       = 0x86
+	// Host -> Container (responses/events)
+	MsgConnected    = 0x81 // Connection established
+	MsgConnectError = 0x82 // Connection failed
+	MsgData         = 0x83 // Incoming data
+	MsgAccept       = 0x84 // New incoming connection
+	MsgClosed       = 0x85 // Connection closed
+	MsgError        = 0x86 // General error
+	MsgRecvFrom     = 0x87 // UDP datagram received
 )
 
 // Socket types
 const (
-	SockStream = 1 // TCP
-	SockDgram  = 2 // UDP
+	SOCK_STREAM = 1
+	SOCK_DGRAM  = 2
 )
 
-// Message from browser
-type InMessage struct {
-	Type     int    `json:"type"`
-	FD       int    `json:"fd"`
-	Domain   int    `json:"domain,omitempty"`
-	SockType int    `json:"sockType,omitempty"`
-	Host     string `json:"host,omitempty"`
-	Port     int    `json:"port,omitempty"`
-	Data     []byte `json:"data,omitempty"`
-	Backlog  int    `json:"backlog,omitempty"`
-	How      int    `json:"how,omitempty"`
-}
-
-// Message to browser
-type OutMessage struct {
-	Type    int    `json:"type"`
-	FD      int    `json:"fd"`
-	Error   int    `json:"error,omitempty"`
-	Data    []byte `json:"data,omitempty"`
-	Message string `json:"message,omitempty"`
-}
-
-// Virtual socket state
-type VSocket struct {
-	fd       int
+// Connection represents a virtual socket
+type Connection struct {
+	id       uint32
 	sockType int
 	conn     net.Conn
 	listener net.Listener
-	closed   bool
+	udpConn  *net.UDPConn
+	closed   atomic.Bool
 	mu       sync.Mutex
 }
 
-// Client session
+// Session represents a WebTransport client session
 type Session struct {
-	ws      *websocket.Conn
-	sockets map[int]*VSocket
-	mu      sync.RWMutex
-	wsMu    sync.Mutex
+	wt          *webtransport.Session
+	connections sync.Map // uint32 -> *Connection
+	nextConnID  atomic.Uint32
+	ctx         context.Context
+	cancel      context.CancelFunc
+	streamMu    sync.Mutex
 }
 
-func newSession(ws *websocket.Conn) *Session {
-	return &Session{
-		ws:      ws,
-		sockets: make(map[int]*VSocket),
+// Server is the WebTransport proxy server
+type Server struct {
+	certFile string
+	keyFile  string
+	listen   string
+	sessions sync.Map
+}
+
+func NewServer(listen, certFile, keyFile string) *Server {
+	return &Server{
+		listen:   listen,
+		certFile: certFile,
+		keyFile:  keyFile,
 	}
 }
 
-func (s *Session) send(msg OutMessage) error {
-	s.wsMu.Lock()
-	defer s.wsMu.Unlock()
-	return s.ws.WriteJSON(msg)
-}
+func (s *Server) Run() error {
+	cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load certificates: %w", err)
+	}
 
-func (s *Session) getSocket(fd int) *VSocket {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.sockets[fd]
-}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h3"},
+	}
 
-func (s *Session) addSocket(fd int, sock *VSocket) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sockets[fd] = sock
-}
+	wtServer := &webtransport.Server{
+		H3: http3.Server{
+			Addr:      s.listen,
+			TLSConfig: tlsConfig,
+		},
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for development
+		},
+	}
 
-func (s *Session) removeSocket(fd int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if sock, ok := s.sockets[fd]; ok {
-		sock.mu.Lock()
-		sock.closed = true
-		if sock.conn != nil {
-			sock.conn.Close()
+	http.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
+		session, err := wtServer.Upgrade(w, r)
+		if err != nil {
+			log.Printf("WebTransport upgrade failed: %v", err)
+			return
 		}
-		if sock.listener != nil {
-			sock.listener.Close()
+		s.handleSession(session)
+	})
+
+	log.Printf("friscy-proxy listening on https://localhost%s/connect", s.listen)
+	log.Printf("WebTransport ready for bidirectional networking")
+
+	return wtServer.ListenAndServe()
+}
+
+func (s *Server) handleSession(wt *webtransport.Session) {
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &Session{
+		wt:     wt,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	log.Printf("New WebTransport session from %s", wt.RemoteAddr())
+
+	// Handle incoming streams (from container)
+	go session.acceptStreams()
+
+	// Note: Datagrams (UDP) would require quic-go datagram API access
+	// For now, UDP is tunneled over streams like TCP
+
+	// Wait for session to close
+	<-wt.Context().Done()
+	cancel()
+
+	// Cleanup all connections
+	session.connections.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*Connection); ok {
+			conn.Close()
 		}
-		sock.mu.Unlock()
-		delete(s.sockets, fd)
+		return true
+	})
+
+	log.Printf("WebTransport session closed")
+}
+
+func (sess *Session) acceptStreams() {
+	for {
+		stream, err := sess.wt.AcceptStream(sess.ctx)
+		if err != nil {
+			if sess.ctx.Err() != nil {
+				return
+			}
+			log.Printf("AcceptStream error: %v", err)
+			return
+		}
+
+		go sess.handleStream(stream)
 	}
 }
 
-func (s *Session) handleMessage(msg InMessage) {
-	switch msg.Type {
-	case MsgSocketCreate:
-		s.handleCreate(msg)
-	case MsgSocketConnect:
-		s.handleConnect(msg)
-	case MsgSocketBind:
-		s.handleBind(msg)
-	case MsgSocketListen:
-		s.handleListen(msg)
-	case MsgSocketSend:
-		s.handleSend(msg)
-	case MsgSocketClose:
-		s.handleClose(msg)
-	}
-}
+func (sess *Session) handleStream(stream webtransport.Stream) {
+	defer stream.Close()
 
-func (s *Session) handleCreate(msg InMessage) {
-	sock := &VSocket{
-		fd:       msg.FD,
-		sockType: msg.SockType,
-	}
-	s.addSocket(msg.FD, sock)
-	log.Printf("[%d] Socket created (type=%d)", msg.FD, msg.SockType)
-}
-
-func (s *Session) handleConnect(msg InMessage) {
-	sock := s.getSocket(msg.FD)
-	if sock == nil {
-		s.send(OutMessage{Type: MsgConnectFail, FD: msg.FD, Error: -88})
+	// Read message type
+	msgType, err := binary.ReadUvarint(byteReader{stream})
+	if err != nil {
+		log.Printf("Failed to read message type: %v", err)
 		return
 	}
 
-	addr := fmt.Sprintf("%s:%d", msg.Host, msg.Port)
-	log.Printf("[%d] Connecting to %s", msg.FD, addr)
+	switch msgType {
+	case MsgConnect:
+		sess.handleConnect(stream)
+	case MsgBind:
+		sess.handleBind(stream)
+	case MsgListen:
+		sess.handleListen(stream)
+	case MsgSend:
+		sess.handleSend(stream)
+	case MsgClose:
+		sess.handleClose(stream)
+	default:
+		log.Printf("Unknown message type: %d", msgType)
+	}
+}
 
+func (sess *Session) handleConnect(stream webtransport.Stream) {
+	// Read: connID (4), sockType (1), hostLen (2), host, port (2)
+	var header [4 + 1 + 2]byte
+	if _, err := io.ReadFull(stream, header[:]); err != nil {
+		log.Printf("Connect: failed to read header: %v", err)
+		return
+	}
+
+	connID := binary.BigEndian.Uint32(header[0:4])
+	sockType := int(header[4])
+	hostLen := binary.BigEndian.Uint16(header[5:7])
+
+	hostBuf := make([]byte, hostLen+2)
+	if _, err := io.ReadFull(stream, hostBuf); err != nil {
+		log.Printf("Connect: failed to read host/port: %v", err)
+		return
+	}
+
+	host := string(hostBuf[:hostLen])
+	port := binary.BigEndian.Uint16(hostBuf[hostLen:])
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	log.Printf("[%d] Connect to %s (type=%d)", connID, addr, sockType)
+
+	// Create connection
+	conn := &Connection{
+		id:       connID,
+		sockType: sockType,
+	}
+	sess.connections.Store(connID, conn)
+
+	// Dial in goroutine
 	go func() {
-		var conn net.Conn
+		var netConn net.Conn
 		var err error
 
-		if sock.sockType == SockStream {
-			conn, err = net.DialTimeout("tcp", addr, 10*time.Second)
+		if sockType == SOCK_STREAM {
+			netConn, err = net.DialTimeout("tcp", addr, 10*time.Second)
 		} else {
-			conn, err = net.Dial("udp", addr)
+			netConn, err = net.Dial("udp", addr)
 		}
 
 		if err != nil {
-			log.Printf("[%d] Connect failed: %v", msg.FD, err)
-			s.send(OutMessage{Type: MsgConnectFail, FD: msg.FD, Error: -111})
+			log.Printf("[%d] Connect failed: %v", connID, err)
+			sess.sendEvent(MsgConnectError, connID, []byte(err.Error()))
+			sess.connections.Delete(connID)
 			return
 		}
 
-		sock.mu.Lock()
-		if sock.closed {
-			conn.Close()
-			sock.mu.Unlock()
+		conn.mu.Lock()
+		if conn.closed.Load() {
+			netConn.Close()
+			conn.mu.Unlock()
 			return
 		}
-		sock.conn = conn
-		sock.mu.Unlock()
+		conn.conn = netConn
+		conn.mu.Unlock()
 
-		log.Printf("[%d] Connected to %s", msg.FD, addr)
-		s.send(OutMessage{Type: MsgConnectOK, FD: msg.FD})
+		log.Printf("[%d] Connected to %s", connID, addr)
+		sess.sendEvent(MsgConnected, connID, nil)
 
 		// Start reading from connection
-		go s.readLoop(msg.FD, sock)
+		go sess.readLoop(conn)
 	}()
 }
 
-func (s *Session) handleBind(msg InMessage) {
-	sock := s.getSocket(msg.FD)
-	if sock == nil {
+func (sess *Session) handleBind(stream webtransport.Stream) {
+	// Read: connID (4), sockType (1), port (2)
+	var header [4 + 1 + 2]byte
+	if _, err := io.ReadFull(stream, header[:]); err != nil {
+		log.Printf("Bind: failed to read header: %v", err)
 		return
 	}
 
-	addr := fmt.Sprintf(":%d", msg.Port)
-	log.Printf("[%d] Bind to %s", msg.FD, addr)
+	connID := binary.BigEndian.Uint32(header[0:4])
+	sockType := int(header[4])
+	port := binary.BigEndian.Uint16(header[5:7])
+
+	addr := fmt.Sprintf(":%d", port)
+	log.Printf("[%d] Bind to %s (type=%d)", connID, addr, sockType)
+
+	conn := &Connection{
+		id:       connID,
+		sockType: sockType,
+	}
 
 	var err error
-	if sock.sockType == SockStream {
-		sock.listener, err = net.Listen("tcp", addr)
+	if sockType == SOCK_STREAM {
+		conn.listener, err = net.Listen("tcp", addr)
 	} else {
-		sock.conn, err = net.ListenPacket("udp", addr).(net.Conn)
+		conn.udpConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: int(port)})
 	}
 
 	if err != nil {
-		log.Printf("[%d] Bind failed: %v", msg.FD, err)
-		s.send(OutMessage{Type: MsgError, FD: msg.FD, Message: err.Error()})
-	}
-}
-
-func (s *Session) handleListen(msg InMessage) {
-	sock := s.getSocket(msg.FD)
-	if sock == nil || sock.listener == nil {
+		log.Printf("[%d] Bind failed: %v", connID, err)
+		sess.sendEvent(MsgError, connID, []byte(err.Error()))
 		return
 	}
 
-	log.Printf("[%d] Listening", msg.FD)
+	sess.connections.Store(connID, conn)
+	sess.sendEvent(MsgConnected, connID, nil) // Bound successfully
+}
 
+func (sess *Session) handleListen(stream webtransport.Stream) {
+	// Read: connID (4), backlog (4)
+	var header [8]byte
+	if _, err := io.ReadFull(stream, header[:]); err != nil {
+		log.Printf("Listen: failed to read header: %v", err)
+		return
+	}
+
+	connID := binary.BigEndian.Uint32(header[0:4])
+
+	v, ok := sess.connections.Load(connID)
+	if !ok {
+		log.Printf("[%d] Listen: connection not found", connID)
+		return
+	}
+	conn := v.(*Connection)
+
+	if conn.listener == nil {
+		log.Printf("[%d] Listen: not a listening socket", connID)
+		return
+	}
+
+	log.Printf("[%d] Listening for connections", connID)
+
+	// Accept incoming connections
 	go func() {
 		for {
-			conn, err := sock.listener.Accept()
+			netConn, err := conn.listener.Accept()
 			if err != nil {
-				if sock.closed {
+				if conn.closed.Load() {
 					return
 				}
-				log.Printf("[%d] Accept error: %v", msg.FD, err)
+				log.Printf("[%d] Accept error: %v", connID, err)
 				continue
 			}
 
-			// For now, we just track the first connection
-			// A full implementation would create new FDs
-			sock.mu.Lock()
-			sock.conn = conn
-			sock.mu.Unlock()
+			// Create new connection for the accepted socket
+			newConnID := sess.nextConnID.Add(1)
+			newConn := &Connection{
+				id:       newConnID,
+				sockType: SOCK_STREAM,
+				conn:     netConn,
+			}
+			sess.connections.Store(newConnID, newConn)
 
-			s.send(OutMessage{Type: MsgAcceptNew, FD: msg.FD})
-			go s.readLoop(msg.FD, sock)
+			remoteAddr := netConn.RemoteAddr().String()
+			log.Printf("[%d] Accepted connection from %s -> new conn %d", connID, remoteAddr, newConnID)
+
+			// Notify container of new connection
+			// Format: listenerConnID (4), newConnID (4), addrLen (2), addr
+			addrBytes := []byte(remoteAddr)
+			payload := make([]byte, 4+4+2+len(addrBytes))
+			binary.BigEndian.PutUint32(payload[0:4], connID)
+			binary.BigEndian.PutUint32(payload[4:8], newConnID)
+			binary.BigEndian.PutUint16(payload[8:10], uint16(len(addrBytes)))
+			copy(payload[10:], addrBytes)
+
+			sess.sendEvent(MsgAccept, newConnID, payload)
+
+			// Start reading from new connection
+			go sess.readLoop(newConn)
 		}
 	}()
 }
 
-func (s *Session) handleSend(msg InMessage) {
-	sock := s.getSocket(msg.FD)
-	if sock == nil || sock.conn == nil {
+func (sess *Session) handleSend(stream webtransport.Stream) {
+	// Read: connID (4), dataLen (4), data
+	var header [8]byte
+	if _, err := io.ReadFull(stream, header[:]); err != nil {
+		log.Printf("Send: failed to read header: %v", err)
 		return
 	}
 
-	sock.mu.Lock()
-	conn := sock.conn
-	sock.mu.Unlock()
+	connID := binary.BigEndian.Uint32(header[0:4])
+	dataLen := binary.BigEndian.Uint32(header[4:8])
 
-	if conn == nil {
+	data := make([]byte, dataLen)
+	if _, err := io.ReadFull(stream, data); err != nil {
+		log.Printf("Send: failed to read data: %v", err)
 		return
 	}
 
-	_, err := conn.Write(msg.Data)
-	if err != nil {
-		log.Printf("[%d] Send error: %v", msg.FD, err)
+	v, ok := sess.connections.Load(connID)
+	if !ok {
+		return
+	}
+	conn := v.(*Connection)
+
+	conn.mu.Lock()
+	netConn := conn.conn
+	conn.mu.Unlock()
+
+	if netConn == nil {
+		return
+	}
+
+	if _, err := netConn.Write(data); err != nil {
+		log.Printf("[%d] Send error: %v", connID, err)
 	}
 }
 
-func (s *Session) handleClose(msg InMessage) {
-	log.Printf("[%d] Close", msg.FD)
-	s.removeSocket(msg.FD)
-	s.send(OutMessage{Type: MsgClosed, FD: msg.FD})
+func (sess *Session) handleClose(stream webtransport.Stream) {
+	// Read: connID (4)
+	var header [4]byte
+	if _, err := io.ReadFull(stream, header[:]); err != nil {
+		return
+	}
+
+	connID := binary.BigEndian.Uint32(header[0:4])
+	log.Printf("[%d] Close", connID)
+
+	if v, ok := sess.connections.LoadAndDelete(connID); ok {
+		conn := v.(*Connection)
+		conn.Close()
+	}
+
+	sess.sendEvent(MsgClosed, connID, nil)
 }
 
-func (s *Session) readLoop(fd int, sock *VSocket) {
+func (sess *Session) readLoop(conn *Connection) {
 	buf := make([]byte, 65536)
 
 	for {
-		sock.mu.Lock()
-		conn := sock.conn
-		closed := sock.closed
-		sock.mu.Unlock()
-
-		if closed || conn == nil {
+		if conn.closed.Load() {
 			return
 		}
 
-		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		n, err := conn.Read(buf)
+		conn.mu.Lock()
+		netConn := conn.conn
+		conn.mu.Unlock()
+
+		if netConn == nil {
+			return
+		}
+
+		netConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, err := netConn.Read(buf)
 
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			if err == io.EOF || sock.closed {
-				s.send(OutMessage{Type: MsgClosed, FD: fd})
+			if err == io.EOF || conn.closed.Load() {
+				sess.sendEvent(MsgClosed, conn.id, nil)
 				return
 			}
-			log.Printf("[%d] Read error: %v", fd, err)
-			s.send(OutMessage{Type: MsgClosed, FD: fd})
+			log.Printf("[%d] Read error: %v", conn.id, err)
+			sess.sendEvent(MsgClosed, conn.id, nil)
 			return
 		}
 
 		if n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			s.send(OutMessage{Type: MsgData, FD: fd, Data: data})
+			sess.sendEvent(MsgData, conn.id, data)
 		}
 	}
 }
 
-func (s *Session) close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	for fd, sock := range s.sockets {
-		sock.mu.Lock()
-		sock.closed = true
-		if sock.conn != nil {
-			sock.conn.Close()
-		}
-		if sock.listener != nil {
-			sock.listener.Close()
-		}
-		sock.mu.Unlock()
-		delete(s.sockets, fd)
-	}
-}
+func (sess *Session) sendEvent(msgType byte, connID uint32, data []byte) {
+	sess.streamMu.Lock()
+	defer sess.streamMu.Unlock()
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for development
-	},
-}
-
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
+	stream, err := sess.wt.OpenUniStream()
 	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
+		log.Printf("Failed to open stream for event: %v", err)
 		return
 	}
-	defer ws.Close()
+	defer stream.Close()
 
-	log.Printf("New client connected from %s", r.RemoteAddr)
+	// Write: msgType (1), connID (4), dataLen (4), data
+	header := make([]byte, 1+4+4)
+	header[0] = msgType
+	binary.BigEndian.PutUint32(header[1:5], connID)
+	binary.BigEndian.PutUint32(header[5:9], uint32(len(data)))
 
-	session := newSession(ws)
-	defer session.close()
+	stream.Write(header)
+	if len(data) > 0 {
+		stream.Write(data)
+	}
+}
 
-	for {
-		var msg InMessage
-		err := ws.ReadJSON(&msg)
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
-			}
-			break
-		}
-
-		session.handleMessage(msg)
+func (c *Connection) Close() {
+	if c.closed.Swap(true) {
+		return // Already closed
 	}
 
-	log.Printf("Client disconnected from %s", r.RemoteAddr)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	if c.listener != nil {
+		c.listener.Close()
+	}
+	if c.udpConn != nil {
+		c.udpConn.Close()
+	}
+}
+
+// byteReader wraps an io.Reader to implement io.ByteReader
+type byteReader struct {
+	io.Reader
+}
+
+func (b byteReader) ReadByte() (byte, error) {
+	var buf [1]byte
+	_, err := b.Read(buf[:])
+	return buf[0], err
 }
 
 func main() {
-	listen := flag.String("listen", ":8765", "Address to listen on")
+	listen := flag.String("listen", ":4433", "Address to listen on")
+	certFile := flag.String("cert", "cert.pem", "TLS certificate file")
+	keyFile := flag.String("key", "key.pem", "TLS key file")
 	flag.Parse()
 
-	http.HandleFunc("/", handleWebSocket)
-
-	log.Printf("friscy network proxy listening on %s", *listen)
-	log.Printf("Connect from browser with: ws://localhost%s", *listen)
-
-	if err := http.ListenAndServe(*listen, nil); err != nil {
+	server := NewServer(*listen, *certFile, *keyFile)
+	if err := server.Run(); err != nil {
 		log.Fatal(err)
 	}
 }

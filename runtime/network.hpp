@@ -1,12 +1,17 @@
 // network.hpp - Socket syscall handlers for friscy
 //
 // This implements Linux socket syscalls by bridging to a host-side network
-// stack via WebSocket. In the browser, this connects to a gvisor-tap-vsock
-// based proxy running on the host.
+// stack via WebTransport (HTTP/3 + QUIC). In the browser, this connects to a
+// gvisor-tap-vsock based proxy running on the host.
 //
 // Architecture:
-//   Guest (RISC-V) -> libriscv syscall -> network.hpp -> JS bridge -> WebSocket
+//   Guest (RISC-V) -> libriscv syscall -> network.hpp -> JS bridge -> WebTransport
 //   -> Host Go process (gvisor-tap-vsock) -> Real network
+//
+// Key features:
+//   - Full TCP/UDP support
+//   - Incoming connections via listen/accept (bidirectional WebTransport)
+//   - Async I/O with buffer management
 //
 // For standalone/native builds, we can optionally use real sockets directly.
 
@@ -277,30 +282,47 @@ inline void sys_bind(Machine& m) {
         return;
     }
 
-    // For now, accept any bind (we're not actually binding to a port)
-    // The host-side proxy will handle actual binding
-
-#ifdef __EMSCRIPTEN__
-    // Read address and notify JS
+    // Read address data from guest memory
     std::vector<uint8_t> addr_data(addrlen);
     m.memory.memcpy_out(addr_data.data(), addr_ptr, addrlen);
 
-    EM_ASM({
-        if (typeof Module.onSocketBind === 'function') {
-            const addr = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
-            Module.onSocketBind($0, addr);
-        }
-    }, sockfd, addr_data.data(), addrlen);
-#endif
+#ifdef __EMSCRIPTEN__
+    // Allocate heap memory for the address data and pass to JS
+    uint8_t* heap_addr = (uint8_t*)malloc(addrlen);
+    if (heap_addr) {
+        memcpy(heap_addr, addr_data.data(), addrlen);
 
-    m.set_result(0);
+        int result = EM_ASM_INT({
+            if (typeof Module.onSocketBind === 'function') {
+                const addr = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                return Module.onSocketBind($0, addr);
+            }
+            return 0;
+        }, sockfd, heap_addr, addrlen);
+
+        free(heap_addr);
+        m.set_result(result);
+    } else {
+        m.set_result(-12);  // ENOMEM
+    }
+#else
+    // Native: use real bind
+    struct ::sockaddr_in native_addr;
+    memcpy(&native_addr, addr_data.data(), std::min(addrlen, (uint32_t)sizeof(native_addr)));
+
+    int result = ::bind(sock->native_fd, (struct sockaddr*)&native_addr, addrlen);
+    if (result == 0) {
+        m.set_result(0);
+    } else {
+        m.set_result(-errno);
+    }
+#endif
 }
 
 // syscall 201: listen(sockfd, backlog)
 inline void sys_listen(Machine& m) {
     int sockfd = m.template sysarg<int>(0);
     int backlog = m.template sysarg<int>(1);
-    (void)backlog;
 
     auto* sock = get_network_ctx().get_socket(sockfd);
     if (!sock) {
@@ -308,17 +330,27 @@ inline void sys_listen(Machine& m) {
         return;
     }
 
+#ifdef __EMSCRIPTEN__
     sock->listening = true;
 
-#ifdef __EMSCRIPTEN__
-    EM_ASM({
+    int result = EM_ASM_INT({
         if (typeof Module.onSocketListen === 'function') {
-            Module.onSocketListen($0, $1);
+            return Module.onSocketListen($0, $1);
         }
+        return 0;
     }, sockfd, backlog);
-#endif
 
-    m.set_result(0);
+    m.set_result(result);
+#else
+    // Native: use real listen
+    int result = ::listen(sock->native_fd, backlog);
+    if (result == 0) {
+        sock->listening = true;
+        m.set_result(0);
+    } else {
+        m.set_result(-errno);
+    }
+#endif
 }
 
 // syscall 202: accept(sockfd, addr, addrlen) / accept4
@@ -326,8 +358,6 @@ inline void sys_accept(Machine& m) {
     int sockfd = m.template sysarg<int>(0);
     uint64_t addr_ptr = m.template sysarg<uint64_t>(1);
     uint64_t addrlen_ptr = m.template sysarg<uint64_t>(2);
-    (void)addr_ptr;
-    (void)addrlen_ptr;
 
     auto* sock = get_network_ctx().get_socket(sockfd);
     if (!sock) {
@@ -340,9 +370,109 @@ inline void sys_accept(Machine& m) {
         return;
     }
 
-    // In async mode, this would block/return EAGAIN
-    // For now, stub as not implemented
-    m.set_result(err::NOSYS);
+#ifdef __EMSCRIPTEN__
+    // Check if there's a pending connection to accept via JS bridge
+    int has_pending = EM_ASM_INT({
+        if (typeof Module.hasPendingAccept === 'function') {
+            return Module.hasPendingAccept($0) ? 1 : 0;
+        }
+        return 0;
+    }, sockfd);
+
+    if (!has_pending) {
+        // No pending connections
+        if (sock->nonblocking) {
+            m.set_result(-11);  // EAGAIN
+        } else {
+            // Would need to block - not supported in Wasm main thread
+            m.set_result(-11);  // EAGAIN
+        }
+        return;
+    }
+
+    // Accept the connection via JS bridge
+    // Returns: new_fd (positive) or error (negative)
+    int new_fd = EM_ASM_INT({
+        if (typeof Module.onSocketAccept === 'function') {
+            var result = Module.onSocketAccept($0);
+            if (result && result.fd >= 0) {
+                // Store the accepted fd in our socket map
+                return result.fd;
+            }
+            return -11;  // EAGAIN
+        }
+        return -38;  // ENOSYS
+    }, sockfd);
+
+    if (new_fd < 0) {
+        m.set_result(new_fd);
+        return;
+    }
+
+    // Create a socket entry for the accepted connection
+    int result_fd = get_network_ctx().create_socket(sock->domain, sock->type, sock->protocol);
+    if (result_fd < 0) {
+        m.set_result(result_fd);
+        return;
+    }
+
+    auto* new_sock = get_network_ctx().get_socket(result_fd);
+    if (new_sock) {
+        new_sock->connected = true;
+    }
+
+    // Write peer address to caller if requested
+    if (addr_ptr && addrlen_ptr) {
+        sockaddr_in peer_addr;
+        memset(&peer_addr, 0, sizeof(peer_addr));
+        peer_addr.sin_family = af::INET;
+        peer_addr.sin_port = 0;  // Would need to get from JS
+        peer_addr.sin_addr = 0x0100007f;  // 127.0.0.1 placeholder
+
+        uint32_t addrlen;
+        m.memory.memcpy_out(&addrlen, addrlen_ptr, sizeof(addrlen));
+        uint32_t copy_len = std::min(addrlen, (uint32_t)sizeof(peer_addr));
+        m.memory.memcpy(addr_ptr, &peer_addr, copy_len);
+        m.memory.memcpy(addrlen_ptr, &copy_len, sizeof(copy_len));
+    }
+
+    m.set_result(result_fd);
+#else
+    // Native: use real accept
+    struct ::sockaddr_in peer_addr;
+    socklen_t peer_len = sizeof(peer_addr);
+
+    int new_fd = ::accept(sock->native_fd, (struct sockaddr*)&peer_addr, &peer_len);
+    if (new_fd < 0) {
+        m.set_result(-errno);
+        return;
+    }
+
+    // Create virtual socket for accepted connection
+    int result_fd = get_network_ctx().create_socket(sock->domain, sock->type, sock->protocol);
+    if (result_fd < 0) {
+        ::close(new_fd);
+        m.set_result(result_fd);
+        return;
+    }
+
+    auto* new_sock = get_network_ctx().get_socket(result_fd);
+    if (new_sock) {
+        new_sock->native_fd = new_fd;
+        new_sock->connected = true;
+    }
+
+    // Write peer address
+    if (addr_ptr && addrlen_ptr) {
+        uint32_t addrlen;
+        m.memory.memcpy_out(&addrlen, addrlen_ptr, sizeof(addrlen));
+        uint32_t copy_len = std::min(addrlen, (uint32_t)peer_len);
+        m.memory.memcpy(addr_ptr, &peer_addr, copy_len);
+        m.memory.memcpy(addrlen_ptr, &copy_len, sizeof(copy_len));
+    }
+
+    m.set_result(result_fd);
+#endif
 }
 
 // syscall 203: connect(sockfd, addr, addrlen)

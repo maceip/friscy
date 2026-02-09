@@ -1,0 +1,73 @@
+name: Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  rust-aot:
+    name: Build & test AOT compiler (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aot
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aot
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy lints
+        run: cargo clippy -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test
+
+  go-proxy:
+    name: Build & vet proxy (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run tests
+        run: go test ./...
+
+  shell-lint:
+    name: Lint shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: ShellCheck scripts
+        run: |
+          shellcheck scripts/*.sh
+          shellcheck tests/*.sh
+          shellcheck tools/harness.sh tools/setup_native_harness.sh tools/container_to_riscv.sh tools/friscy-pack

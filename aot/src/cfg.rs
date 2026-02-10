@@ -226,7 +226,7 @@ fn compute_successors(inst: &Instruction) -> Vec<u64> {
 /// Identify functions from the CFG
 fn identify_functions(blocks: &BTreeMap<u64, BasicBlock>, entry: u64) -> Vec<Function> {
     let mut functions = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
 
     // Find function entry points (called via JAL/JALR)
     let mut call_targets = BTreeSet::new();

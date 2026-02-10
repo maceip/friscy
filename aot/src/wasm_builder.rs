@@ -21,17 +21,13 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     let mut types = TypeSection::new();
 
     // Type 0: Block function (param $m i32) (result i32)
-    types.ty().function(vec![ValType::I32], vec![ValType::I32]);
+    types.function(vec![ValType::I32], vec![ValType::I32]);
 
     // Type 1: Dispatch function (param $m i32, $pc i32) (result i32)
-    types
-        .ty()
-        .function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+    types.function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
 
     // Type 2: Syscall handler (param $m i32, $pc i32) (result i32)
-    types
-        .ty()
-        .function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+    types.function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
 
     wasm.section(&types);
 
@@ -49,7 +45,6 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
             maximum: Some((module.memory_pages * 4) as u64),
             memory64: false,
             shared: false,
-            page_size_log2: None,
         },
     );
 
@@ -81,10 +76,8 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     // Table for block dispatch
     tables.table(TableType {
         element_type: wasm_encoder::RefType::FUNCREF,
-        table64: false,
-        minimum: module.functions.len() as u64,
-        maximum: Some(module.functions.len() as u64),
-        shared: false,
+        minimum: module.functions.len() as u32,
+        maximum: Some(module.functions.len() as u32),
     });
 
     wasm.section(&tables);
@@ -215,8 +208,8 @@ fn build_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64
 
         // call_indirect with type 0 (block function signature)
         func.instruction(&Instruction::CallIndirect {
-            type_index: 0,
-            table_index: 0,
+            ty: 0,
+            table: 0,
         });
 
         func.instruction(&Instruction::LocalSet(2));
@@ -250,94 +243,166 @@ fn can_use_dense_table(module: &WasmModule) -> bool {
     span <= (module.functions.len() as u64 * 2)
 }
 
-/// Emit sparse dispatch using if-else chain (for small block counts) or br_table
+/// Emit sparse dispatch using br_table with dense index mapping, or if-else fallback
 fn emit_sparse_dispatch(func: &mut Function, module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) {
-    // For small number of blocks, use if-else chain
-    // For larger numbers, use br_table with computed index
+    let sorted_addrs: Vec<(u64, u32)> = addr_to_table_idx.iter().map(|(&a, &t)| (a, t)).collect();
+    let n = sorted_addrs.len(); // number of real blocks
 
-    let num_blocks = module.functions.len();
-
-    if num_blocks <= 16 {
-        // If-else chain: check each address and call corresponding block
-        for (addr, &table_idx) in addr_to_table_idx.iter() {
-            func.instruction(&Instruction::LocalGet(2)); // $pc
-            func.instruction(&Instruction::I32Const(*addr as i32));
-            func.instruction(&Instruction::I32Eq);
-            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-
-            // Call block function via call_indirect
-            func.instruction(&Instruction::LocalGet(0)); // $m
-            func.instruction(&Instruction::I32Const(table_idx as i32));
-            func.instruction(&Instruction::CallIndirect {
-                type_index: 0,
-                table_index: 0,
-            });
-            func.instruction(&Instruction::LocalSet(2));
-            func.instruction(&Instruction::Br(1)); // Break to loop continue
-
-            func.instruction(&Instruction::End);
-        }
-
-        // Default: unknown PC, halt
+    if n == 0 {
         func.instruction(&Instruction::I32Const(-1));
         func.instruction(&Instruction::LocalSet(2));
+        return;
+    }
+
+    let base_addr = sorted_addrs[0].0;
+    let max_addr = sorted_addrs[n - 1].0;
+
+    // Compute alignment (GCD of all offsets from base) for compact indexing
+    let alignment = compute_addr_alignment(&sorted_addrs);
+    let table_size = if max_addr == base_addr {
+        1
     } else {
-        // For larger block counts, use br_table with sorted addresses
-        // Create block nesting for br_table targets
-        let sorted_addrs: Vec<(&u64, &u32)> = addr_to_table_idx.iter().collect();
+        ((max_addr - base_addr) / alignment + 1) as usize
+    };
 
-        // Emit nested blocks for each target
-        for _ in 0..num_blocks {
-            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-        }
-        // Default block
-        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    // Use br_table for O(1) dispatch when table fits in memory
+    if table_size <= 65536 {
+        emit_br_table_dispatch(func, &sorted_addrs, base_addr, alignment, table_size, n);
+    } else {
+        // Fallback: if-else chain for extremely sparse address spaces
+        emit_if_else_dispatch(func, &sorted_addrs);
+    }
+}
 
-        // Build br_table: map PC to block index via binary search
-        // For simplicity, we compute a hash index
-        func.instruction(&Instruction::LocalGet(2)); // $pc
+/// Compute the alignment (GCD) of block addresses for dense br_table indexing
+fn compute_addr_alignment(addrs: &[(u64, u32)]) -> u64 {
+    if addrs.len() <= 1 {
+        return 2; // minimum RISC-V instruction alignment (C extension)
+    }
+    let base = addrs[0].0;
+    let mut g = 0u64;
+    for &(addr, _) in &addrs[1..] {
+        g = gcd_u64(g, addr - base);
+    }
+    if g == 0 { 2 } else { g }
+}
 
-        // Simple hash: (pc >> 2) % num_blocks
-        func.instruction(&Instruction::I32Const(2));
+fn gcd_u64(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd_u64(b, a % b) }
+}
+
+/// Emit O(1) br_table dispatch with dense index mapping
+///
+/// Structure (n = number of real blocks):
+///   block $outer          ;; all cases break here to reach loop continue
+///    block $case_{n-1}
+///     ...
+///      block $case_0
+///       block $default
+///        ;; compute index = (pc - base) / alignment
+///        br_table [targets...] default
+///       end               ;; → DEFAULT handler
+///       DEFAULT: pc = -1; br n  (exits $outer)
+///      end                ;; → CASE 0 handler
+///      CASE 0: call block_0; br (n-1)
+///     end                 ;; → CASE 1 handler
+///     ...
+///    end                  ;; → CASE n-1 handler
+///    CASE n-1: call block_{n-1}; br 0  (exits $outer)
+///   end $outer            ;; falls through to loop continue
+fn emit_br_table_dispatch(
+    func: &mut Function,
+    sorted_addrs: &[(u64, u32)],
+    base_addr: u64,
+    alignment: u64,
+    table_size: usize,
+    n: usize,
+) {
+    // Build address → case number mapping
+    let mut addr_to_case: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for (case_num, &(addr, _)) in sorted_addrs.iter().enumerate() {
+        addr_to_case.insert(addr, case_num);
+    }
+
+    // Emit block nesting: $outer + n case blocks + $default (outermost to innermost)
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $outer
+    for _ in 0..n {
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $case_j
+    }
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $default
+
+    // Compute dense index: (pc - base_addr) / alignment
+    func.instruction(&Instruction::LocalGet(2)); // $pc
+    func.instruction(&Instruction::I32Const(base_addr as i32));
+    func.instruction(&Instruction::I32Sub);
+    let shift = alignment.trailing_zeros();
+    if alignment.is_power_of_two() && shift > 0 {
+        func.instruction(&Instruction::I32Const(shift as i32));
         func.instruction(&Instruction::I32ShrU);
-        func.instruction(&Instruction::I32Const(num_blocks as i32));
-        func.instruction(&Instruction::I32RemU);
+    } else if alignment > 1 {
+        func.instruction(&Instruction::I32Const(alignment as i32));
+        func.instruction(&Instruction::I32DivU);
+    }
 
-        // br_table: targets are 0..num_blocks, default is num_blocks (error block)
-        let targets: Vec<u32> = (0..num_blocks as u32).collect();
-        func.instruction(&Instruction::BrTable(targets.into(), num_blocks as u32));
-
-        // Default block: halt
-        func.instruction(&Instruction::End);
-        func.instruction(&Instruction::I32Const(-1));
-        func.instruction(&Instruction::LocalSet(2));
-
-        // For each block, verify address and call or continue searching
-        for (i, (addr, &table_idx)) in sorted_addrs.iter().enumerate() {
-            func.instruction(&Instruction::End);
-
-            // Verify this is the right address
-            func.instruction(&Instruction::LocalGet(2)); // $pc
-            func.instruction(&Instruction::I32Const(**addr as i32));
-            func.instruction(&Instruction::I32Eq);
-            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-
-            // Call the block
-            func.instruction(&Instruction::LocalGet(0)); // $m
-            func.instruction(&Instruction::I32Const(table_idx as i32));
-            func.instruction(&Instruction::CallIndirect {
-                type_index: 0,
-                table_index: 0,
-            });
-            func.instruction(&Instruction::LocalSet(2));
-
-            func.instruction(&Instruction::Else);
-            // Wrong address, halt (hash collision)
-            func.instruction(&Instruction::I32Const(-1));
-            func.instruction(&Instruction::LocalSet(2));
-            func.instruction(&Instruction::End);
+    // Build br_table targets:
+    //   From br_table position (inside $default + n case blocks + $outer):
+    //     depth 0 → $default → DEFAULT handler
+    //     depth (j+1) → $case_j → CASE j handler
+    let mut targets: Vec<u32> = Vec::with_capacity(table_size);
+    for i in 0..table_size {
+        let addr = base_addr + (i as u64) * alignment;
+        match addr_to_case.get(&addr) {
+            Some(&case_num) => targets.push((case_num + 1) as u32),
+            None => targets.push(0), // default
         }
     }
+
+    func.instruction(&Instruction::BrTable(targets.into(), 0)); // default = depth 0
+
+    // End $default block
+    func.instruction(&Instruction::End);
+    // DEFAULT handler: unknown PC, halt
+    func.instruction(&Instruction::I32Const(-1));
+    func.instruction(&Instruction::LocalSet(2));
+    func.instruction(&Instruction::Br(n as u32)); // exit $outer
+
+    // Emit case handlers (one per real block, in sorted address order)
+    for (case_num, &(_addr, table_idx)) in sorted_addrs.iter().enumerate() {
+        func.instruction(&Instruction::End); // end $case_{case_num}
+
+        // Call block function via call_indirect
+        func.instruction(&Instruction::LocalGet(0)); // $m
+        func.instruction(&Instruction::I32Const(table_idx as i32));
+        func.instruction(&Instruction::CallIndirect { ty: 0, table: 0 });
+        func.instruction(&Instruction::LocalSet(2));
+
+        // Break to $outer
+        func.instruction(&Instruction::Br((n - 1 - case_num) as u32));
+    }
+
+    func.instruction(&Instruction::End); // end $outer
+}
+
+/// Fallback: if-else chain dispatch for extremely sparse address spaces
+fn emit_if_else_dispatch(func: &mut Function, sorted_addrs: &[(u64, u32)]) {
+    for &(addr, table_idx) in sorted_addrs {
+        func.instruction(&Instruction::LocalGet(2)); // $pc
+        func.instruction(&Instruction::I32Const(addr as i32));
+        func.instruction(&Instruction::I32Eq);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+        func.instruction(&Instruction::LocalGet(0)); // $m
+        func.instruction(&Instruction::I32Const(table_idx as i32));
+        func.instruction(&Instruction::CallIndirect { ty: 0, table: 0 });
+        func.instruction(&Instruction::LocalSet(2));
+        func.instruction(&Instruction::Br(1)); // break to loop continue
+
+        func.instruction(&Instruction::End);
+    }
+
+    // Default: unknown PC, halt
+    func.instruction(&Instruction::I32Const(-1));
+    func.instruction(&Instruction::LocalSet(2));
 }
 
 /// Build a block function from our IR
@@ -383,8 +448,8 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
         }
         WasmInst::CallIndirect { type_idx } => {
             func.instruction(&Instruction::CallIndirect {
-                type_index: *type_idx,
-                table_index: 0,
+                ty: *type_idx,
+                table: 0,
             });
         }
 
@@ -576,12 +641,78 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
             func.instruction(&Instruction::I64GeU);
         }
 
+        // i32 loads
+        WasmInst::I32Load8S { offset } => {
+            func.instruction(&Instruction::I32Load8S(wasm_encoder::MemArg {
+                offset: *offset as u64, align: 0, memory_index: 0,
+            }));
+        }
+        WasmInst::I32Load8U { offset } => {
+            func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                offset: *offset as u64, align: 0, memory_index: 0,
+            }));
+        }
+        WasmInst::I32Load16S { offset } => {
+            func.instruction(&Instruction::I32Load16S(wasm_encoder::MemArg {
+                offset: *offset as u64, align: 1, memory_index: 0,
+            }));
+        }
+        WasmInst::I32Load16U { offset } => {
+            func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                offset: *offset as u64, align: 1, memory_index: 0,
+            }));
+        }
+        // i32 stores
+        WasmInst::I32Store8 { offset } => {
+            func.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
+                offset: *offset as u64, align: 0, memory_index: 0,
+            }));
+        }
+        WasmInst::I32Store16 { offset } => {
+            func.instruction(&Instruction::I32Store16(wasm_encoder::MemArg {
+                offset: *offset as u64, align: 1, memory_index: 0,
+            }));
+        }
+
         // i32 arithmetic
         WasmInst::I32Add => {
             func.instruction(&Instruction::I32Add);
         }
         WasmInst::I32Sub => {
             func.instruction(&Instruction::I32Sub);
+        }
+        WasmInst::I32Mul => {
+            func.instruction(&Instruction::I32Mul);
+        }
+        WasmInst::I32DivS => {
+            func.instruction(&Instruction::I32DivS);
+        }
+        WasmInst::I32DivU => {
+            func.instruction(&Instruction::I32DivU);
+        }
+        WasmInst::I32RemS => {
+            func.instruction(&Instruction::I32RemS);
+        }
+        WasmInst::I32RemU => {
+            func.instruction(&Instruction::I32RemU);
+        }
+        WasmInst::I32And => {
+            func.instruction(&Instruction::I32And);
+        }
+        WasmInst::I32Or => {
+            func.instruction(&Instruction::I32Or);
+        }
+        WasmInst::I32Xor => {
+            func.instruction(&Instruction::I32Xor);
+        }
+        WasmInst::I32Shl => {
+            func.instruction(&Instruction::I32Shl);
+        }
+        WasmInst::I32ShrS => {
+            func.instruction(&Instruction::I32ShrS);
+        }
+        WasmInst::I32ShrU => {
+            func.instruction(&Instruction::I32ShrU);
         }
         WasmInst::I32Eqz => {
             func.instruction(&Instruction::I32Eqz);
@@ -591,6 +722,30 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
         }
         WasmInst::I32Ne => {
             func.instruction(&Instruction::I32Ne);
+        }
+        WasmInst::I32LtS => {
+            func.instruction(&Instruction::I32LtS);
+        }
+        WasmInst::I32LtU => {
+            func.instruction(&Instruction::I32LtU);
+        }
+        WasmInst::I32GtS => {
+            func.instruction(&Instruction::I32GtS);
+        }
+        WasmInst::I32GtU => {
+            func.instruction(&Instruction::I32GtU);
+        }
+        WasmInst::I32LeS => {
+            func.instruction(&Instruction::I32LeS);
+        }
+        WasmInst::I32LeU => {
+            func.instruction(&Instruction::I32LeU);
+        }
+        WasmInst::I32GeS => {
+            func.instruction(&Instruction::I32GeS);
+        }
+        WasmInst::I32GeU => {
+            func.instruction(&Instruction::I32GeU);
         }
 
         // Conversions
@@ -838,9 +993,127 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
             func.instruction(&Instruction::I64ReinterpretF64);
         }
 
+        // i64 extended ops
+        WasmInst::I64Rotl => {
+            func.instruction(&Instruction::I64Rotl);
+        }
+        WasmInst::I64Rotr => {
+            func.instruction(&Instruction::I64Rotr);
+        }
+        WasmInst::I64Clz => {
+            func.instruction(&Instruction::I64Clz);
+        }
+        WasmInst::I64Ctz => {
+            func.instruction(&Instruction::I64Ctz);
+        }
+        WasmInst::I64Popcnt => {
+            func.instruction(&Instruction::I64Popcnt);
+        }
+
+        // Unreachable
+        WasmInst::Unreachable => {
+            func.instruction(&Instruction::Unreachable);
+        }
+
         // Comments are no-ops
         WasmInst::Comment { .. } => {}
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::{WasmFunction, WasmModule};
+
+    /// Helper: create a minimal WasmModule with block functions at the given addresses
+    fn make_module(addrs: &[u64]) -> WasmModule {
+        let mut functions = Vec::new();
+        let mut block_to_func = std::collections::HashMap::new();
+        for (i, &addr) in addrs.iter().enumerate() {
+            block_to_func.insert(addr, i);
+            functions.push(WasmFunction {
+                name: format!("block_{:x}", addr),
+                block_addr: addr,
+                body: vec![
+                    // return next_pc = addr + 4 (as i32 via i64 wrap)
+                    WasmInst::I32Const { value: -1 }, // halt after this block
+                ],
+                num_locals: 0,
+            });
+        }
+        WasmModule {
+            functions,
+            memory_pages: 8,
+            entry: addrs.first().copied().unwrap_or(0),
+            block_to_func,
+        }
+    }
+
+    #[test]
+    fn test_build_empty_module() {
+        let module = make_module(&[]);
+        let bytes = build(&module).unwrap();
+        // Should start with Wasm magic "\0asm"
+        assert_eq!(&bytes[0..4], b"\0asm");
+    }
+
+    #[test]
+    fn test_build_single_block() {
+        let module = make_module(&[0x1000]);
+        let bytes = build(&module).unwrap();
+        assert_eq!(&bytes[0..4], b"\0asm");
+        assert!(bytes.len() > 8); // non-trivial output
+    }
+
+    #[test]
+    fn test_build_dense_blocks() {
+        // Dense addresses: 0x1000, 0x1004, 0x1008, 0x100c
+        let module = make_module(&[0x1000, 0x1004, 0x1008, 0x100c]);
+        let bytes = build(&module).unwrap();
+        assert_eq!(&bytes[0..4], b"\0asm");
+    }
+
+    #[test]
+    fn test_build_sparse_blocks_br_table() {
+        // Sparse addresses that trigger br_table dispatch (not dense enough for simple indexing)
+        // Spread out far enough that can_use_dense_table returns false
+        let addrs: Vec<u64> = (0..20).map(|i| 0x10000 + i * 0x100).collect();
+        let module = make_module(&addrs);
+        // Verify it's actually sparse (not dense)
+        assert!(!can_use_dense_table(&module));
+        let bytes = build(&module).unwrap();
+        assert_eq!(&bytes[0..4], b"\0asm");
+        assert!(bytes.len() > 100);
+    }
+
+    #[test]
+    fn test_build_sparse_blocks_mixed_alignment() {
+        // Addresses with mixed 2-byte and 4-byte offsets (simulating C extension mixing)
+        let addrs = vec![0x1000, 0x1002, 0x1006, 0x1008, 0x100e, 0x1010,
+                         0x1014, 0x1018, 0x101a, 0x101e, 0x1020, 0x1024,
+                         0x1028, 0x102a, 0x102e, 0x1030, 0x1034, 0x1038];
+        let module = make_module(&addrs);
+        let bytes = build(&module).unwrap();
+        assert_eq!(&bytes[0..4], b"\0asm");
+    }
+
+    #[test]
+    fn test_compute_addr_alignment_power_of_two() {
+        let addrs = vec![(0x1000u64, 0u32), (0x1004, 1), (0x1008, 2), (0x100c, 3)];
+        assert_eq!(compute_addr_alignment(&addrs), 4);
+    }
+
+    #[test]
+    fn test_compute_addr_alignment_two_byte() {
+        let addrs = vec![(0x1000u64, 0u32), (0x1002, 1), (0x1006, 2)];
+        assert_eq!(compute_addr_alignment(&addrs), 2);
+    }
+
+    #[test]
+    fn test_compute_addr_alignment_single() {
+        let addrs = vec![(0x1000u64, 0u32)];
+        assert_eq!(compute_addr_alignment(&addrs), 2); // minimum C-ext alignment
+    }
 }

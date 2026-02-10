@@ -392,22 +392,19 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             Module.FS.writeFile('/rootfs.tar', rootfsData);
 
             // Set up stdin from terminal
-            let inputBuffer = [];
-            let inputResolve = null;
-
             term.onData((data) => {
-                if (inputResolve) {
-                    inputBuffer.push(...data.split('').map(c => c.charCodeAt(0)));
-                    inputResolve();
-                    inputResolve = null;
-                } else {
-                    inputBuffer.push(...data.split('').map(c => c.charCodeAt(0)));
+                if (!Module._stdinBuffer) Module._stdinBuffer = [];
+                for (let i = 0; i < data.length; i++) {
+                    Module._stdinBuffer.push(data.charCodeAt(i));
                 }
             });
 
             statusEl.textContent = 'Running...';
             term.writeln('Starting: ' + manifest.entrypoint);
             term.writeln('─'.repeat(40));
+
+            // Connect terminal output to xterm.js
+            Module._termWrite = (text) => term.write(text);
 
             // Run the container
             try {

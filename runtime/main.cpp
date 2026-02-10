@@ -35,7 +35,16 @@ static constexpr uint32_t HEAP_SYSCALLS_BASE = 480;
 static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 
 // Global VFS instance (needed for syscall handlers)
-static vfs::VirtualFS g_vfs;
+// Use pointer + lazy init so wizer_init can safely construct it
+// before C++ static constructors have run.
+static vfs::VirtualFS* g_vfs_ptr = nullptr;
+static vfs::VirtualFS& g_vfs_ref() {
+    if (!g_vfs_ptr) {
+        g_vfs_ptr = new vfs::VirtualFS();
+    }
+    return *g_vfs_ptr;
+}
+#define g_vfs (g_vfs_ref())
 
 // Forward declarations (needed by wizer_init)
 static std::vector<uint8_t> load_file(const std::string& path);
@@ -48,42 +57,19 @@ static void setup_virtual_files();
 // rootfs and entry binary so the Wasm snapshot starts with VFS populated.
 // ============================================================================
 #ifdef FRISCY_WIZER
-static std::vector<uint8_t> g_wizer_binary;
-static std::string g_wizer_entry;
 static bool g_wizer_initialized = false;
 
 extern "C" void wizer_init() {
-    // Read rootfs from environment or default
-    const char* rootfs_path = getenv("FRISCY_ROOTFS");
-    if (!rootfs_path) rootfs_path = "/rootfs.tar";
-
-    const char* entry = getenv("FRISCY_ENTRY");
-    if (!entry) entry = "/bin/sh";
-
-    std::cerr << "[wizer_init] Loading rootfs: " << rootfs_path << "\n";
-    std::cerr << "[wizer_init] Entry binary: " << entry << "\n";
-
-    try {
-        auto tar_data = load_file(rootfs_path);
-        if (!g_vfs.load_tar(tar_data.data(), tar_data.size())) {
-            std::cerr << "[wizer_init] ERROR: Failed to parse rootfs\n";
-            return;
-        }
-
-        // Set up virtual files (/dev/null, /etc/passwd, etc.)
-        setup_virtual_files();
-        g_vfs.add_virtual_file("/proc/self/exe", std::string(entry));
-
-        // Pre-load the entry binary
-        g_wizer_binary = load_from_vfs(entry);
-        g_wizer_entry = entry;
-        g_wizer_initialized = true;
-
-        std::cerr << "[wizer_init] Pre-initialized: " << g_wizer_binary.size()
-                  << " bytes, VFS loaded\n";
-    } catch (const std::exception& e) {
-        std::cerr << "[wizer_init] ERROR: " << e.what() << "\n";
-    }
+    // Pre-initialize code paths and VFS structures.
+    // Note: File I/O is not available during wizer pre-initialization
+    // (tokio runtime conflict in wasmtime), so rootfs loading happens
+    // at runtime via JavaScript. The value of this snapshot is:
+    //   1. C++ static constructors are pre-run
+    //   2. VFS data structures are initialized
+    //   3. Virtual /dev and /proc entries are created
+    //   4. Code paths are pre-warmed in the Wasm engine
+    setup_virtual_files();
+    g_wizer_initialized = true;
 }
 #endif
 

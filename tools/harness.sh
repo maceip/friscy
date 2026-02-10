@@ -67,8 +67,9 @@ echo ""
 
 mkdir -p build
 
-# Use latest emsdk for best Wasm optimizations
-EMSDK_VERSION="3.1.50"
+# Use latest emsdk for final-spec Wasm exception handling (try_table/exnref)
+# Required for wizer (wasmtime) compatibility — emsdk 3.1.50 emits legacy try/catch
+EMSDK_VERSION="latest"
 
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -82,8 +83,8 @@ docker run --rm \
             -DCMAKE_BUILD_TYPE=Release \
             -DFRISCY_PRODUCTION=${PRODUCTION} \
             -DFRISCY_WIZER=${WIZER} \
-            -DCMAKE_CXX_FLAGS=\"-fexceptions\" \
-            -DCMAKE_C_FLAGS=\"-fexceptions\" \
+            -DCMAKE_CXX_FLAGS=\"-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0\" \
+            -DCMAKE_C_FLAGS=\"-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0\" \
         && emmake make -j\$(nproc) VERBOSE=1
     "
 
@@ -117,6 +118,8 @@ if [ "$WIZER" = "ON" ] && command -v wizer &> /dev/null; then
     echo ""
     echo "Creating Wizer snapshot..."
     wizer build/friscy.wasm \
+        --allow-wasi \
+        --wasm-exceptions=true \
         --init-func wizer_init \
         -o build/friscy-snapshot.wasm
     ls -lh build/friscy-snapshot.wasm

@@ -5,12 +5,15 @@
 
 set -euo pipefail
 
+# Use sudo when not running as root (remote Claude VMs run as root, local dev doesn't)
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+
 echo "=== friscy: Initializing Environment Setup ==="
 
 # 1. System Dependencies
 echo "Installing base system packages..."
-sudo apt-get update
-sudo apt-get install -y \
+$SUDO apt-get update
+$SUDO apt-get install -y \
     build-essential cmake git python3 nodejs npm xz-utils wget curl jq file xxd \
     ca-certificates gnupg gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
 
@@ -18,18 +21,18 @@ sudo apt-get install -y \
 # Required for friscy-pack and RISC-V container extraction
 if ! command -v docker &> /dev/null; then
     echo "Installing Docker Engine..."
-    sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    $SUDO install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
 
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-    sudo apt-get update
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
-    
+    $SUDO apt-get update
+    $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+
     # Register QEMU handlers for RISC-V emulation
-    sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+    $SUDO docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 fi
 
 # 3. Rust Toolchain
@@ -46,7 +49,7 @@ if ! command -v go &> /dev/null; then
     echo "Installing Go (1.21.6)..."
     GO_VER="1.21.6"
     wget -q "https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz"
-    sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf "go${GO_VER}.linux-amd64.tar.gz"
+    $SUDO rm -rf /usr/local/go && $SUDO tar -C /usr/local -xzf "go${GO_VER}.linux-amd64.tar.gz"
     rm "go${GO_VER}.linux-amd64.tar.gz"
     
     # Update PATH for current session and bashrc

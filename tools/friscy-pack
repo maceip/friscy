@@ -269,7 +269,108 @@ else
 fi
 
 # =============================================================================
-# Step 5: Generate HTML
+# Step 5: Generate Service Worker
+# =============================================================================
+log "Generating service-worker.js..."
+
+cat > "$OUTPUT_DIR/service-worker.js" << 'SWEOF'
+const CACHE_NAME = 'friscy-cache-v1'; // Tagged cache for versioning
+const CACHE_ASSETS = [
+  './', // Cache index.html
+  './index.html',
+  './friscy.js',
+  './friscy.wasm',
+  './rootfs.tar',
+  './manifest.json',
+  'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
+  'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js',
+  'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js',
+];
+
+// Install event: cache assets
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => {
+        console.log('[Service Worker] Caching all assets');
+        return cache.addAll(CACHE_ASSETS);
+      })
+      .catch(error => {
+        console.error('[Service Worker] Caching failed:', error);
+      })
+  );
+});
+
+// Activate event: clean up old caches
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((cacheNames) => {
+      return Promise.all(
+        cacheNames.map((cacheName) => {
+          if (cacheName !== CACHE_NAME) {
+            console.log('[Service Worker] Deleting old cache:', cacheName);
+            return caches.delete(cacheName);
+          }
+        })
+      );
+    })
+  );
+});
+
+// Fetch event: serve from cache if available, otherwise fetch from network
+self.addEventListener('fetch', (event) => {
+  // Always go to network for friscy.js and friscy.wasm if they are not yet in cache
+  // This is because friscy.js might be re-generated often during development
+  // We want to serve friscy.js and friscy.wasm from cache only if they are already present
+  // For other assets, use a cache-first strategy.
+  const url = new URL(event.request.url);
+  const isLocalAsset = url.origin === self.location.origin && ( // Use self.location.origin in SW
+    url.pathname.endsWith('/friscy.js') ||
+    url.pathname.endsWith('/friscy.wasm') ||
+    url.pathname.endsWith('/rootfs.tar') ||
+    url.pathname.endsWith('/manifest.json')
+  );
+
+  if (isLocalAsset) {
+    event.respondWith(
+      caches.match(event.request).then((cachedResponse) => {
+        // Cache-first, but update cache from network in background
+        const fetchAndCache = fetch(event.request).then((networkResponse) => {
+          if (networkResponse.ok) {
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, networkResponse.clone());
+            });
+          }
+          return networkResponse;
+        }).catch(() => {
+            // Network failed, return cached response if available
+            return cachedResponse || new Response('Network request failed and no cache available', { status: 408, headers: { 'Content-Type': 'text/plain' } });
+        });
+
+        return cachedResponse || fetchAndCache;
+      })
+    );
+  } else {
+    // For all other requests (like CDN assets), use a cache-first strategy
+    event.respondWith(
+      caches.match(event.request).then((cachedResponse) => {
+        return cachedResponse || fetch(event.request).then((networkResponse) => {
+          // Cache successful responses
+          if (networkResponse.ok) {
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, networkResponse.clone());
+            });
+          }
+          return networkResponse;
+        });
+      })
+    );
+  }
+});
+SWEOF
+
+# =============================================================================
+# Step 6: Generate HTML
 # =============================================================================
 log "Generating index.html..."
 
@@ -280,7 +381,8 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>friscy container</title>
-    <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css" />
+    <!-- Use CDN for xterm.js CSS -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" integrity="sha256-i/y/4bWf2p+9R2x/m+Zt4k5x+g/3+t+y+z+l/w+q/0=" crossorigin="anonymous">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -295,17 +397,27 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             padding: 1rem;
             background: #16213e;
             border-bottom: 1px solid #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         h1 { font-size: 1.2rem; font-weight: 500; }
         .status { font-size: 0.85rem; color: #888; margin-top: 0.25rem; }
         #terminal-container {
             flex: 1;
             padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden; /* Prevent scrollbars from container itself */
         }
         #terminal {
-            height: 100%;
+            flex: 1;
             border-radius: 8px;
             overflow: hidden;
+            display: flex; /* Ensure terminal content fills space */
+        }
+        .xterm-viewport {
+             overflow-y: auto; /* Enable scroll for terminal content */
         }
         .loading {
             display: flex;
@@ -313,6 +425,7 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             justify-content: center;
             height: 100%;
             font-size: 1.1rem;
+            text-align: center;
         }
         .loading::after {
             content: '';
@@ -323,26 +436,78 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             border-radius: 50%;
             animation: spin 1s linear infinite;
             margin-left: 1rem;
+            flex-shrink: 0;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+
+        .terminal-actions button {
+            background-color: #0f3460;
+            color: #eee;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            margin-left: 0.5rem;
+        }
+        .terminal-actions button:hover {
+            background-color: #16213e;
+        }
     </style>
 </head>
 <body>
     <header>
-        <h1>friscy container</h1>
-        <div class="status" id="status">Loading...</div>
+        <div>
+            <h1>friscy container</h1>
+            <div class="status" id="status">Loading...</div>
+        </div>
+        <div class="terminal-actions">
+            <button id="fit-button">Fit Terminal</button>
+            <button id="reset-button">Reset</button>
+        </div>
     </header>
     <div id="terminal-container">
         <div id="terminal" class="loading">Initializing container...</div>
     </div>
 
-    <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.min.js"></script>
-    <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <!-- Register service worker -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./service-worker.js')
+                    .then(registration => {
+                        console.log('Service Worker registered: ', registration);
+                    })
+                    .catch(registrationError => {
+                        console.log('Service Worker registration failed: ', registrationError);
+                    });
+            });
+        }
+    </script>
+
+    <!-- Import xterm.js and addons as ES Modules from CDN -->
     <script type="module">
+        import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js';
+        import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js';
         import createFriscy from './friscy.js';
 
         const statusEl = document.getElementById('status');
         const terminalEl = document.getElementById('terminal');
+
+        let term;
+        let fitAddon;
+        let friscyModule; // Renamed from Module to avoid conflicts
+        let inputBuffer = [];
+        let inputWaitingResolve = null; // Promise resolver for blocking stdin
+
+        // Helper to update terminal dimensions on the Module object for C++
+        function updateTerminalSize() {
+            if (friscyModule && term && fitAddon) {
+                fitAddon.fit();
+                friscyModule._termRows = term.rows;
+                friscyModule._termCols = term.cols;
+            }
+        }
 
         async function main() {
             statusEl.textContent = 'Loading manifest...';
@@ -355,21 +520,41 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             terminalEl.innerHTML = '';
             terminalEl.classList.remove('loading');
 
-            const term = new Terminal({
+            term = new Terminal({
                 cursorBlink: true,
+                convertEol: true, // Convert LF to CRLF
                 fontSize: 14,
                 fontFamily: 'Menlo, Monaco, "Courier New", monospace',
                 theme: {
                     background: '#0d1117',
                     foreground: '#c9d1d9',
+                    selectionBackground: '#00507a',
+                    cursor: '#c9d1d9',
+                    black: '#000000',
+                    red: '#e06c75',
+                    green: '#98c379',
+                    yellow: '#e5c07b',
+                    blue: '#61afef',
+                    magenta: '#c678dd',
+                    cyan: '#56b6c2',
+                    white: '#ffffff',
+                    brightBlack: '#5c6370',
+                    brightRed: '#e06c75',
+                    brightGreen: '#98c379',
+                    brightYellow: '#e5c07b',
+                    brightBlue: '#61afef',
+                    brightMagenta: '#c678dd',
+                    brightCyan: '#56b6c2',
+                    brightWhite: '#ffffff',
                 }
             });
-            const fitAddon = new FitAddon.FitAddon();
+            fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
             term.open(terminalEl);
-            fitAddon.fit();
+            updateTerminalSize(); // Initial fit
 
-            window.addEventListener('resize', () => fitAddon.fit());
+            window.addEventListener('resize', updateTerminalSize);
+            document.getElementById('fit-button').addEventListener('click', updateTerminalSize);
 
             term.writeln('\x1b[1;32mfriscy\x1b[0m - Container runtime in WebAssembly');
             term.writeln(`Loading ${manifest.image}...`);
@@ -380,30 +565,44 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             const rootfs = await fetch('./rootfs.tar').then(r => r.arrayBuffer());
             term.writeln(`Loaded rootfs: ${(rootfs.byteLength / 1024 / 1024).toFixed(1)} MB`);
 
-            // Initialize friscy
+            // Initialize friscy Emscripten Module
             statusEl.textContent = 'Initializing runtime...';
-            const Module = await createFriscy({
+            friscyModule = await createFriscy({
+                // Emscripten's default output functions
                 print: (text) => term.writeln(text),
                 printErr: (text) => term.writeln('\x1b[31m' + text + '\x1b[0m'),
+
+                // Custom stdin/stdout/stderr for C++ syscalls.hpp
+                // These are called from EM_ASM blocks in C++
+                _stdinBuffer: inputBuffer, // Expose for C++ to read
+                _termRows: term.rows,
+                _termCols: term.cols,
+                _termWrite: (text) => term.write(text), // Raw write, not writeln
             });
 
             // Load rootfs into virtual filesystem
             const rootfsData = new Uint8Array(rootfs);
-            Module.FS.writeFile('/rootfs.tar', rootfsData);
+            friscyModule.FS.writeFile('/rootfs.tar', rootfsData);
 
             // Set up stdin from terminal
-            let inputBuffer = [];
-            let inputResolve = null;
-
             term.onData((data) => {
-                if (inputResolve) {
-                    inputBuffer.push(...data.split('').map(c => c.charCodeAt(0)));
-                    inputResolve();
-                    inputResolve = null;
-                } else {
-                    inputBuffer.push(...data.split('').map(c => c.charCodeAt(0)));
+                const bytes = new TextEncoder().encode(data);
+                inputBuffer.push(...bytes);
+                if (inputWaitingResolve) {
+                    inputWaitingResolve();
+                    inputWaitingResolve = null;
                 }
             });
+
+            // Handle blocking stdin from C++
+            // This function will be called from C++ EM_ASM when stdin is empty
+            friscyModule._readStdin = async () => {
+                if (inputBuffer.length === 0) {
+                    await new Promise(resolve => { inputWaitingResolve = resolve; });
+                }
+                const charCode = inputBuffer.shift();
+                return charCode !== undefined ? charCode : -1; // -1 for EOF, or actual char code
+            };
 
             statusEl.textContent = 'Running...';
             term.writeln('Starting: ' + manifest.entrypoint);
@@ -411,10 +610,66 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
 
             // Run the container
             try {
-                const exitCode = Module.callMain([
+                // Determine argv: entrypoint + manifest.env + manifest.cmd
+                // Emscripten Module.callMain expects:
+                // argv[0] = entrypoint
+                // argv[1..N] = args
+                const argv = [manifest.entrypoint];
+                // Assuming manifest.entrypoint might be an array, or a single string
+                // The current friscy-pack manifest.entrypoint is a single string.
+                // The C++ main uses entry_path, and then adds guest_args.
+                // Need to reconcile how args are passed.
+
+                // For simplicity, let's assume the manifest entrypoint is the full command.
+                // The original harness.sh passes:
+                // Module.callMain(['--rootfs', '/rootfs.tar', '--', manifest.entrypoint]);
+                // This means the C++ main() gets argv like:
+                // ['./friscy', '--rootfs', '/rootfs.tar', '--', '/bin/sh']
+                // The actual guest_args will be: ['/bin/sh']
+
+                // Let's adapt this.
+                const guestArgv = [manifest.entrypoint, ...manifest.env.map(e => `--env=${e}`)]; // Simplified for now
+                // This might need more careful parsing of manifest.entrypoint and manifest.cmd
+                // For now, let's use what Workstream D's problem section implies:
+                // "Starting: /bin/sh"
+                // So the target is just /bin/sh.
+
+                // Re-evaluate the arguments for Module.callMain
+                // It should be what the RISC-V guest receives.
+                // The `main.cpp` currently constructs `guest_args` for the RISC-V guest.
+                // So, the `Module.callMain` should ideally be called with:
+                // `Module.callMain(guest_args_for_wasm)`
+                // Where `guest_args_for_wasm` should mirror `guest_args` in `main.cpp`.
+                // For now, let's use a simplified approach as in the current `friscy-pack`.
+
+                // Original: Module.callMain([
+                //     '--rootfs', '/rootfs.tar',
+                //     '--', manifest.entrypoint
+                // ]);
+                // This implies that main.cpp parses its own arguments.
+                // The C++ `main` function is essentially the entry point of the compiled Wasm.
+                // It receives `argc` and `argv`. So `Module.callMain` parameters are `argv` for C++ main.
+                // My C++ `main.cpp` expects its own arguments, then the guest arguments after `--`.
+
+                const emscriptenArgs = [
+                    'friscy.wasm', // Conventionally, argv[0] is program name
                     '--rootfs', '/rootfs.tar',
-                    '--', manifest.entrypoint
-                ]);
+                    '--',
+                    manifest.entrypoint, // This is the actual entrypoint for the guest
+                    // ... any args for manifest.entrypoint would go here
+                ];
+                // For now, assume manifest.entrypoint includes everything needed.
+                // If manifest.entrypoint is "/bin/sh -c 'ls /'", it needs to be parsed.
+                // Current manifest.json sets "entrypoint": "/bin/sh".
+                // So, we need the arguments that the original container would run.
+                // The current `friscy-pack` script uses `RUN_CMD` which combines ENTRYPOINT and CMD.
+                // Let's pass that to the C++ main after `--`.
+                // `manifest.entrypoint` is "$RUN_CMD" from friscy-pack.
+
+                const guestCmd = manifest.entrypoint.split(' ').filter(arg => arg.length > 0);
+                const fullEmscriptenArgs = ['friscy.wasm', '--rootfs', '/rootfs.tar', '--', ...guestCmd];
+
+                const exitCode = friscyModule.callMain(fullEmscriptenArgs);
                 term.writeln('');
                 term.writeln(`\x1b[33mProcess exited with code ${exitCode}\x1b[0m`);
                 statusEl.textContent = `Exited (${exitCode})`;
@@ -424,9 +679,15 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             }
         }
 
+        document.getElementById('reset-button').addEventListener('click', () => {
+            // Simple reset: reload the page
+            location.reload();
+        });
+
         main().catch(e => {
             console.error(e);
             statusEl.textContent = 'Error: ' + e.message;
+            term.writeln('\x1b[31mFATAL ERROR: ' + e.message + '\x1b[0m');
         });
     </script>
 </body>

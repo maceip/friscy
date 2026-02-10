@@ -122,9 +122,18 @@ if(EMSCRIPTEN)
         -sSTACK_SIZE=1048576            # 1MB stack
         -sEXPORT_ES6=1
         -sMODULARIZE=1
-        -sEXPORTED_RUNTIME_METHODS=['FS','callMain','HEAPU8']
-        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
+        -sEXPORTED_RUNTIME_METHODS=['FS','callMain']
     )
+
+    # Build consolidated EXPORTED_FUNCTIONS list
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar")
+    if(FRISCY_WIZER)
+        list(APPEND FRISCY_EXPORTS "_wizer_init")
+        target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
+    endif()
+    # Format as ['_main','_malloc',...] for Emscripten
+    list(JOIN FRISCY_EXPORTS "','" FRISCY_EXPORTS_STR)
+    list(APPEND FRISCY_LINK_FLAGS "-sEXPORTED_FUNCTIONS=['${FRISCY_EXPORTS_STR}']")
 
     if(FRISCY_PRODUCTION)
         list(APPEND FRISCY_LINK_FLAGS
@@ -140,14 +149,6 @@ if(EMSCRIPTEN)
             -O2
             -sASSERTIONS=1
         )
-    endif()
-
-    # Wizer support for instant snapshots
-    if(FRISCY_WIZER)
-        list(APPEND FRISCY_LINK_FLAGS
-            -sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_wizer_init']
-        )
-        target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
     endif()
 
     target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})

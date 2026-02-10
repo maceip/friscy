@@ -37,6 +37,11 @@ static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 // Global VFS instance (needed for syscall handlers)
 static vfs::VirtualFS g_vfs;
 
+// Forward declarations (needed by wizer_init)
+static std::vector<uint8_t> load_file(const std::string& path);
+static std::vector<uint8_t> load_from_vfs(const std::string& path);
+static void setup_virtual_files();
+
 // ============================================================================
 // Wizer pre-initialization support (Workstream E)
 // When built with -DFRISCY_WIZER, the wizer_init() function pre-loads the
@@ -140,6 +145,29 @@ static void setup_virtual_files() {
     // /etc/resolv.conf
     g_vfs.add_virtual_file("/etc/resolv.conf", "nameserver 8.8.8.8\n");
 }
+
+// ============================================================================
+// Emscripten VFS tar export (Workstream F)
+// JavaScript calls _friscy_export_tar to get the VFS as a tar blob.
+// Caller must Module._free() the returned pointer after use.
+// ============================================================================
+#ifdef __EMSCRIPTEN__
+extern "C" uint8_t* friscy_export_tar(uint32_t* out_size) {
+    auto tar = g_vfs.save_tar();
+    if (tar.empty()) {
+        if (out_size) *out_size = 0;
+        return nullptr;
+    }
+    uint8_t* buf = static_cast<uint8_t*>(malloc(tar.size()));
+    if (!buf) {
+        if (out_size) *out_size = 0;
+        return nullptr;
+    }
+    memcpy(buf, tar.data(), tar.size());
+    if (out_size) *out_size = static_cast<uint32_t>(tar.size());
+    return buf;
+}
+#endif
 
 // Print usage
 static void usage(const char* argv0) {

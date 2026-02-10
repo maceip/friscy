@@ -194,23 +194,22 @@ static void sys_read(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Read from JavaScript stdin buffer
-        size_t bytes_read = 0;
-        std::vector<uint8_t> buf(count);
-        for (size_t i = 0; i < count; i++) {
-            int ch = EM_ASM_INT({
-                if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
-                    return Module._stdinBuffer.shift();
-                }
-                return -1;
-            });
-            if (ch < 0) break;
-            buf[bytes_read++] = (uint8_t)ch;
-        }
-        if (bytes_read > 0) {
-            m.memory.memcpy(buf_addr, buf.data(), bytes_read);
-        }
+        // Call into JavaScript to get input
+        int bytes_read = EM_ASM_INT({
+            // Check if inputBuffer has data
+            if (typeof Module._stdinBuffer === 'undefined') Module._stdinBuffer = [];
+            if (Module._stdinBuffer.length === 0) return 0;  // No data available
+
+            var count = Math.min($1, Module._stdinBuffer.length);
+            for (var i = 0; i < count; i++) {
+                Module.HEAPU8[$0 + i] = Module._stdinBuffer[i];
+            }
+            Module._stdinBuffer.splice(0, count);
+            return count;
+        }, buf_addr, count); // Note: $0 is buf_addr, $1 is count
+
         m.set_result(bytes_read);
+        return;
 #else
         m.set_result(0);  // EOF for stdin
 #endif
@@ -676,31 +675,42 @@ static void sys_readv(Machine& m) {
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
         // Read from JavaScript stdin buffer into iovec
-        size_t total = 0;
-        for (int i = 0; i < iovcnt; i++) {
-            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
-            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
-            if (len > 0) {
-                std::vector<uint8_t> buf(len);
-                size_t bytes_read = 0;
-                for (size_t j = 0; j < len; j++) {
-                    int ch = EM_ASM_INT({
-                        if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
-                            return Module._stdinBuffer.shift();
-                        }
-                        return -1;
-                    });
-                    if (ch < 0) break;
-                    buf[bytes_read++] = (uint8_t)ch;
+        size_t total_bytes_read = EM_ASM_INT({
+            if (typeof Module._stdinBuffer === 'undefined') Module._stdinBuffer = [];
+            if (Module._stdinBuffer.length === 0) return 0; // No data available
+
+            var iov_addr = $0; // Address of the iovec array in guest memory
+            var iovcnt = $1;   // Number of iovec entries
+            var current_total_bytes_read = 0;
+
+            for (var i = 0; i < iovcnt; i++) {
+                // Read base (iov_base) and len (iov_len) for each iovec entry
+                // Assuming WASM memory is 32-bit addressable, so iov_base fits into a JS number.
+                // Assuming iov_len also fits into a JS number.
+                var base_ptr = iov_addr + i * 16;
+                var len_ptr = iov_addr + i * 16 + 8;
+
+                // Read 64-bit values from guest memory.
+                // For simplicity, we'll assume the high 32 bits are 0 for addresses and lengths,
+                // which is common for WASM memory access patterns.
+                var base = Module.HEAPU32[base_ptr / 4];
+                var len = Module.HEAPU32[len_ptr / 4];
+                
+                var bytes_to_copy = Math.min(len, Module._stdinBuffer.length);
+                if (bytes_to_copy === 0) break; // No more data for this or subsequent iovs
+
+                for (var j = 0; j < bytes_to_copy; j++) {
+                    Module.HEAPU8[base + j] = Module._stdinBuffer.shift();
                 }
-                if (bytes_read > 0) {
-                    m.memory.memcpy(base, buf.data(), bytes_read);
-                    total += bytes_read;
-                }
-                if (bytes_read < len) break;  // Short read
+                current_total_bytes_read += bytes_to_copy;
+
+                if (Module._stdinBuffer.length === 0) break; // Consumed all available stdin
+                if (bytes_to_copy < len) break; // Short read for this iov, stop processing further iovs
             }
-        }
-        m.set_result(total);
+            return current_total_bytes_read;
+        }, iov_addr, iovcnt);
+
+        m.set_result(total_bytes_read);
 #else
         m.set_result(0);  // EOF for stdin
 #endif

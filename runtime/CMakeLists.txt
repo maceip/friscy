@@ -77,7 +77,8 @@ if(FRISCY_PRODUCTION)
             -O3
             -flto
             -fno-rtti
-            -fexceptions
+            -fwasm-exceptions
+            -sWASM_LEGACY_EXCEPTIONS=0
             -DNDEBUG
             -msimd128              # WASM SIMD
             -mbulk-memory          # Fast memcpy/memset
@@ -97,7 +98,8 @@ else()
     if(EMSCRIPTEN)
         target_compile_options(friscy PRIVATE
             -O2
-            -fexceptions
+            -fwasm-exceptions
+            -sWASM_LEGACY_EXCEPTIONS=0
             -msimd128              # WASM SIMD (2-4x faster memcpy)
             -mbulk-memory          # Fast memcpy/memset intrinsics
         )
@@ -112,7 +114,9 @@ endif()
 # --- Link flags ---
 if(EMSCRIPTEN)
     set(FRISCY_LINK_FLAGS
-        -fexceptions
+        -fwasm-exceptions
+        -sWASM_LEGACY_EXCEPTIONS=0
+        -sSUPPORT_LONGJMP=0
         -msimd128                       # WASM SIMD for faster memory ops
         -mbulk-memory                   # memory.copy, memory.fill intrinsics
         -sALLOW_TABLE_GROWTH
@@ -147,8 +151,10 @@ if(EMSCRIPTEN)
     else()
         list(APPEND FRISCY_LINK_FLAGS
             -O2
-            -sASSERTIONS=1
         )
+        if(NOT FRISCY_WIZER)
+            list(APPEND FRISCY_LINK_FLAGS -sASSERTIONS=1)
+        endif()
     endif()
 
     target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})

@@ -117,6 +117,7 @@ if(EMSCRIPTEN)
         -fwasm-exceptions
         -sWASM_LEGACY_EXCEPTIONS=0
         -sSUPPORT_LONGJMP=0
+        -sJSPI                          # Enable async I/O via JS Promise Integration
         -msimd128                       # WASM SIMD for faster memory ops
         -mbulk-memory                   # memory.copy, memory.fill intrinsics
         -sALLOW_TABLE_GROWTH

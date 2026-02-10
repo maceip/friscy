@@ -45,6 +45,7 @@ namespace nr {
     constexpr int pread64       = 67;
     constexpr int pwrite64      = 68;
     constexpr int sendfile      = 71;
+    constexpr int ppoll         = 73;
     constexpr int readlinkat    = 78;
     constexpr int newfstatat    = 79;
     constexpr int fstat         = 80;
@@ -154,8 +155,10 @@ inline vfs::VirtualFS& get_fs(Machine& m) {
 namespace handlers {
 
 static void sys_exit(Machine& m) {
+    auto code = m.template sysarg<int>(0);
+    std::cerr << "[exit] code=" << code << "\n";
     m.stop();
-    m.set_result(m.template sysarg<int>(0));
+    m.set_result(code);
 }
 
 static void sys_openat(Machine& m) {
@@ -163,6 +166,10 @@ static void sys_openat(Machine& m) {
     int dirfd = m.template sysarg<int>(0);
     auto path_addr = m.sysarg(1);
     int flags = m.template sysarg<int>(2);
+    try {
+        std::string p = m.memory.memstring(path_addr);
+        std::cerr << "[openat] path=" << p << " flags=0x" << std::hex << flags << std::dec << "\n";
+    } catch (...) {}
 
     if (dirfd != AT_FDCWD) {
         m.set_result(err::NOTSUP);
@@ -191,25 +198,42 @@ static void sys_read(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
+    std::cerr << "[read] fd=" << fd << " count=" << count << "\n";
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Call into JavaScript to get input
-        int bytes_read = EM_ASM_INT({
-            // Check if inputBuffer has data
-            if (typeof Module._stdinBuffer === 'undefined') Module._stdinBuffer = [];
-            if (Module._stdinBuffer.length === 0) return 0;  // No data available
+        // Poll for stdin data, yielding to browser event loop via JSPI.
+        // Without sleep, read() returns 0 immediately = EOF = shell exits.
+        int polls = 0;
+        while (true) {
+            int bytes_read = EM_ASM_INT({
+                if (typeof Module._stdinBuffer === 'undefined') Module._stdinBuffer = [];
+                if (Module._stdinEOF) { console.log('[stdin] EOF flag set'); return 0; }
+                if (Module._stdinBuffer.length === 0) return -1;  // No data yet
 
-            var count = Math.min($1, Module._stdinBuffer.length);
-            for (var i = 0; i < count; i++) {
-                Module.HEAPU8[$0 + i] = Module._stdinBuffer[i];
+                var count = Math.min($1, Module._stdinBuffer.length);
+                for (var i = 0; i < count; i++) {
+                    Module.HEAPU8[$0 + i] = Module._stdinBuffer[i];
+                }
+                Module._stdinBuffer.splice(0, count);
+                console.log('[stdin] read', count, 'bytes');
+                return count;
+            }, buf_addr, count);
+
+            if (bytes_read >= 0) {
+                if (polls > 0) {
+                    EM_ASM({ console.log('[stdin] returning', $0, 'after', $1, 'polls'); },
+                        bytes_read, polls);
+                }
+                m.set_result(bytes_read);
+                return;
             }
-            Module._stdinBuffer.splice(0, count);
-            return count;
-        }, buf_addr, count); // Note: $0 is buf_addr, $1 is count
-
-        m.set_result(bytes_read);
-        return;
+            polls++;
+            if (polls <= 3 || polls % 100 == 0) {
+                EM_ASM({ console.log('[stdin] poll #' + $0 + ', sleeping...'); }, polls);
+            }
+            emscripten_sleep(10);
+        }
 #else
         m.set_result(0);  // EOF for stdin
 #endif
@@ -578,6 +602,7 @@ static void sys_sendfile(Machine& m) {
 static void sys_ioctl(Machine& m) {
     int fd = m.template sysarg<int>(0);
     unsigned long request = m.sysarg(1);
+    std::cerr << "[ioctl] fd=" << fd << " req=0x" << std::hex << request << std::dec << "\n";
 
     // TIOCGWINSZ - get window size
     if (request == 0x5413 && (fd == 0 || fd == 1 || fd == 2)) {
@@ -671,46 +696,41 @@ static void sys_readv(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto iov_addr = m.sysarg(1);
     int iovcnt = m.template sysarg<int>(2);
+    std::cerr << "[readv] fd=" << fd << " iovcnt=" << iovcnt << "\n";
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Read from JavaScript stdin buffer into iovec
-        size_t total_bytes_read = EM_ASM_INT({
-            if (typeof Module._stdinBuffer === 'undefined') Module._stdinBuffer = [];
-            if (Module._stdinBuffer.length === 0) return 0; // No data available
+        // Poll for stdin data, yielding to browser event loop via Asyncify.
+        while (true) {
+            int result = EM_ASM_INT({
+                if (typeof Module._stdinBuffer === 'undefined') Module._stdinBuffer = [];
+                if (Module._stdinEOF) return 0;
+                if (Module._stdinBuffer.length === 0) return -1;  // No data yet
 
-            var iov_addr = $0; // Address of the iovec array in guest memory
-            var iovcnt = $1;   // Number of iovec entries
-            var current_total_bytes_read = 0;
+                var iov_addr = $0;
+                var iovcnt = $1;
+                var total = 0;
 
-            for (var i = 0; i < iovcnt; i++) {
-                // Read base (iov_base) and len (iov_len) for each iovec entry
-                // Assuming WASM memory is 32-bit addressable, so iov_base fits into a JS number.
-                // Assuming iov_len also fits into a JS number.
-                var base_ptr = iov_addr + i * 16;
-                var len_ptr = iov_addr + i * 16 + 8;
-
-                // Read 64-bit values from guest memory.
-                // For simplicity, we'll assume the high 32 bits are 0 for addresses and lengths,
-                // which is common for WASM memory access patterns.
-                var base = Module.HEAPU32[base_ptr / 4];
-                var len = Module.HEAPU32[len_ptr / 4];
-                
-                var bytes_to_copy = Math.min(len, Module._stdinBuffer.length);
-                if (bytes_to_copy === 0) break; // No more data for this or subsequent iovs
-
-                for (var j = 0; j < bytes_to_copy; j++) {
-                    Module.HEAPU8[base + j] = Module._stdinBuffer.shift();
+                for (var i = 0; i < iovcnt; i++) {
+                    var base = Module.HEAPU32[(iov_addr + i * 16) / 4];
+                    var len = Module.HEAPU32[(iov_addr + i * 16 + 8) / 4];
+                    var n = Math.min(len, Module._stdinBuffer.length);
+                    if (n === 0) break;
+                    for (var j = 0; j < n; j++) {
+                        Module.HEAPU8[base + j] = Module._stdinBuffer.shift();
+                    }
+                    total += n;
+                    if (Module._stdinBuffer.length === 0 || n < len) break;
                 }
-                current_total_bytes_read += bytes_to_copy;
+                return total;
+            }, iov_addr, iovcnt);
 
-                if (Module._stdinBuffer.length === 0) break; // Consumed all available stdin
-                if (bytes_to_copy < len) break; // Short read for this iov, stop processing further iovs
+            if (result >= 0) {
+                m.set_result(result);
+                return;
             }
-            return current_total_bytes_read;
-        }, iov_addr, iovcnt);
-
-        m.set_result(total_bytes_read);
+            emscripten_sleep(10);
+        }
 #else
         m.set_result(0);  // EOF for stdin
 #endif
@@ -903,6 +923,70 @@ static void sys_sysinfo(Machine& m) {
     m.set_result(0);
 }
 
+// ppoll(fds, nfds, timeout, sigmask) - poll file descriptors
+// Linux pollfd: { int32_t fd; int16_t events; int16_t revents; }
+// POLLIN = 1, POLLOUT = 4, POLLERR = 8, POLLHUP = 16
+static void sys_ppoll(Machine& m) {
+    auto fds_addr = m.sysarg(0);
+    uint64_t nfds = m.sysarg(1);
+    std::cerr << "[ppoll] called with nfds=" << nfds << "\n";
+
+    if (nfds == 0) {
+        m.set_result(0);
+        return;
+    }
+    if (nfds > 64) nfds = 64;  // sanity cap
+
+    // Check if any polled fd is stdin — if so, we may need to sleep
+    bool has_stdin = false;
+    for (uint64_t i = 0; i < nfds; i++) {
+        int32_t fd = m.memory.template read<int32_t>(fds_addr + i * 8);
+        if (fd == 0) { has_stdin = true; break; }
+    }
+
+#ifdef __EMSCRIPTEN__
+    if (has_stdin) {
+        // Wait until stdin has data (or EOF), yielding via JSPI
+        while (true) {
+            int avail = EM_ASM_INT({
+                if (typeof Module._stdinBuffer === 'undefined') Module._stdinBuffer = [];
+                if (Module._stdinEOF) return 1;
+                return Module._stdinBuffer.length > 0 ? 1 : 0;
+            });
+            if (avail) break;
+            emscripten_sleep(10);
+        }
+    }
+#endif
+
+    // Fill in revents for each fd
+    int ready = 0;
+    for (uint64_t i = 0; i < nfds; i++) {
+        auto entry_addr = fds_addr + i * 8;
+        int32_t fd = m.memory.template read<int32_t>(entry_addr);
+        int16_t events = m.memory.template read<int16_t>(entry_addr + 4);
+        int16_t revents = 0;
+
+        if (fd == 0 || fd == 1 || fd == 2) {
+            // stdin: report POLLIN if requested
+            if (fd == 0 && (events & 1)) revents |= 1;  // POLLIN
+            // stdout/stderr: always writable
+            if ((fd == 1 || fd == 2) && (events & 4)) revents |= 4;  // POLLOUT
+        } else if (get_fs(m).is_open(fd)) {
+            // VFS files: report as readable and writable
+            if (events & 1) revents |= 1;
+            if (events & 4) revents |= 4;
+        } else {
+            revents = 0x20;  // POLLNVAL
+        }
+
+        m.memory.template write<int16_t>(entry_addr + 6, revents);
+        if (revents) ready++;
+    }
+
+    m.set_result(ready);
+}
+
 }  // namespace handlers
 
 // Install all syscall handlers
@@ -949,6 +1033,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::dup3, sys_dup3);
     machine.install_syscall_handler(nr::pipe2, sys_pipe2);
     machine.install_syscall_handler(nr::readv, sys_readv);
+    machine.install_syscall_handler(nr::ppoll, sys_ppoll);
     machine.install_syscall_handler(nr::sendfile, sys_sendfile);
     machine.install_syscall_handler(nr::pread64, sys_pread64);
     machine.install_syscall_handler(nr::pwrite64, sys_pwrite64);

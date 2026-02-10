@@ -23,6 +23,9 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 using Machine = riscv::Machine<riscv::RISCV64>;
 
@@ -33,6 +36,51 @@ static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 
 // Global VFS instance (needed for syscall handlers)
 static vfs::VirtualFS g_vfs;
+
+// ============================================================================
+// Wizer pre-initialization support (Workstream E)
+// When built with -DFRISCY_WIZER, the wizer_init() function pre-loads the
+// rootfs and entry binary so the Wasm snapshot starts with VFS populated.
+// ============================================================================
+#ifdef FRISCY_WIZER
+static std::vector<uint8_t> g_wizer_binary;
+static std::string g_wizer_entry;
+static bool g_wizer_initialized = false;
+
+extern "C" void wizer_init() {
+    // Read rootfs from environment or default
+    const char* rootfs_path = getenv("FRISCY_ROOTFS");
+    if (!rootfs_path) rootfs_path = "/rootfs.tar";
+
+    const char* entry = getenv("FRISCY_ENTRY");
+    if (!entry) entry = "/bin/sh";
+
+    std::cerr << "[wizer_init] Loading rootfs: " << rootfs_path << "\n";
+    std::cerr << "[wizer_init] Entry binary: " << entry << "\n";
+
+    try {
+        auto tar_data = load_file(rootfs_path);
+        if (!g_vfs.load_tar(tar_data.data(), tar_data.size())) {
+            std::cerr << "[wizer_init] ERROR: Failed to parse rootfs\n";
+            return;
+        }
+
+        // Set up virtual files (/dev/null, /etc/passwd, etc.)
+        setup_virtual_files();
+        g_vfs.add_virtual_file("/proc/self/exe", std::string(entry));
+
+        // Pre-load the entry binary
+        g_wizer_binary = load_from_vfs(entry);
+        g_wizer_entry = entry;
+        g_wizer_initialized = true;
+
+        std::cerr << "[wizer_init] Pre-initialized: " << g_wizer_binary.size()
+                  << " bytes, VFS loaded\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[wizer_init] ERROR: " << e.what() << "\n";
+    }
+}
+#endif
 
 // Load a file into memory
 static std::vector<uint8_t> load_file(const std::string& path) {
@@ -113,6 +161,7 @@ int main(int argc, char** argv) {
 
     std::string rootfs_path;
     std::string entry_path;
+    std::string export_tar_path;
     std::vector<std::string> guest_args;
     bool container_mode = false;
 
@@ -127,6 +176,12 @@ int main(int argc, char** argv) {
             container_mode = true;
             rootfs_path = argv[++i];
             entry_path = argv[++i];
+        } else if (strcmp(argv[i], "--export-tar") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --export-tar requires <path>\n";
+                return 1;
+            }
+            export_tar_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -321,10 +376,25 @@ int main(int argc, char** argv) {
         }
 
         // Route guest stdout/stderr to host
+#ifdef __EMSCRIPTEN__
+        machine.set_printer([](const auto&, const char* data, size_t len) {
+            EM_ASM({
+                if (typeof Module._termWrite === 'function') {
+                    // Use TextDecoder to handle potential partial UTF-8 sequences between chunks
+                    if (!Module._decoder) Module._decoder = new TextDecoder();
+                    var view = Module.HEAPU8.subarray($0, $0 + $1);
+                    Module._termWrite(Module._decoder.decode(view, {stream: true}));
+                } else {
+                    out(UTF8ToString($0, $1));
+                }
+            }, data, len);
+        });
+#else
         machine.set_printer([](const auto&, const char* data, size_t len) {
             std::cout.write(data, len);
             std::cout.flush();
         });
+#endif
 
         std::cout << "[friscy] Starting execution...\n";
         std::cout << "----------------------------------------\n";
@@ -341,6 +411,19 @@ int main(int argc, char** argv) {
         std::cout << "[friscy] Execution complete\n";
         std::cout << "[friscy] Instructions: " << instructions << "\n";
         std::cout << "[friscy] Exit code: " << exit_code << "\n";
+
+        // Export VFS as tar if requested
+        if (!export_tar_path.empty()) {
+            std::cout << "[friscy] Exporting VFS to tar: " << export_tar_path << "\n";
+            auto tar_data = g_vfs.save_tar();
+            std::ofstream out(export_tar_path, std::ios::binary);
+            if (!out) {
+                std::cerr << "Error: Could not open export tar path: " << export_tar_path << "\n";
+                return 1;
+            }
+            out.write(reinterpret_cast<const char*>(tar_data.data()), tar_data.size());
+            std::cout << "[friscy] Exported " << tar_data.size() << " bytes\n";
+        }
 
         return static_cast<int>(exit_code);
 

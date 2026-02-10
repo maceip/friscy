@@ -60,6 +60,11 @@ constexpr uint32_t PT_PHDR    = 6;
 constexpr uint16_t ET_EXEC = 2;
 constexpr uint16_t ET_DYN  = 3;
 
+// ELF segment permission flags
+constexpr uint32_t PF_X = 1;
+constexpr uint32_t PF_W = 2;
+constexpr uint32_t PF_R = 4;
+
 constexpr uint16_t EM_RISCV = 0xF3;
 
 // Auxiliary vector types (for dynamic linker)
@@ -368,6 +373,13 @@ inline uint64_t load_elf_segments(
             if (memsz > filesz) {
                 machine.memory.memset(vaddr + filesz, 0, memsz - filesz);
             }
+
+            // Set page permissions (critical for execute access)
+            riscv::PageAttributes attr;
+            attr.read  = (phdr->p_flags & elf::PF_R) != 0;
+            attr.write = (phdr->p_flags & elf::PF_W) != 0;
+            attr.exec  = (phdr->p_flags & elf::PF_X) != 0;
+            machine.memory.set_page_attr(vaddr, memsz, attr);
         }
 
         phoff += ehdr->e_phentsize;

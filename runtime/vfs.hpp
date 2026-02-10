@@ -760,6 +760,16 @@ public:
         return "";
     }
 
+    // Serialize the VFS tree to a POSIX tar archive
+    std::vector<uint8_t> save_tar() {
+        std::vector<uint8_t> out;
+        // Walk the tree depth-first starting from root children
+        save_tar_recursive(out, root_, "");
+        // End-of-archive: two 512-byte zero blocks
+        out.resize(out.size() + 1024, 0);
+        return out;
+    }
+
 private:
     std::shared_ptr<Entry> root_;
     std::string cwd_;
@@ -876,6 +886,188 @@ private:
         }
 
         parent->children[name] = entry;
+    }
+
+    // --- Tar serialization helpers ---
+
+    static void write_octal(uint8_t* buf, size_t len, uint64_t val) {
+        // Write octal value as ASCII, null-terminated, right-aligned
+        // len includes the null terminator position
+        if (len < 2) return;
+        buf[len - 1] = '\0';
+        for (size_t i = len - 2; i < len; i--) {
+            buf[i] = '0' + (val & 7);
+            val >>= 3;
+            if (i == 0) break;
+        }
+    }
+
+    static uint32_t compute_tar_checksum(const uint8_t* header) {
+        uint32_t sum = 0;
+        for (int i = 0; i < 512; i++) {
+            // The checksum field (offset 148..155) is treated as spaces
+            if (i >= 148 && i < 156) {
+                sum += ' ';
+            } else {
+                sum += header[i];
+            }
+        }
+        return sum;
+    }
+
+    void emit_long_name_header(std::vector<uint8_t>& out, const std::string& long_name) {
+        // GNU tar ././@LongLink extension for names > 100 chars
+        uint8_t header[512];
+        memset(header, 0, 512);
+
+        // Name: ././@LongLink
+        memcpy(header, "././@LongLink", 13);
+
+        // Mode
+        write_octal(header + 100, 8, 0);
+        // UID
+        write_octal(header + 108, 8, 0);
+        // GID
+        write_octal(header + 116, 8, 0);
+        // Size: length of the long name including null terminator
+        size_t name_size = long_name.size() + 1;
+        write_octal(header + 124, 12, name_size);
+        // Mtime
+        write_octal(header + 136, 12, 0);
+        // Type flag: 'L' for long name
+        header[156] = 'L';
+        // Magic
+        memcpy(header + 257, "ustar", 5);
+        header[262] = ' ';
+        // Version
+        header[263] = ' ';
+
+        // Compute checksum
+        uint32_t cksum = compute_tar_checksum(header);
+        // Write checksum as 6 octal digits + null + space
+        write_octal(header + 148, 7, cksum);
+        header[155] = ' ';
+
+        // Write header
+        out.insert(out.end(), header, header + 512);
+
+        // Write name data (padded to 512-byte boundary)
+        size_t padded = ((name_size + 511) / 512) * 512;
+        size_t base = out.size();
+        out.resize(base + padded, 0);
+        memcpy(out.data() + base, long_name.c_str(), long_name.size() + 1);
+    }
+
+    void emit_tar_header(std::vector<uint8_t>& out, const std::string& path,
+                         const std::shared_ptr<Entry>& entry) {
+        std::string tar_path = path;
+
+        // Directories get trailing slash
+        if (entry->is_dir() && !tar_path.empty() && tar_path.back() != '/') {
+            tar_path += '/';
+        }
+
+        // If name is too long, emit a LongLink header first
+        if (tar_path.size() > 100) {
+            emit_long_name_header(out, tar_path);
+        }
+
+        uint8_t header[512];
+        memset(header, 0, 512);
+
+        // Name (first 100 chars)
+        size_t name_copy = std::min(tar_path.size(), (size_t)100);
+        memcpy(header, tar_path.c_str(), name_copy);
+
+        // Mode
+        write_octal(header + 100, 8, entry->mode);
+        // UID
+        write_octal(header + 108, 8, entry->uid);
+        // GID
+        write_octal(header + 116, 8, entry->gid);
+
+        // Size (only for regular files with content)
+        uint64_t content_size = 0;
+        if (entry->type == FileType::Regular) {
+            content_size = entry->content.size();
+        }
+        write_octal(header + 124, 12, content_size);
+
+        // Mtime
+        write_octal(header + 136, 12, entry->mtime);
+
+        // Type flag
+        char type_flag = '0';
+        switch (entry->type) {
+            case FileType::Regular:  type_flag = '0'; break;
+            case FileType::Directory: type_flag = '5'; break;
+            case FileType::Symlink:  type_flag = '2'; break;
+            case FileType::CharDev:  type_flag = '3'; break;
+            case FileType::BlockDev: type_flag = '4'; break;
+            case FileType::Fifo:     type_flag = '6'; break;
+            default:                 type_flag = '0'; break;
+        }
+        header[156] = type_flag;
+
+        // Link target for symlinks
+        if (entry->type == FileType::Symlink) {
+            size_t link_copy = std::min(entry->link_target.size(), (size_t)100);
+            memcpy(header + 157, entry->link_target.c_str(), link_copy);
+        }
+
+        // UStar magic and version
+        memcpy(header + 257, "ustar", 5);
+        header[262] = '\0';
+        header[263] = '0';
+        header[264] = '0';
+
+        // Owner and group name (optional, leave as "root")
+        memcpy(header + 265, "root", 4);
+        memcpy(header + 297, "root", 4);
+
+        // Compute and write checksum
+        uint32_t cksum = compute_tar_checksum(header);
+        write_octal(header + 148, 7, cksum);
+        header[155] = ' ';
+
+        // Write header
+        out.insert(out.end(), header, header + 512);
+
+        // Write file content if regular file
+        if (entry->type == FileType::Regular && content_size > 0) {
+            out.insert(out.end(), entry->content.begin(), entry->content.end());
+            // Pad to 512-byte boundary
+            size_t remainder = content_size % 512;
+            if (remainder != 0) {
+                size_t padding = 512 - remainder;
+                out.resize(out.size() + padding, 0);
+            }
+        }
+    }
+
+    void save_tar_recursive(std::vector<uint8_t>& out,
+                            const std::shared_ptr<Entry>& node,
+                            const std::string& prefix) {
+        // Collect and sort children for deterministic output
+        std::vector<std::string> names;
+        names.reserve(node->children.size());
+        for (const auto& [name, _] : node->children) {
+            names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());
+
+        for (const auto& name : names) {
+            auto& child = node->children.at(name);
+            std::string child_path = prefix.empty() ? name : prefix + "/" + name;
+
+            // Emit tar header for this entry
+            emit_tar_header(out, child_path, child);
+
+            // Recurse into directories
+            if (child->is_dir()) {
+                save_tar_recursive(out, child, child_path);
+            }
+        }
     }
 };
 

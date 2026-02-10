@@ -10,6 +10,9 @@
 #include <cstring>
 #include <random>
 #include <iostream>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 namespace syscalls {
 
@@ -41,6 +44,7 @@ namespace nr {
     constexpr int writev        = 66;
     constexpr int pread64       = 67;
     constexpr int pwrite64      = 68;
+    constexpr int sendfile      = 71; // Added missing sendfile
     constexpr int readlinkat    = 78;
     constexpr int newfstatat    = 79;
     constexpr int fstat         = 80;
@@ -189,7 +193,23 @@ static void sys_read(Machine& m) {
     size_t count = m.sysarg(2);
 
     if (fd == 0) {
+#ifdef __EMSCRIPTEN__
+        // Read from JavaScript stdin buffer
+        auto view = m.memory.memview(buf_addr, count);
+        int bytes_read = EM_ASM_INT({
+            if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
+                var toRead = Math.min($1, Module._stdinBuffer.length);
+                for (var i = 0; i < toRead; i++) {
+                    Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
+                }
+                return toRead;
+            }
+            return 0;
+        }, view.data(), count);
+        m.set_result(bytes_read);
+#else
         m.set_result(0);  // EOF for stdin
+#endif
         return;
     }
 
@@ -211,9 +231,7 @@ static void sys_write(Machine& m) {
     if (fd == 1 || fd == 2) {
         try {
             auto view = m.memory.memview(buf_addr, count);
-            auto& out = (fd == 1) ? std::cout : std::cerr;
-            out.write(reinterpret_cast<const char*>(view.data()), count);
-            out.flush();
+            m.print(reinterpret_cast<const char*>(view.data()), count);
             m.set_result(count);
         } catch (...) {
             m.set_result(err::INVAL);
@@ -242,18 +260,15 @@ static void sys_writev(Machine& m) {
     // stdout/stderr go to host
     if (fd == 1 || fd == 2) {
         size_t total = 0;
-        auto& out = (fd == 1) ? std::cout : std::cerr;
-
         for (int i = 0; i < iovcnt; i++) {
             uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
             uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
             if (len > 0) {
                 auto view = m.memory.memview(base, len);
-                out.write(reinterpret_cast<const char*>(view.data()), len);
+                m.print(reinterpret_cast<const char*>(view.data()), len);
                 total += len;
             }
         }
-        out.flush();
         m.set_result(total);
         return;
     }
@@ -383,12 +398,12 @@ static void sys_fstat(Machine& m) {
         st.st_nlink = entry->is_dir() ? 2 : 1;
         st.st_uid = entry->uid;
         st.st_gid = entry->gid;
-        st.st_size = entry->size;
+        st.st_size = entry.size;
         st.st_blksize = 4096;
         st.st_blocks = (entry->size + 511) / 512;
-        st.st_mtime_sec = entry->mtime;
-        st.st_atime_sec = entry->mtime;
-        st.st_ctime_sec = entry->mtime;
+        st.st_mtime_sec = entry.mtime;
+        st.st_atime_sec = entry.mtime;
+        st.st_ctime_sec = entry.mtime;
         m.memory.memcpy(statbuf_addr, &st, sizeof(st));
         m.set_result(0);
         return;
@@ -506,14 +521,44 @@ static void sys_getrandom(Machine& m) {
     m.set_result(count);
 }
 
-static void sys_brk(Machine& m) { m.set_result(0); }
-static void sys_mmap(Machine& m) { m.set_result(-12); }  // ENOMEM
-static void sys_munmap(Machine& m) { m.set_result(0); }
-static void sys_mprotect(Machine& m) { m.set_result(0); }
-static void sys_sigaction(Machine& m) { m.set_result(0); }
-static void sys_sigprocmask(Machine& m) { m.set_result(0); }
-static void sys_prlimit64(Machine& m) { m.set_result(0); }
-static void sys_rseq(Machine& m) { m.set_result(err::NOSYS); }
+// sendfile(out_fd, in_fd, offset, count) - copy data between fds via VFS
+static void sys_sendfile(Machine& m) {
+    auto* ctx = get_ctx(m);
+    int out_fd = m.template sysarg<int>(0);
+    int in_fd = m.template sysarg<int>(1);
+    auto offset_ptr = m.sysarg(2);
+    size_t count = m.sysarg(3);
+
+    // Read from in_fd
+    if (count > 65536) count = 65536;  // cap single transfer
+    std::vector<uint8_t> buf(count);
+
+    // Handle offset if provided
+    if (offset_ptr != 0) {
+        int64_t off = m.memory.template read<int64_t>(offset_ptr);
+        ssize_t n = ctx->fs->pread(in_fd, buf.data(), count, off);
+        if (n < 0) { m.set_result(n); return; }
+        // Update the offset
+        m.memory.template write<int64_t>(offset_ptr, off + n);
+        count = n;
+    } else {
+        ssize_t n = ctx->fs->read(in_fd, buf.data(), count);
+        if (n < 0) { m.set_result(n); return; }
+        count = n;
+    }
+
+    if (count == 0) { m.set_result(0); return; }
+
+    // Write to out_fd
+    if (out_fd == 1 || out_fd == 2) {
+        // stdout/stderr - use printer
+        m.print(reinterpret_cast<const char*>(buf.data()), count);
+        m.set_result(count);
+    } else {
+        ssize_t n = ctx->fs->write(out_fd, buf.data(), count);
+        m.set_result(n);
+    }
+}
 
 static void sys_ioctl(Machine& m) {
     int fd = m.template sysarg<int>(0);
@@ -522,11 +567,42 @@ static void sys_ioctl(Machine& m) {
     // TIOCGWINSZ - get window size
     if (request == 0x5413 && (fd == 0 || fd == 1 || fd == 2)) {
         auto ws_addr = m.sysarg(2);
-        uint16_t ws[4] = { 24, 80, 0, 0 };
-        m.memory.memcpy(ws_addr, ws, sizeof(ws));
+        struct { uint16_t rows, cols, xpixel, ypixel; } ws = { 24, 80, 0, 0 };
+#ifdef __EMSCRIPTEN__
+        ws.rows = EM_ASM_INT({ return Module._termRows || 24; });
+        ws.cols = EM_ASM_INT({ return Module._termCols || 80; });
+#endif
+        m.memory.memcpy(ws_addr, &ws, sizeof(ws));
         m.set_result(0);
         return;
     }
+
+    // TCGETS - get terminal attributes
+    if (request == 0x5401 && (fd == 0 || fd == 1 || fd == 2)) {
+        auto termios_addr = m.sysarg(2);
+        // Return a plausible raw-mode termios struct
+        // struct termios { c_iflag, c_oflag, c_cflag, c_lflag, c_line, c_cc[32], c_ispeed, c_ospeed }
+        uint8_t termios_buf[60] = {};
+        uint32_t c_iflag = 0;
+        uint32_t c_oflag = 0;
+        uint32_t c_cflag = 0x00bf;  // CS8 | CREAD | CLOCAL
+        uint32_t c_lflag = 0;
+        std::memcpy(termios_buf + 0, &c_iflag, 4);
+        std::memcpy(termios_buf + 4, &c_oflag, 4);
+        std::memcpy(termios_buf + 8, &c_cflag, 4);
+        std::memcpy(termios_buf + 12, &c_lflag, 4);
+        m.memory.memcpy(termios_addr, termios_buf, sizeof(termios_buf));
+        m.set_result(0);
+        return;
+    }
+
+    // TCSETS, TCSETSW, TCSETSF - set terminal attributes (accept silently)
+    if ((request == 0x5402 || request == 0x5403 || request == 0x5404) &&
+        (fd == 0 || fd == 1 || fd == 2)) {
+        m.set_result(0);
+        return;
+    }
+
     m.set_result(err::NOTSUP);
 }
 
@@ -586,7 +662,34 @@ static void sys_readv(Machine& m) {
     int iovcnt = m.template sysarg<int>(2);
 
     if (fd == 0) {
+#ifdef __EMSCRIPTEN__
+        // Read from JavaScript stdin buffer into iovec
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len > 0) {
+                auto view = m.memory.memview(base, len);
+                int bytes_read = EM_ASM_INT({
+                    if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
+                        var toRead = Math.min($1, Module._stdinBuffer.length);
+                        for (var i = 0; i < toRead; i++) {
+                            Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
+                        }
+                        return toRead;
+                    }
+                    return 0;
+                }, view.data(), len);
+                if (bytes_read > 0) {
+                    total += bytes_read;
+                }
+                if (static_cast<size_t>(bytes_read) < len) break;  // Short read
+            }
+        }
+        m.set_result(total);
+#else
         m.set_result(0);  // EOF for stdin
+#endif
         return;
     }
 
@@ -753,7 +856,6 @@ static void sys_sysinfo(Machine& m) {
         uint64_t loads[3];
         uint64_t totalram;
         uint64_t freeram;
-        uint64_t sharedram;
         uint64_t bufferram;
         uint64_t totalswap;
         uint64_t freeswap;
@@ -811,14 +913,9 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::set_tid_address, sys_set_tid_address);
     machine.install_syscall_handler(nr::clock_gettime, sys_clock_gettime);
     machine.install_syscall_handler(nr::getrandom, sys_getrandom);
-    machine.install_syscall_handler(nr::brk, sys_brk);
-    machine.install_syscall_handler(nr::mmap, sys_mmap);
-    machine.install_syscall_handler(nr::munmap, sys_munmap);
-    machine.install_syscall_handler(nr::mprotect, sys_mprotect);
-    machine.install_syscall_handler(nr::sigaction, sys_sigaction);
-    machine.install_syscall_handler(nr::sigprocmask, sys_sigprocmask);
-    machine.install_syscall_handler(nr::prlimit64, sys_prlimit64);
-    machine.install_syscall_handler(nr::rseq, sys_rseq);
+    machine.install_syscall_handler(nr::sendfile, sys_sendfile); // Added missing sendfile
+    // NOTE: brk, mmap, munmap, mprotect, sigaction, sigprocmask, prlimit64, rseq are handled by libriscv's
+    // setup_linux_syscalls() + add_mman_syscalls(). Do NOT override them here.
     machine.install_syscall_handler(nr::ioctl, sys_ioctl);
     machine.install_syscall_handler(nr::fcntl, sys_fcntl);
     machine.install_syscall_handler(nr::dup, sys_dup);

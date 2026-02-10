@@ -156,6 +156,8 @@ if [[ "$USE_AOT" == "true" ]]; then
 
     if [[ ! -f "$RV2WASM" ]]; then
         warn "rv2wasm not found, attempting to build..."
+        # Ensure cargo is findable (rustup installs to ~/.cargo/bin)
+        [[ -d "$HOME/.cargo/bin" ]] && export PATH="$HOME/.cargo/bin:$PATH"
         if command -v cargo >/dev/null 2>&1; then
             (cd "${SCRIPT_DIR}/../aot" && cargo build --release) || {
                 warn "Failed to build rv2wasm, skipping AOT"
@@ -177,9 +179,27 @@ if [[ "$USE_AOT" == "true" ]]; then
         AOT_COUNT=0
         mkdir -p "$OUTPUT_DIR/aot"
 
-        find "$AOT_TMP" -type f -executable 2>/dev/null | while read -r elf; do
-            # Check if it's a RISC-V ELF
-            if file "$elf" 2>/dev/null | grep -q "RISC-V"; then
+        # Use process substitution to avoid subshell (so AOT_COUNT propagates)
+        while read -r elf; do
+            # Check if it's a RISC-V ELF (try file command, fallback to magic bytes)
+            IS_RISCV=false
+            if command -v file >/dev/null 2>&1; then
+                if file "$elf" 2>/dev/null | grep -q "RISC-V"; then
+                    IS_RISCV=true
+                fi
+            else
+                # Fallback: check ELF magic (7f 45 4c 46) and e_machine=0xf3 (RISC-V)
+                MAGIC=$(od -A n -t x1 -N 4 "$elf" 2>/dev/null | tr -d ' ')
+                if [[ "$MAGIC" == "7f454c46" ]]; then
+                    # e_machine is at offset 18 (2 bytes, little-endian)
+                    EMACH=$(od -A n -t x1 -j 18 -N 2 "$elf" 2>/dev/null | tr -d ' ')
+                    if [[ "$EMACH" == "f300" ]]; then
+                        IS_RISCV=true
+                    fi
+                fi
+            fi
+
+            if [[ "$IS_RISCV" == "true" ]]; then
                 REL_PATH="${elf#$AOT_TMP}"
                 AOT_OUT="$OUTPUT_DIR/aot${REL_PATH}.wasm"
                 mkdir -p "$(dirname "$AOT_OUT")"
@@ -189,7 +209,7 @@ if [[ "$USE_AOT" == "true" ]]; then
                     AOT_COUNT=$((AOT_COUNT + 1))
                 fi
             fi
-        done
+        done < <(find "$AOT_TMP" -type f -executable 2>/dev/null)
 
         rm -rf "$AOT_TMP"
         log "AOT compilation complete: $AOT_COUNT binaries"
@@ -201,15 +221,33 @@ fi
 # =============================================================================
 log "Generating manifest..."
 
+AOT_JSON="[]"
+if [[ "$USE_AOT" == "true" && -d "$OUTPUT_DIR/aot" ]]; then
+    # Build JSON array of AOT-compiled files (relative paths)
+    AOT_FILES=""
+    while read -r wasm_file; do
+        REL="${wasm_file#$OUTPUT_DIR/}"
+        if [[ -n "$AOT_FILES" ]]; then
+            AOT_FILES="$AOT_FILES, \"$REL\""
+        else
+            AOT_FILES="\"$REL\""
+        fi
+    done < <(find "$OUTPUT_DIR/aot" -name '*.wasm' -type f 2>/dev/null)
+    if [[ -n "$AOT_FILES" ]]; then
+        AOT_JSON="[$AOT_FILES]"
+    fi
+fi
+
 cat > "$OUTPUT_DIR/manifest.json" << EOF
 {
   "version": 1,
   "image": "$IMAGE",
-  "entrypoint": "$(echo $RUN_CMD | head -1)",
+  "entrypoint": "$(printf '%s' "$RUN_CMD")",
   "workdir": "$WORKDIR",
   "env": [
 $(echo "$ENV" | sed 's/^/    "/; s/$/"/' | paste -sd ',' | sed 's/,/,\n/g')
   ],
+  "aot": $AOT_JSON,
   "created": "$(date -Iseconds)"
 }
 EOF

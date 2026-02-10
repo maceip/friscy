@@ -151,6 +151,52 @@ pub enum Opcode {
     FMUL_D,
     FDIV_D,
     FSQRT_D,
+    // FP sign injection
+    FSGNJ_S,
+    FSGNJN_S,
+    FSGNJX_S,
+    FSGNJ_D,
+    FSGNJN_D,
+    FSGNJX_D,
+    // FP min/max
+    FMIN_S,
+    FMAX_S,
+    FMIN_D,
+    FMAX_D,
+    // FP compare
+    FEQ_S,
+    FLT_S,
+    FLE_S,
+    FEQ_D,
+    FLT_D,
+    FLE_D,
+    // FP convert float<->int
+    FCVT_W_S,
+    FCVT_WU_S,
+    FCVT_L_S,
+    FCVT_LU_S,
+    FCVT_S_W,
+    FCVT_S_WU,
+    FCVT_S_L,
+    FCVT_S_LU,
+    FCVT_W_D,
+    FCVT_WU_D,
+    FCVT_L_D,
+    FCVT_LU_D,
+    FCVT_D_W,
+    FCVT_D_WU,
+    FCVT_D_L,
+    FCVT_D_LU,
+    // FP convert between precisions
+    FCVT_S_D,
+    FCVT_D_S,
+    // FP move and classify
+    FMV_X_W,
+    FMV_W_X,
+    FMV_X_D,
+    FMV_D_X,
+    FCLASS_S,
+    FCLASS_D,
 
     // Compressed instructions (C extension)
     C_ADDI4SPN,
@@ -470,6 +516,159 @@ fn decode_32bit(addr: u64, bytes: u32) -> Instruction {
                 (3, 0x14) => Opcode::AMOMAX_D,
                 (3, 0x18) => Opcode::AMOMINU_D,
                 (3, 0x1c) => Opcode::AMOMAXU_D,
+                _ => Opcode::Unknown,
+            };
+            (op, None)
+        }
+        0x07 => {
+            // LOAD-FP (I-type)
+            let imm = (bytes as i32 >> 20) as i64;
+            let op = match funct3 {
+                2 => Opcode::FLW,
+                3 => Opcode::FLD,
+                _ => Opcode::Unknown,
+            };
+            (op, Some(imm))
+        }
+        0x27 => {
+            // STORE-FP (S-type)
+            let imm = decode_s_imm(bytes);
+            let op = match funct3 {
+                2 => Opcode::FSW,
+                3 => Opcode::FSD,
+                _ => Opcode::Unknown,
+            };
+            (op, Some(imm))
+        }
+        0x43 => {
+            // FMADD (R4-type)
+            let fmt = (bytes >> 25) & 0x3;
+            let op = match fmt {
+                0 => Opcode::FMADD_S,
+                1 => Opcode::FMADD_D,
+                _ => Opcode::Unknown,
+            };
+            (op, None)
+        }
+        0x47 => {
+            // FMSUB (R4-type)
+            let fmt = (bytes >> 25) & 0x3;
+            let op = match fmt {
+                0 => Opcode::FMSUB_S,
+                1 => Opcode::FMSUB_D,
+                _ => Opcode::Unknown,
+            };
+            (op, None)
+        }
+        0x4b => {
+            // FNMSUB (R4-type)
+            let fmt = (bytes >> 25) & 0x3;
+            let op = match fmt {
+                0 => Opcode::FNMSUB_S,
+                1 => Opcode::FNMSUB_D,
+                _ => Opcode::Unknown,
+            };
+            (op, None)
+        }
+        0x4f => {
+            // FNMADD (R4-type)
+            let fmt = (bytes >> 25) & 0x3;
+            let op = match fmt {
+                0 => Opcode::FNMADD_S,
+                1 => Opcode::FNMADD_D,
+                _ => Opcode::Unknown,
+            };
+            (op, None)
+        }
+        0x53 => {
+            // OP-FP
+            let op = match funct7 {
+                0x00 => Opcode::FADD_S,
+                0x01 => Opcode::FADD_D,
+                0x04 => Opcode::FSUB_S,
+                0x05 => Opcode::FSUB_D,
+                0x08 => Opcode::FMUL_S,
+                0x09 => Opcode::FMUL_D,
+                0x0c => Opcode::FDIV_S,
+                0x0d => Opcode::FDIV_D,
+                0x10 => match funct3 {
+                    0 => Opcode::FSGNJ_S,
+                    1 => Opcode::FSGNJN_S,
+                    2 => Opcode::FSGNJX_S,
+                    _ => Opcode::Unknown,
+                },
+                0x11 => match funct3 {
+                    0 => Opcode::FSGNJ_D,
+                    1 => Opcode::FSGNJN_D,
+                    2 => Opcode::FSGNJX_D,
+                    _ => Opcode::Unknown,
+                },
+                0x14 => match funct3 {
+                    0 => Opcode::FMIN_S,
+                    1 => Opcode::FMAX_S,
+                    _ => Opcode::Unknown,
+                },
+                0x15 => match funct3 {
+                    0 => Opcode::FMIN_D,
+                    1 => Opcode::FMAX_D,
+                    _ => Opcode::Unknown,
+                },
+                0x20 => Opcode::FCVT_S_D,
+                0x21 => Opcode::FCVT_D_S,
+                0x2c => Opcode::FSQRT_S,
+                0x2d => Opcode::FSQRT_D,
+                0x50 => match funct3 {
+                    2 => Opcode::FEQ_S,
+                    1 => Opcode::FLT_S,
+                    0 => Opcode::FLE_S,
+                    _ => Opcode::Unknown,
+                },
+                0x51 => match funct3 {
+                    2 => Opcode::FEQ_D,
+                    1 => Opcode::FLT_D,
+                    0 => Opcode::FLE_D,
+                    _ => Opcode::Unknown,
+                },
+                0x60 => match rs2 {
+                    0 => Opcode::FCVT_W_S,
+                    1 => Opcode::FCVT_WU_S,
+                    2 => Opcode::FCVT_L_S,
+                    3 => Opcode::FCVT_LU_S,
+                    _ => Opcode::Unknown,
+                },
+                0x61 => match rs2 {
+                    0 => Opcode::FCVT_W_D,
+                    1 => Opcode::FCVT_WU_D,
+                    2 => Opcode::FCVT_L_D,
+                    3 => Opcode::FCVT_LU_D,
+                    _ => Opcode::Unknown,
+                },
+                0x68 => match rs2 {
+                    0 => Opcode::FCVT_S_W,
+                    1 => Opcode::FCVT_S_WU,
+                    2 => Opcode::FCVT_S_L,
+                    3 => Opcode::FCVT_S_LU,
+                    _ => Opcode::Unknown,
+                },
+                0x69 => match rs2 {
+                    0 => Opcode::FCVT_D_W,
+                    1 => Opcode::FCVT_D_WU,
+                    2 => Opcode::FCVT_D_L,
+                    3 => Opcode::FCVT_D_LU,
+                    _ => Opcode::Unknown,
+                },
+                0x70 => match funct3 {
+                    0 => Opcode::FMV_X_W,
+                    1 => Opcode::FCLASS_S,
+                    _ => Opcode::Unknown,
+                },
+                0x71 => match funct3 {
+                    0 => Opcode::FMV_X_D,
+                    1 => Opcode::FCLASS_D,
+                    _ => Opcode::Unknown,
+                },
+                0x78 => Opcode::FMV_W_X,
+                0x79 => Opcode::FMV_D_X,
                 _ => Opcode::Unknown,
             };
             (op, None)

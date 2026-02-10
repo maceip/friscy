@@ -414,6 +414,12 @@ int main(int argc, char** argv) {
         });
 #endif
 
+        // Debug: trace unhandled syscalls
+        Machine::on_unhandled_syscall = [](Machine& m, size_t nr) {
+            std::cerr << "[syscall] UNHANDLED #" << nr << "\n";
+            m.set_result(-38);  // ENOSYS
+        };
+
         std::cout << "[friscy] Starting execution...\n";
         std::cout << "----------------------------------------\n";
 

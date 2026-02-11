@@ -281,8 +281,8 @@ const CACHE_ASSETS = [
   './rootfs.tar',
   './manifest.json',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
-  'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js',
-  'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js',
+  'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm',
+  'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm',
 ];
 
 // Install event: cache assets
@@ -379,8 +379,7 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>friscy container</title>
-    <!-- Use CDN for xterm.js CSS -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" integrity="sha256-i/y/4bWf2p+9R2x/m+Zt4k5x+g/3+t+y+z+l/w+q/0=" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -485,8 +484,8 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
 
     <!-- Import xterm.js and addons as ES Modules from CDN -->
     <script type="module">
-        import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js';
-        import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js';
+        import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm';
+        import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm';
         import createFriscy from './friscy.js';
 
         const statusEl = document.getElementById('status');

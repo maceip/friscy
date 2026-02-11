@@ -358,10 +358,27 @@ int main(int argc, char** argv) {
                 exec_info.phdr_addr += exec_base;
                 exec_info.entry_point = actual_entry;
                 std::cout << "[friscy] PIE base: 0x" << std::hex << exec_base << std::dec << "\n";
+
+                // Save PIE base for execve: load_elf_segments needs the
+                // address where the first segment starts (exec_base + lo)
+                auto [lo, hi] = elf::get_load_range(binary);
+                syscalls::g_exec_ctx.exec_base = exec_base + lo;
             }
 
             // We'll jump to interpreter's entry point instead of main binary's
             machine.cpu.jump(interp_entry);
+        }
+
+        // Save execution context for execve support (clone+execve needs
+        // to reload segments and set up a fresh stack for the new process)
+        syscalls::g_exec_ctx.exec_binary = binary;
+        syscalls::g_exec_ctx.exec_info = exec_info;  // Already adjusted for PIE
+        if (use_dynamic_linker) {
+            syscalls::g_exec_ctx.interp_binary = interp_binary;
+            syscalls::g_exec_ctx.interp_base = interp_base;
+            syscalls::g_exec_ctx.interp_entry = machine.cpu.pc();  // interp_entry
+            syscalls::g_exec_ctx.dynamic = true;
+            // exec_base was set above in the PIE adjustment block
         }
 
         // Set up Linux syscall emulation (provided by libriscv)
@@ -386,6 +403,7 @@ int main(int argc, char** argv) {
             "TERM=xterm-256color",
             "LANG=C.UTF-8",
         };
+        syscalls::g_exec_ctx.env = env;
 
         // Set up argv
         if (guest_args.empty()) {
@@ -399,6 +417,7 @@ int main(int argc, char** argv) {
 
             // Use the machine's actual stack pointer (set by Machine constructor)
             uint64_t stack_top = machine.cpu.reg(riscv::REG_SP);
+            syscalls::g_exec_ctx.original_stack_top = stack_top;
             std::cout << "[friscy] Machine stack top: 0x" << std::hex << stack_top << std::dec << "\n";
 
             uint64_t sp = dynlink::setup_dynamic_stack(

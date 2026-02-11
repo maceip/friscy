@@ -421,12 +421,17 @@ int main(int argc, char** argv) {
         // no data is available, the syscall handler calls machine.stop().
         // We detect this (machine stopped but not at instruction limit),
         // yield to the JS event loop via emscripten_sleep, then resume.
-        machine.simulate(MAX_INSTRUCTIONS);
+        bool sim_result = machine.simulate(MAX_INSTRUCTIONS);
 #ifdef __EMSCRIPTEN__
+        {
+            auto [ic, _x] = machine.get_counters();
+            std::cerr << "[friscy-dbg] simulate returned=" << sim_result
+                      << " stopped=" << machine.stopped()
+                      << " ilr=" << machine.instruction_limit_reached()
+                      << " ic=" << ic << "\n";
+        }
         // Stdin yield loop: syscall handler calls machine.stop() when
         // stdin has no data. We yield to JS event loop, then resume.
-        // simulate() returns true if stopped normally (instruction limit),
-        // false if stopped by machine.stop().
         while (machine.stopped() && !machine.instruction_limit_reached()) {
             // Machine was stopped by stdin handler — yield and retry
             emscripten_sleep(10);
@@ -434,7 +439,15 @@ int main(int argc, char** argv) {
             bool eof = EM_ASM_INT({
                 return (Module._stdinEOF === true) ? 1 : 0;
             });
-            if (eof) break;
+            if (eof) {
+                std::cerr << "[friscy-dbg] EOF signaled from JS\n";
+                break;
+            }
+            // Check if stdin now has data
+            int has_data = EM_ASM_INT({
+                return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
+            });
+            std::cerr << "[friscy-dbg] resume loop: has_data=" << has_data << "\n";
             machine.resume(MAX_INSTRUCTIONS);
         }
 #endif

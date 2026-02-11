@@ -159,10 +159,8 @@ inline vfs::VirtualFS& get_fs(Machine& m) {
 namespace handlers {
 
 static void sys_exit(Machine& m) {
-    auto code = m.template sysarg<int>(0);
-    std::cerr << "[debug] sys_exit called, code=" << code << "\n";
     m.stop();
-    m.set_result(code);
+    m.set_result(m.template sysarg<int>(0));
 }
 
 static void sys_openat(Machine& m) {
@@ -185,7 +183,6 @@ static void sys_openat(Machine& m) {
     }
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
-    std::cerr << "[debug] openat \"" << path << "\" flags=" << flags << " → fd=" << fd << "\n";
     m.set_result(fd);
 }
 
@@ -199,8 +196,6 @@ static void sys_read(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
-
-    std::cerr << "[debug] sys_read fd=" << fd << " count=" << count << "\n";
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
@@ -590,7 +585,6 @@ static void sys_sendfile(Machine& m) {
 static void sys_ioctl(Machine& m) {
     int fd = m.template sysarg<int>(0);
     unsigned long request = m.sysarg(1);
-    std::cerr << "[debug] sys_ioctl fd=" << fd << " req=0x" << std::hex << request << std::dec << "\n";
 
     // TIOCGWINSZ - get window size
     if (request == 0x5413) {
@@ -709,8 +703,6 @@ static void sys_readv(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto iov_addr = m.sysarg(1);
     int iovcnt = m.template sysarg<int>(2);
-
-    std::cerr << "[debug] sys_readv fd=" << fd << " iovcnt=" << iovcnt << "\n";
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
@@ -1070,10 +1062,6 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::renameat, sys_renameat);
     machine.install_syscall_handler(nr::sysinfo, sys_sysinfo);
 
-    // Debug: catch-all for unhandled syscalls
-    Machine::on_unhandled_syscall = [](Machine&, size_t sysno) {
-        std::cerr << "[debug] UNHANDLED syscall " << sysno << "\n";
-    };
 }
 
 }  // namespace syscalls

@@ -447,8 +447,14 @@ int main(int argc, char** argv) {
             int has_data = EM_ASM_INT({
                 return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
             });
-            std::cerr << "[friscy-dbg] resume loop: has_data=" << has_data << "\n";
+            auto [ic_before, _b] = machine.get_counters();
             machine.resume(MAX_INSTRUCTIONS);
+            auto [ic_after, _a] = machine.get_counters();
+            std::cerr << "[friscy-dbg] resume: has_data=" << has_data
+                      << " ic_before=" << ic_before
+                      << " ic_after=" << ic_after
+                      << " stopped=" << machine.stopped()
+                      << " ilr=" << machine.instruction_limit_reached() << "\n";
         }
 #endif
 

@@ -6,6 +6,7 @@
 
 #include <libriscv/machine.hpp>
 #include "vfs.hpp"
+#include "elf_loader.hpp"
 #include <ctime>
 #include <cstring>
 #include <random>
@@ -35,6 +36,21 @@ struct ForkState {
 };
 inline ForkState g_fork = {};
 inline pid_t g_next_pid = 100;
+
+// Execution context saved from initial load — used by execve to
+// reload binary segments and set up a fresh stack.
+struct ExecContext {
+    std::vector<uint8_t> exec_binary;    // Original main executable
+    std::vector<uint8_t> interp_binary;  // Original interpreter (ld-musl)
+    elf::ElfInfo exec_info;              // Adjusted ELF info (with PIE base)
+    uint64_t exec_base = 0;             // PIE base for main executable
+    uint64_t interp_base = 0;           // Where interpreter was loaded
+    uint64_t interp_entry = 0;          // Interpreter entry point
+    uint64_t original_stack_top = 0;    // Stack top from initial setup
+    std::vector<std::string> env;        // Environment variables
+    bool dynamic = false;                // Using dynamic linker?
+};
+inline ExecContext g_exec_ctx;
 
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
@@ -70,6 +86,7 @@ namespace nr {
     constexpr int exit          = 93;
     constexpr int exit_group    = 94;
     constexpr int set_tid_address = 96;
+    constexpr int set_robust_list = 99;
     constexpr int clock_gettime = 113;
     constexpr int sigaction     = 134;
     constexpr int sigprocmask   = 135;
@@ -84,6 +101,7 @@ namespace nr {
     constexpr int brk           = 214;
     constexpr int munmap        = 215;
     constexpr int clone         = 220;
+    constexpr int execve        = 221;
     constexpr int mmap          = 222;
     constexpr int mprotect      = 226;
     constexpr int wait4         = 260;
@@ -229,6 +247,102 @@ static void sys_wait4(Machine& m) {
         m.memory.template write<int32_t>(wstatus_addr, wstatus);
     }
     m.set_result(g_fork.child_pid);
+}
+
+// execve — replace current "process" with a new program.
+// In our single-machine model, we reload ELF segments from the stored
+// binary data, set up a fresh stack with new argv, and jump to the
+// interpreter entry point. This works because all binaries in a
+// busybox-based container are the same executable.
+static void sys_execve(Machine& m) {
+    auto path_addr = m.sysarg(0);
+    auto argv_addr = m.sysarg(1);
+
+    if (!g_exec_ctx.dynamic || g_exec_ctx.exec_binary.empty()) {
+        m.set_result(-38);  // -ENOSYS
+        return;
+    }
+
+    // Read target path
+    std::string path;
+    try {
+        path = m.memory.memstring(path_addr);
+    } catch (...) {
+        m.set_result(-14);  // -EFAULT
+        return;
+    }
+
+    // Resolve symlinks to verify the file exists
+    auto& fs = get_fs(m);
+    std::string resolved = path;
+    for (int i = 0; i < 10; i++) {
+        vfs::Entry entry;
+        if (!fs.stat(resolved, entry)) {
+            m.set_result(-2);  // -ENOENT
+            return;
+        }
+        if (entry.type == vfs::FileType::Symlink) {
+            char target[256];
+            ssize_t n = fs.readlink(resolved, target, sizeof(target));
+            if (n > 0) {
+                std::string link(target, n);
+                if (link[0] != '/') {
+                    // Relative symlink — resolve against dirname
+                    auto slash = resolved.rfind('/');
+                    if (slash != std::string::npos)
+                        link = resolved.substr(0, slash + 1) + link;
+                }
+                resolved = link;
+                continue;
+            }
+        }
+        break;
+    }
+
+    // Read argv from guest memory
+    std::vector<std::string> args;
+    try {
+        for (int i = 0; i < 256; i++) {
+            uint64_t ptr = m.memory.template read<uint64_t>(argv_addr + i * 8);
+            if (ptr == 0) break;
+            args.push_back(m.memory.memstring(ptr));
+        }
+    } catch (...) {
+        m.set_result(-14);  // -EFAULT
+        return;
+    }
+
+    if (args.empty()) {
+        args.push_back(path);
+    }
+
+    // Reload ELF segments — gives the new "process" fresh data/BSS
+    dynlink::load_elf_segments(m, g_exec_ctx.exec_binary, g_exec_ctx.exec_base);
+    if (!g_exec_ctx.interp_binary.empty()) {
+        dynlink::load_elf_segments(m, g_exec_ctx.interp_binary, g_exec_ctx.interp_base);
+    }
+
+    // Set up fresh stack with new argv/envp/auxv
+    uint64_t sp = dynlink::setup_dynamic_stack(
+        m,
+        g_exec_ctx.exec_info,
+        g_exec_ctx.interp_base,
+        args,
+        g_exec_ctx.env,
+        g_exec_ctx.original_stack_top
+    );
+
+    // Clear all registers (execve starts with clean state)
+    for (int i = 1; i < 32; i++) {
+        m.cpu.reg(i) = 0;
+    }
+
+    // Set SP and jump to interpreter entry
+    m.cpu.reg(riscv::REG_SP) = sp;
+    m.cpu.jump(g_exec_ctx.interp_entry);
+
+    // execve doesn't "return" on success — execution continues at new entry.
+    // Do NOT call set_result() — the new process starts fresh.
 }
 
 static void sys_openat(Machine& m) {
@@ -578,6 +692,7 @@ static void sys_geteuid(Machine& m) { m.set_result(0); }
 static void sys_getgid(Machine& m) { m.set_result(0); }
 static void sys_getegid(Machine& m) { m.set_result(0); }
 static void sys_set_tid_address(Machine& m) { m.set_result(1); }
+static void sys_set_robust_list(Machine& m) { m.set_result(0); }
 
 static void sys_clock_gettime(Machine& m) {
     auto tp_addr = m.sysarg(1);
@@ -1105,9 +1220,11 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::getgid, sys_getgid);
     machine.install_syscall_handler(nr::getegid, sys_getegid);
     machine.install_syscall_handler(nr::set_tid_address, sys_set_tid_address);
+    machine.install_syscall_handler(nr::set_robust_list, sys_set_robust_list);
     machine.install_syscall_handler(nr::clock_gettime, sys_clock_gettime);
     machine.install_syscall_handler(nr::getrandom, sys_getrandom);
     machine.install_syscall_handler(nr::clone, sys_clone);
+    machine.install_syscall_handler(nr::execve, sys_execve);
     machine.install_syscall_handler(nr::wait4, sys_wait4);
     // brk, mmap, munmap, mprotect: handled by libriscv (do not override)
     machine.install_syscall_handler(nr::sigaction, sys_sigaction);

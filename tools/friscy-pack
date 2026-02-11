@@ -608,6 +608,9 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             term.writeln('Starting: ' + manifest.entrypoint);
             term.writeln('─'.repeat(40));
 
+            // Connect terminal output to xterm.js
+            Module._termWrite = (text) => term.write(text);
+
             // Run the container
             try {
                 // Determine argv: entrypoint + manifest.env + manifest.cmd

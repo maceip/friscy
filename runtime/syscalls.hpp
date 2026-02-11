@@ -44,7 +44,7 @@ namespace nr {
     constexpr int writev        = 66;
     constexpr int pread64       = 67;
     constexpr int pwrite64      = 68;
-    constexpr int sendfile      = 71; // Added missing sendfile
+    constexpr int sendfile      = 71;
     constexpr int readlinkat    = 78;
     constexpr int newfstatat    = 79;
     constexpr int fstat         = 80;
@@ -194,7 +194,7 @@ static void sys_read(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Read from JavaScript stdin buffer
+        // Read from JavaScript stdin buffer (batch read for efficiency)
         auto view = m.memory.memview(buf_addr, count);
         int bytes_read = EM_ASM_INT({
             if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
@@ -398,12 +398,12 @@ static void sys_fstat(Machine& m) {
         st.st_nlink = entry->is_dir() ? 2 : 1;
         st.st_uid = entry->uid;
         st.st_gid = entry->gid;
-        st.st_size = entry.size;
+        st.st_size = entry->size;
         st.st_blksize = 4096;
         st.st_blocks = (entry->size + 511) / 512;
-        st.st_mtime_sec = entry.mtime;
-        st.st_atime_sec = entry.mtime;
-        st.st_ctime_sec = entry.mtime;
+        st.st_mtime_sec = entry->mtime;
+        st.st_atime_sec = entry->mtime;
+        st.st_ctime_sec = entry->mtime;
         m.memory.memcpy(statbuf_addr, &st, sizeof(st));
         m.set_result(0);
         return;
@@ -520,6 +520,13 @@ static void sys_getrandom(Machine& m) {
     m.memory.memcpy(buf_addr, buf.data(), count);
     m.set_result(count);
 }
+
+// NOTE: brk, mmap, munmap, mprotect are handled by libriscv's
+// setup_linux_syscalls() + add_mman_syscalls(). Do NOT override them here.
+static void sys_sigaction(Machine& m) { m.set_result(0); }
+static void sys_sigprocmask(Machine& m) { m.set_result(0); }
+static void sys_prlimit64(Machine& m) { m.set_result(0); }
+static void sys_rseq(Machine& m) { m.set_result(err::NOSYS); }
 
 // sendfile(out_fd, in_fd, offset, count) - copy data between fds via VFS
 static void sys_sendfile(Machine& m) {
@@ -913,15 +920,18 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::set_tid_address, sys_set_tid_address);
     machine.install_syscall_handler(nr::clock_gettime, sys_clock_gettime);
     machine.install_syscall_handler(nr::getrandom, sys_getrandom);
-    machine.install_syscall_handler(nr::sendfile, sys_sendfile); // Added missing sendfile
-    // NOTE: brk, mmap, munmap, mprotect, sigaction, sigprocmask, prlimit64, rseq are handled by libriscv's
-    // setup_linux_syscalls() + add_mman_syscalls(). Do NOT override them here.
+    // brk, mmap, munmap, mprotect: handled by libriscv (do not override)
+    machine.install_syscall_handler(nr::sigaction, sys_sigaction);
+    machine.install_syscall_handler(nr::sigprocmask, sys_sigprocmask);
+    machine.install_syscall_handler(nr::prlimit64, sys_prlimit64);
+    machine.install_syscall_handler(nr::rseq, sys_rseq);
     machine.install_syscall_handler(nr::ioctl, sys_ioctl);
     machine.install_syscall_handler(nr::fcntl, sys_fcntl);
     machine.install_syscall_handler(nr::dup, sys_dup);
     machine.install_syscall_handler(nr::dup3, sys_dup3);
     machine.install_syscall_handler(nr::pipe2, sys_pipe2);
     machine.install_syscall_handler(nr::readv, sys_readv);
+    machine.install_syscall_handler(nr::sendfile, sys_sendfile);
     machine.install_syscall_handler(nr::pread64, sys_pread64);
     machine.install_syscall_handler(nr::pwrite64, sys_pwrite64);
     machine.install_syscall_handler(nr::ftruncate, sys_ftruncate);

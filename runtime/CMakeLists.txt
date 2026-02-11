@@ -126,6 +126,7 @@ if(EMSCRIPTEN)
         -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
         -sASYNCIFY                          # Enable emscripten_sleep for stdin polling
         -sASYNCIFY_STACK_SIZE=65536         # 64KB async stack
+        "-sASYNCIFY_IMPORTS=['emscripten_sleep']"
     )
 
     if(FRISCY_PRODUCTION)

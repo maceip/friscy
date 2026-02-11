@@ -185,6 +185,7 @@ static void sys_openat(Machine& m) {
     }
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
+    std::cerr << "[debug] openat \"" << path << "\" flags=" << flags << " → fd=" << fd << "\n";
     m.set_result(fd);
 }
 
@@ -199,8 +200,9 @@ static void sys_read(Machine& m) {
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
 
+    std::cerr << "[debug] sys_read fd=" << fd << " count=" << count << "\n";
+
     if (fd == 0) {
-        std::cerr << "[debug] sys_read fd=0, count=" << count << "\n";
 #ifdef __EMSCRIPTEN__
         // Try non-blocking read from JavaScript stdin buffer
         auto view = m.memory.memview(buf_addr, count);
@@ -588,6 +590,7 @@ static void sys_sendfile(Machine& m) {
 static void sys_ioctl(Machine& m) {
     int fd = m.template sysarg<int>(0);
     unsigned long request = m.sysarg(1);
+    std::cerr << "[debug] sys_ioctl fd=" << fd << " req=0x" << std::hex << request << std::dec << "\n";
 
     // TIOCGWINSZ - get window size
     if (request == 0x5413 && (fd == 0 || fd == 1 || fd == 2)) {
@@ -685,6 +688,8 @@ static void sys_readv(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto iov_addr = m.sysarg(1);
     int iovcnt = m.template sysarg<int>(2);
+
+    std::cerr << "[debug] sys_readv fd=" << fd << " iovcnt=" << iovcnt << "\n";
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__

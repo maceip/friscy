@@ -292,9 +292,9 @@ int main(int argc, char** argv) {
 
         // If dynamic, also load the interpreter at a high address
         if (use_dynamic_linker) {
-            // Load interpreter at 0x40000000 (1GB mark)
-            // This is above typical executable addresses but below stack
-            interp_base = 0x40000000;
+            // Load interpreter within the 512MB encompassing arena (2^29 = 0x20000000).
+            // Place at 384MB mark, above heap/mmap but within arena.
+            interp_base = 0x18000000;
 
             std::cout << "[friscy] Loading interpreter at 0x" << std::hex << interp_base << std::dec << "\n";
 
@@ -310,6 +310,17 @@ int main(int argc, char** argv) {
             }
 
             std::cout << "[friscy] Interpreter entry: 0x" << std::hex << interp_entry << std::dec << "\n";
+
+            // Calculate the base address where libriscv loaded the main executable.
+            // For PIE (ET_DYN), libriscv loads at DYLINK_BASE (0x40000).
+            // We can derive the base adjustment from the machine's start address.
+            if (exec_info.type == elf::ET_DYN) {
+                uint64_t actual_entry = machine.memory.start_address();
+                uint64_t exec_base = actual_entry - exec_info.entry_point;
+                exec_info.phdr_addr += exec_base;
+                exec_info.entry_point = actual_entry;
+                std::cout << "[friscy] PIE base: 0x" << std::hex << exec_base << std::dec << "\n";
+            }
 
             // We'll jump to interpreter's entry point instead of main binary's
             machine.cpu.jump(interp_entry);
@@ -348,22 +359,17 @@ int main(int argc, char** argv) {
             // For dynamic linking, set up stack with aux vector
             std::cout << "[friscy] Setting up aux vector for dynamic linker\n";
 
-            // Adjust exec_info.phdr_addr if it's relative
-            // For PIE executables, phdr_addr is relative to load address
-            elf::ElfInfo adjusted_exec_info = exec_info;
-            if (exec_info.type == elf::ET_DYN) {
-                // PIE executable - phdr_addr needs adjustment
-                // libriscv loads PIE at a base address, need to find it
-                // For now assume loaded at low address as specified in ELF
-            }
+            // Use the machine's actual stack pointer (set by Machine constructor)
+            uint64_t stack_top = machine.cpu.reg(riscv::REG_SP);
+            std::cout << "[friscy] Machine stack top: 0x" << std::hex << stack_top << std::dec << "\n";
 
             uint64_t sp = dynlink::setup_dynamic_stack(
                 machine,
-                adjusted_exec_info,
+                exec_info,
                 interp_base,
                 guest_args,
                 env,
-                0x7fff0000  // Stack top
+                stack_top
             );
 
             // Set stack pointer

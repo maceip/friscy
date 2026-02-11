@@ -249,99 +249,11 @@ static void sys_wait4(Machine& m) {
     m.set_result(g_fork.child_pid);
 }
 
-// execve — replace current "process" with a new program.
-// In our single-machine model, we reload ELF segments from the stored
-// binary data, set up a fresh stack with new argv, and jump to the
-// interpreter entry point. This works because all binaries in a
-// busybox-based container are the same executable.
+// execve — stub that returns -ENOSYS for now.
+// The child will call _exit(127) after execve fails, which triggers
+// parent state restoration via our cooperative fork.
 static void sys_execve(Machine& m) {
-    auto path_addr = m.sysarg(0);
-    auto argv_addr = m.sysarg(1);
-
-    if (!g_exec_ctx.dynamic || g_exec_ctx.exec_binary.empty()) {
-        m.set_result(-38);  // -ENOSYS
-        return;
-    }
-
-    // Read target path
-    std::string path;
-    try {
-        path = m.memory.memstring(path_addr);
-    } catch (...) {
-        m.set_result(-14);  // -EFAULT
-        return;
-    }
-
-    // Resolve symlinks to verify the file exists
-    auto& fs = get_fs(m);
-    std::string resolved = path;
-    for (int i = 0; i < 10; i++) {
-        vfs::Entry entry;
-        if (!fs.stat(resolved, entry)) {
-            m.set_result(-2);  // -ENOENT
-            return;
-        }
-        if (entry.type == vfs::FileType::Symlink) {
-            char target[256];
-            ssize_t n = fs.readlink(resolved, target, sizeof(target));
-            if (n > 0) {
-                std::string link(target, n);
-                if (link[0] != '/') {
-                    // Relative symlink — resolve against dirname
-                    auto slash = resolved.rfind('/');
-                    if (slash != std::string::npos)
-                        link = resolved.substr(0, slash + 1) + link;
-                }
-                resolved = link;
-                continue;
-            }
-        }
-        break;
-    }
-
-    // Read argv from guest memory
-    std::vector<std::string> args;
-    try {
-        for (int i = 0; i < 256; i++) {
-            uint64_t ptr = m.memory.template read<uint64_t>(argv_addr + i * 8);
-            if (ptr == 0) break;
-            args.push_back(m.memory.memstring(ptr));
-        }
-    } catch (...) {
-        m.set_result(-14);  // -EFAULT
-        return;
-    }
-
-    if (args.empty()) {
-        args.push_back(path);
-    }
-
-    // Note: we do NOT reload ELF segments here. The same binary (busybox)
-    // is already loaded in memory — code segments are identical. Skipping
-    // the reload avoids protection faults from writing to execute-only pages.
-    // The dynamic linker will redo relocations on its own init path.
-
-    // Set up fresh stack with new argv/envp/auxv
-    uint64_t sp = dynlink::setup_dynamic_stack(
-        m,
-        g_exec_ctx.exec_info,
-        g_exec_ctx.interp_base,
-        args,
-        g_exec_ctx.env,
-        g_exec_ctx.original_stack_top
-    );
-
-    // Clear all registers (execve starts with clean state)
-    for (int i = 1; i < 32; i++) {
-        m.cpu.reg(i) = 0;
-    }
-
-    // Set SP and jump to interpreter entry
-    m.cpu.reg(riscv::REG_SP) = sp;
-    m.cpu.jump(g_exec_ctx.interp_entry);
-
-    // execve doesn't "return" on success — execution continues at new entry.
-    // Do NOT call set_result() — the new process starts fresh.
+    m.set_result(-38);  // -ENOSYS
 }
 
 static void sys_openat(Machine& m) {

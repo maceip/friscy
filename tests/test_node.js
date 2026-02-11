@@ -8,7 +8,7 @@
 //   node test_node.js ./guest
 //   node test_node.js --rootfs alpine.tar /bin/busybox ls -la
 
-import initModule from './build/friscy.js';
+import initModule from '../runtime/build/friscy.js';
 import { readFileSync, existsSync } from 'fs';
 import { argv } from 'process';
 import { basename } from 'path';
@@ -72,7 +72,7 @@ async function run() {
         const rootfsData = readFileSync(rootfsPath);
 
         friscyArgs.push('--rootfs', '/rootfs.tar', binaryPath);
-        friscyArgs.push(...guestArgs.slice(1));  // Skip the entry binary from guestArgs
+        friscyArgs.push(...guestArgs);  // Pass remaining guest args (ls, /, etc.)
 
         const Module = await initModule({
             print: (text) => console.log(text),

@@ -209,6 +209,18 @@ int main(int argc, char** argv) {
     try {
         std::vector<uint8_t> binary;
 
+#ifdef FRISCY_WIZER
+        if (g_wizer_initialized) {
+            // Wizer pre-initialization already loaded rootfs into VFS
+            // and pre-loaded the entry binary — skip redundant I/O.
+            binary = g_wizer_binary;
+            entry_path = g_wizer_entry;
+            container_mode = true;  // VFS is already loaded
+            std::cout << "[friscy] Using wizer pre-initialized snapshot\n";
+            std::cout << "[friscy] Entry point: " << entry_path << "\n";
+            std::cout << "[friscy] Binary size: " << binary.size() << " bytes\n";
+        } else
+#endif
         if (container_mode) {
             std::cout << "[friscy] Loading rootfs: " << rootfs_path << "\n";
 

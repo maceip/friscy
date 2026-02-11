@@ -316,11 +316,10 @@ static void sys_execve(Machine& m) {
         args.push_back(path);
     }
 
-    // Reload ELF segments — gives the new "process" fresh data/BSS
-    dynlink::load_elf_segments(m, g_exec_ctx.exec_binary, g_exec_ctx.exec_base);
-    if (!g_exec_ctx.interp_binary.empty()) {
-        dynlink::load_elf_segments(m, g_exec_ctx.interp_binary, g_exec_ctx.interp_base);
-    }
+    // Note: we do NOT reload ELF segments here. The same binary (busybox)
+    // is already loaded in memory — code segments are identical. Skipping
+    // the reload avoids protection faults from writing to execute-only pages.
+    // The dynamic linker will redo relocations on its own init path.
 
     // Set up fresh stack with new argv/envp/auxv
     uint64_t sp = dynlink::setup_dynamic_stack(

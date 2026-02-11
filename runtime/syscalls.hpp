@@ -18,6 +18,10 @@ namespace syscalls {
 
 using Machine = riscv::Machine<riscv::RISCV64>;
 
+// Flag: true when machine stopped because stdin has no data.
+// Used by JS resume loop to distinguish stdin-wait from program exit.
+inline bool g_waiting_for_stdin = false;
+
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
     constexpr int getcwd        = 17;
@@ -45,6 +49,7 @@ namespace nr {
     constexpr int pread64       = 67;
     constexpr int pwrite64      = 68;
     constexpr int sendfile      = 71;
+    constexpr int ppoll         = 73;
     constexpr int readlinkat    = 78;
     constexpr int newfstatat    = 79;
     constexpr int fstat         = 80;
@@ -204,6 +209,7 @@ static void sys_read(Machine& m) {
                 }
                 return toRead;
             }
+            if (Module._stdinEOF) return 0; // EOF
             return -1; // -1 means "no data yet", NOT EOF
         }, view.data(), count);
         if (bytes_read >= 0) {
@@ -212,6 +218,7 @@ static void sys_read(Machine& m) {
             // No data available — rewind PC to the ecall instruction
             // and stop the machine. When resumed, the ecall will
             // re-execute this syscall handler, retrying the read.
+            g_waiting_for_stdin = true;
             m.cpu.increment_pc(-4);  // Rewind past ecall (4 bytes)
             m.stop();
         }
@@ -680,10 +687,17 @@ static void sys_readv(Machine& m) {
 #ifdef __EMSCRIPTEN__
         // Try non-blocking read from JavaScript stdin buffer into iovec
         int has_data = EM_ASM_INT({
-            return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
+            return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
+                   (Module._stdinEOF ? -1 : 0);
         });
-        if (!has_data) {
+        if (has_data == -1) {
+            // EOF
+            m.set_result(0);
+            return;
+        }
+        if (has_data == 0) {
             // No data — rewind PC and stop machine so main loop can yield
+            g_waiting_for_stdin = true;
             m.cpu.increment_pc(-4);  // Rewind past ecall (4 bytes)
             m.stop();
             return;
@@ -902,6 +916,73 @@ static void sys_sysinfo(Machine& m) {
     m.set_result(0);
 }
 
+// ppoll - poll file descriptors for events
+// Ash uses this to check if stdin has data before reading.
+static void sys_ppoll(Machine& m) {
+    auto fds_addr = m.sysarg(0);
+    uint64_t nfds = m.sysarg(1);
+    // args 2,3: timeout (ignored), sigmask (ignored)
+
+    if (nfds == 0) {
+        m.set_result(0);
+        return;
+    }
+    if (nfds > 64) nfds = 64;
+
+    int ready = 0;
+    bool needs_stdin = false;
+
+    for (uint64_t i = 0; i < nfds; i++) {
+        uint64_t entry_addr = fds_addr + i * 8;
+        int32_t fd = m.memory.template read<int32_t>(entry_addr);
+        int16_t events = m.memory.template read<int16_t>(entry_addr + 4);
+        int16_t revents = 0;
+
+        if (fd == 0 && (events & 0x0001 /*POLLIN*/)) {
+#ifdef __EMSCRIPTEN__
+            int has_data = EM_ASM_INT({
+                return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
+                       (Module._stdinEOF ? -1 : 0);
+            });
+            if (has_data == 1) {
+                revents |= 0x0001; // POLLIN
+                ready++;
+            } else if (has_data == -1) {
+                revents |= 0x0010; // POLLHUP (EOF)
+                ready++;
+            } else {
+                needs_stdin = true;
+            }
+#else
+            revents |= 0x0010; // POLLHUP (EOF in native mode)
+            ready++;
+#endif
+        } else if (fd == 1 || fd == 2) {
+            if (events & 0x0004 /*POLLOUT*/) {
+                revents |= 0x0004;
+                ready++;
+            }
+        } else if (fd >= 0) {
+            // VFS file descriptors are always ready
+            revents |= (events & 0x0001); // POLLIN if requested
+            if (revents) ready++;
+        }
+
+        m.memory.template write<int16_t>(entry_addr + 6, revents);
+    }
+
+    if (ready > 0) {
+        m.set_result(ready);
+    } else if (needs_stdin) {
+        // No data on stdin — stop and let JS resume when data arrives
+        g_waiting_for_stdin = true;
+        m.cpu.increment_pc(-4);
+        m.stop();
+    } else {
+        m.set_result(0);
+    }
+}
+
 }  // namespace handlers
 
 // Install all syscall handlers
@@ -948,6 +1029,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::dup3, sys_dup3);
     machine.install_syscall_handler(nr::pipe2, sys_pipe2);
     machine.install_syscall_handler(nr::readv, sys_readv);
+    machine.install_syscall_handler(nr::ppoll, sys_ppoll);
     machine.install_syscall_handler(nr::sendfile, sys_sendfile);
     machine.install_syscall_handler(nr::pread64, sys_pread64);
     machine.install_syscall_handler(nr::pwrite64, sys_pwrite64);

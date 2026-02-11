@@ -320,7 +320,11 @@ int main(int argc, char** argv) {
         }
 
         // Create machine with main executable
-        Machine machine{binary};
+        // Use static unique_ptr so machine survives after main() returns,
+        // allowing JS to call friscy_resume() for stdin polling.
+        static std::unique_ptr<Machine> machine_ptr;
+        machine_ptr = std::make_unique<Machine>(binary);
+        auto& machine = *machine_ptr;
 
         // If dynamic, also load the interpreter at a high address
         if (use_dynamic_linker) {

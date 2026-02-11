@@ -53,7 +53,26 @@ EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
 EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     if (!g_machine) return 0;
     syscalls::g_waiting_for_stdin = false;
-    g_machine->resume(MAX_INSTRUCTIONS);
+    try {
+        g_machine->resume(MAX_INSTRUCTIONS);
+    } catch (const riscv::MachineException& e) {
+        EM_ASM({
+            if (typeof Module._termWrite === 'function') {
+                Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
+                    UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                    ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+            }
+        }, e.what(), (uint32_t)e.data(), (uint32_t)g_machine->cpu.pc());
+        return 0;
+    } catch (const std::exception& e) {
+        EM_ASM({
+            if (typeof Module._termWrite === 'function') {
+                Module._termWrite('\r\n\x1b[31m[friscy] Error: ' +
+                    UTF8ToString($0) + '\x1b[0m\r\n');
+            }
+        }, e.what());
+        return 0;
+    }
     return friscy_stopped();
 }
 }
@@ -468,7 +487,22 @@ int main(int argc, char** argv) {
         // Run! When the guest reads from stdin and no data is available,
         // the syscall handler calls machine.stop(). JS calls friscy_resume()
         // after new stdin data arrives to continue execution.
-        machine.simulate(MAX_INSTRUCTIONS);
+        try {
+            machine.simulate(MAX_INSTRUCTIONS);
+        } catch (const riscv::MachineException& e) {
+#ifdef __EMSCRIPTEN__
+            EM_ASM({
+                if (typeof Module._termWrite === 'function') {
+                    Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
+                        UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                        ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+                }
+            }, e.what(), (uint32_t)e.data(), (uint32_t)machine.cpu.pc());
+            return 1;
+#else
+            throw;
+#endif
+        }
 
 #ifdef __EMSCRIPTEN__
         if (syscalls::g_waiting_for_stdin) {

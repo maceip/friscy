@@ -593,42 +593,63 @@ static void sys_ioctl(Machine& m) {
     std::cerr << "[debug] sys_ioctl fd=" << fd << " req=0x" << std::hex << request << std::dec << "\n";
 
     // TIOCGWINSZ - get window size
-    if (request == 0x5413 && (fd == 0 || fd == 1 || fd == 2)) {
-        auto ws_addr = m.sysarg(2);
-        struct { uint16_t rows, cols, xpixel, ypixel; } ws = { 24, 80, 0, 0 };
+    if (request == 0x5413) {
+        if (fd == 0) {
+            m.set_result(-25);  // -ENOTTY (stdin is not a terminal)
+            return;
+        }
+        if (fd == 1 || fd == 2) {
+            auto ws_addr = m.sysarg(2);
+            struct { uint16_t rows, cols, xpixel, ypixel; } ws = { 24, 80, 0, 0 };
 #ifdef __EMSCRIPTEN__
-        ws.rows = EM_ASM_INT({ return Module._termRows || 24; });
-        ws.cols = EM_ASM_INT({ return Module._termCols || 80; });
+            ws.rows = EM_ASM_INT({ return Module._termRows || 24; });
+            ws.cols = EM_ASM_INT({ return Module._termCols || 80; });
 #endif
-        m.memory.memcpy(ws_addr, &ws, sizeof(ws));
-        m.set_result(0);
-        return;
+            m.memory.memcpy(ws_addr, &ws, sizeof(ws));
+            m.set_result(0);
+            return;
+        }
     }
 
     // TCGETS - get terminal attributes
-    if (request == 0x5401 && (fd == 0 || fd == 1 || fd == 2)) {
-        auto termios_addr = m.sysarg(2);
-        // Return a plausible raw-mode termios struct
-        // struct termios { c_iflag, c_oflag, c_cflag, c_lflag, c_line, c_cc[32], c_ispeed, c_ospeed }
-        uint8_t termios_buf[60] = {};
-        uint32_t c_iflag = 0;
-        uint32_t c_oflag = 0;
-        uint32_t c_cflag = 0x00bf;  // CS8 | CREAD | CLOCAL
-        uint32_t c_lflag = 0;
-        std::memcpy(termios_buf + 0, &c_iflag, 4);
-        std::memcpy(termios_buf + 4, &c_oflag, 4);
-        std::memcpy(termios_buf + 8, &c_cflag, 4);
-        std::memcpy(termios_buf + 12, &c_lflag, 4);
-        m.memory.memcpy(termios_addr, termios_buf, sizeof(termios_buf));
-        m.set_result(0);
-        return;
+    // For stdin (fd 0): return -ENOTTY so isatty(0) returns false.
+    // This puts ash into non-interactive batch mode where it reads
+    // commands from stdin with simple read() calls instead of trying
+    // to do raw-mode character-by-character line editing (which requires
+    // poll/signal infrastructure we don't have).
+    // For stdout/stderr (fd 1,2): return success so output formatting works.
+    if (request == 0x5401) {
+        if (fd == 0) {
+            m.set_result(-25);  // -ENOTTY
+            return;
+        }
+        if (fd == 1 || fd == 2) {
+            auto termios_addr = m.sysarg(2);
+            uint8_t termios_buf[60] = {};
+            uint32_t c_iflag = 0;
+            uint32_t c_oflag = 0x0005;  // OPOST | ONLCR
+            uint32_t c_cflag = 0x00bf;  // CS8 | CREAD | CLOCAL
+            uint32_t c_lflag = 0x8a3b;  // ECHO|ICANON|ISIG|IEXTEN|ECHOCTL|ECHOKE|ECHOE
+            std::memcpy(termios_buf + 0, &c_iflag, 4);
+            std::memcpy(termios_buf + 4, &c_oflag, 4);
+            std::memcpy(termios_buf + 8, &c_cflag, 4);
+            std::memcpy(termios_buf + 12, &c_lflag, 4);
+            m.memory.memcpy(termios_addr, termios_buf, sizeof(termios_buf));
+            m.set_result(0);
+            return;
+        }
     }
 
     // TCSETS, TCSETSW, TCSETSF - set terminal attributes (accept silently)
-    if ((request == 0x5402 || request == 0x5403 || request == 0x5404) &&
-        (fd == 0 || fd == 1 || fd == 2)) {
-        m.set_result(0);
-        return;
+    if ((request == 0x5402 || request == 0x5403 || request == 0x5404)) {
+        if (fd == 0) {
+            m.set_result(-25);  // -ENOTTY (stdin is not a terminal)
+            return;
+        }
+        if (fd == 1 || fd == 2) {
+            m.set_result(0);
+            return;
+        }
     }
 
     m.set_result(err::NOTSUP);

@@ -22,6 +22,20 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // Used by JS resume loop to distinguish stdin-wait from program exit.
 inline bool g_waiting_for_stdin = false;
 
+// Cooperative fork state — single-process vfork emulation.
+// On clone(): save parent registers, return 0 (child runs).
+// On exit_group() in child: restore parent registers, return child PID.
+// On wait4(): return saved exit status.
+struct ForkState {
+    uint64_t regs[32];  // Saved parent registers (x0-x31)
+    uint64_t pc;        // Saved parent PC (the ecall instruction)
+    int exit_status;    // Child's exit code
+    pid_t child_pid;    // PID assigned to child
+    bool in_child;      // True while "child" is running
+};
+inline ForkState g_fork = {};
+inline pid_t g_next_pid = 100;
+
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
     constexpr int getcwd        = 17;
@@ -69,8 +83,10 @@ namespace nr {
     constexpr int sysinfo       = 179;
     constexpr int brk           = 214;
     constexpr int munmap        = 215;
+    constexpr int clone         = 220;
     constexpr int mmap          = 222;
     constexpr int mprotect      = 226;
+    constexpr int wait4         = 260;
     constexpr int prlimit64     = 261;
     constexpr int getrandom     = 278;
     constexpr int rseq          = 293;
@@ -159,8 +175,60 @@ inline vfs::VirtualFS& get_fs(Machine& m) {
 namespace handlers {
 
 static void sys_exit(Machine& m) {
+    if (g_fork.in_child) {
+        // "Child" is exiting — restore parent state
+        g_fork.exit_status = m.template sysarg<int>(0);
+        g_fork.in_child = false;
+
+        // Restore parent registers (x0-x31)
+        for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
+            m.cpu.reg(i) = g_fork.regs[i];
+        }
+        // Resume parent at instruction after the clone ecall
+        m.cpu.jump(g_fork.pc);
+        // Parent sees child PID as clone() return value
+        m.set_result(g_fork.child_pid);
+        return;
+    }
     m.stop();
     m.set_result(m.template sysarg<int>(0));
+}
+
+// clone — cooperative vfork emulation for single-process emulator.
+// Saves parent state, returns 0 (child context). When child calls
+// exit/exit_group, parent state is restored with child PID as return.
+static void sys_clone(Machine& m) {
+    if (g_fork.in_child) {
+        // Nested fork not supported
+        m.set_result(-11);  // -EAGAIN
+        return;
+    }
+
+    // Save parent registers
+    for (int i = 0; i < 32; i++) {
+        g_fork.regs[i] = m.cpu.reg(i);
+    }
+    g_fork.pc = m.cpu.pc();  // Already past the ecall
+    g_fork.child_pid = g_next_pid++;
+    g_fork.in_child = true;
+    g_fork.exit_status = 0;
+
+    // Return 0 = "you are the child"
+    m.set_result(0);
+}
+
+// wait4 — return status of the cooperatively-forked child.
+// In our model the child has always already exited by the time
+// the parent resumes, so this never blocks.
+static void sys_wait4(Machine& m) {
+    auto wstatus_addr = m.sysarg(1);
+
+    if (wstatus_addr != 0) {
+        // Encode in wait status format: WEXITSTATUS = (status & 0xff) << 8
+        int32_t wstatus = (g_fork.exit_status & 0xff) << 8;
+        m.memory.template write<int32_t>(wstatus_addr, wstatus);
+    }
+    m.set_result(g_fork.child_pid);
 }
 
 static void sys_openat(Machine& m) {
@@ -1039,6 +1107,8 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::set_tid_address, sys_set_tid_address);
     machine.install_syscall_handler(nr::clock_gettime, sys_clock_gettime);
     machine.install_syscall_handler(nr::getrandom, sys_getrandom);
+    machine.install_syscall_handler(nr::clone, sys_clone);
+    machine.install_syscall_handler(nr::wait4, sys_wait4);
     // brk, mmap, munmap, mprotect: handled by libriscv (do not override)
     machine.install_syscall_handler(nr::sigaction, sys_sigaction);
     machine.install_syscall_handler(nr::sigprocmask, sys_sigprocmask);

@@ -198,6 +198,11 @@ static void sys_exit(Machine& m) {
         g_fork.exit_status = m.template sysarg<int>(0);
         g_fork.in_child = false;
 
+        std::cerr << "[exit] child exit_status=" << g_fork.exit_status
+                  << " restoring parent pc=0x" << std::hex << g_fork.pc
+                  << " sp=0x" << g_fork.regs[2]
+                  << std::dec << "\n";
+
         // Restore parent registers (x0-x31)
         for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
             m.cpu.reg(i) = g_fork.regs[i];
@@ -222,6 +227,9 @@ static void sys_clone(Machine& m) {
         return;
     }
 
+    uint64_t flags = m.sysarg(0);
+    uint64_t child_stack = m.sysarg(1);
+
     // Save parent registers
     for (int i = 0; i < 32; i++) {
         g_fork.regs[i] = m.cpu.reg(i);
@@ -230,6 +238,12 @@ static void sys_clone(Machine& m) {
     g_fork.child_pid = g_next_pid++;
     g_fork.in_child = true;
     g_fork.exit_status = 0;
+
+    std::cerr << "[clone] flags=0x" << std::hex << flags
+              << " child_stack=0x" << child_stack
+              << " pc=0x" << g_fork.pc
+              << " sp=0x" << m.cpu.reg(2)
+              << std::dec << "\n";
 
     // Return 0 = "you are the child"
     m.set_result(0);

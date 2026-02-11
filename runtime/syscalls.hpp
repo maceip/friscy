@@ -209,10 +209,10 @@ static void sys_read(Machine& m) {
         if (bytes_read >= 0) {
             m.set_result(bytes_read);
         } else {
-            // No data available — stop the machine so main loop can yield
-            // to the browser event loop and retry. Do NOT set result yet;
-            // the PC stays on the ecall instruction so it will re-execute
-            // the read syscall when resumed.
+            // No data available — rewind PC to the ecall instruction
+            // and stop the machine. When resumed, the ecall will
+            // re-execute this syscall handler, retrying the read.
+            m.cpu.increment_pc(-4);  // Rewind past ecall (4 bytes)
             m.stop();
         }
 #else
@@ -683,7 +683,8 @@ static void sys_readv(Machine& m) {
             return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
         });
         if (!has_data) {
-            // No data — stop machine so main loop can yield and retry
+            // No data — rewind PC and stop machine so main loop can yield
+            m.cpu.increment_pc(-4);  // Rewind past ecall (4 bytes)
             m.stop();
             return;
         }

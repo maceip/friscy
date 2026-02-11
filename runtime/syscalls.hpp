@@ -194,29 +194,27 @@ static void sys_read(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Read from JavaScript stdin buffer with polling (emscripten_sleep yields to browser)
-        // Returns -1 when no data yet (NOT 0, which means EOF and kills ash)
+        // Try non-blocking read from JavaScript stdin buffer
         auto view = m.memory.memview(buf_addr, count);
-        int polls = 0;
-        while (polls < 3000) { // 30 second timeout (3000 * 10ms)
-            int bytes_read = EM_ASM_INT({
-                if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
-                    var toRead = Math.min($1, Module._stdinBuffer.length);
-                    for (var i = 0; i < toRead; i++) {
-                        Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
-                    }
-                    return toRead;
+        int bytes_read = EM_ASM_INT({
+            if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
+                var toRead = Math.min($1, Module._stdinBuffer.length);
+                for (var i = 0; i < toRead; i++) {
+                    Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
                 }
-                return -1; // -1 means "no data yet", NOT EOF
-            }, view.data(), count);
-            if (bytes_read >= 0) {
-                m.set_result(bytes_read);
-                return;
+                return toRead;
             }
-            emscripten_sleep(10); // Yield to browser event loop
-            polls++;
+            return -1; // -1 means "no data yet", NOT EOF
+        }, view.data(), count);
+        if (bytes_read >= 0) {
+            m.set_result(bytes_read);
+        } else {
+            // No data available — stop the machine so main loop can yield
+            // to the browser event loop and retry. Do NOT set result yet;
+            // the PC stays on the ecall instruction so it will re-execute
+            // the read syscall when resumed.
+            m.stop();
         }
-        m.set_result(0); // Timeout reached = EOF
 #else
         m.set_result(0);  // EOF for stdin
 #endif
@@ -680,18 +678,15 @@ static void sys_readv(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Read from JavaScript stdin buffer into iovec with polling
-        // First, poll until at least some data is available (avoid returning 0 = EOF)
-        int polls = 0;
-        while (polls < 3000) { // 30 second timeout (3000 * 10ms)
-            int has_data = EM_ASM_INT({
-                return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
-            });
-            if (has_data) break;
-            emscripten_sleep(10); // Yield to browser event loop
-            polls++;
+        // Try non-blocking read from JavaScript stdin buffer into iovec
+        int has_data = EM_ASM_INT({
+            return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
+        });
+        if (!has_data) {
+            // No data — stop machine so main loop can yield and retry
+            m.stop();
+            return;
         }
-        // Now drain whatever is available into the iovec buffers
         size_t total = 0;
         for (int i = 0; i < iovcnt; i++) {
             uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
@@ -711,10 +706,10 @@ static void sys_readv(Machine& m) {
                 if (bytes_read > 0) {
                     total += bytes_read;
                 }
-                if (static_cast<size_t>(bytes_read) < len) break;  // Short read
+                if (static_cast<size_t>(bytes_read) < len) break;
             }
         }
-        m.set_result(total); // 0 here only if timeout reached (= EOF)
+        m.set_result(total);
 #else
         m.set_result(0);  // EOF for stdin
 #endif

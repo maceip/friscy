@@ -124,7 +124,8 @@ if(EMSCRIPTEN)
         -sMODULARIZE=1
         -sEXPORTED_RUNTIME_METHODS=['FS','callMain']
         -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
-        -sJSPI                              # Enable JSPI for emscripten_sleep (stdin polling)
+        -sASYNCIFY                          # Enable emscripten_sleep for stdin polling
+        -sASYNCIFY_STACK_SIZE=65536         # 64KB async stack
     )
 
     if(FRISCY_PRODUCTION)

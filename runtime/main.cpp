@@ -42,15 +42,17 @@ static vfs::VirtualFS g_vfs;
 static Machine* g_machine = nullptr;
 
 extern "C" {
-// Returns 1 if machine is stopped (waiting for stdin), 0 otherwise
+// Returns 1 if machine is stopped waiting for stdin, 0 otherwise.
+// Uses g_waiting_for_stdin flag (set by syscall handlers) to distinguish
+// stdin-wait from program exit (both call machine.stop()).
 EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
-    if (!g_machine) return 0;
-    return (g_machine->stopped() && !g_machine->instruction_limit_reached()) ? 1 : 0;
+    return syscalls::g_waiting_for_stdin ? 1 : 0;
 }
 
 // Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
 EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     if (!g_machine) return 0;
+    syscalls::g_waiting_for_stdin = false;
     g_machine->resume(MAX_INSTRUCTIONS);
     return friscy_stopped();
 }
@@ -448,6 +450,14 @@ int main(int argc, char** argv) {
         // the syscall handler calls machine.stop(). JS calls friscy_resume()
         // after new stdin data arrives to continue execution.
         machine.simulate(MAX_INSTRUCTIONS);
+
+#ifdef __EMSCRIPTEN__
+        if (syscalls::g_waiting_for_stdin) {
+            // Machine stopped because stdin has no data.
+            // Return to JS — the resume loop will call friscy_resume().
+            return 0;
+        }
+#endif
 
         std::cout << "----------------------------------------\n";
 

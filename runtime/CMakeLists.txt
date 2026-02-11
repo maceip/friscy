@@ -124,6 +124,7 @@ if(EMSCRIPTEN)
         -sMODULARIZE=1
         -sEXPORTED_RUNTIME_METHODS=['FS','callMain']
         -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
+        -sJSPI                              # Enable JSPI for emscripten_sleep (stdin polling)
     )
 
     if(FRISCY_PRODUCTION)

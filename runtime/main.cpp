@@ -37,6 +37,26 @@ static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 // Global VFS instance (needed for syscall handlers)
 static vfs::VirtualFS g_vfs;
 
+// Global machine pointer for JS interop (stdin resume loop)
+#ifdef __EMSCRIPTEN__
+static Machine* g_machine = nullptr;
+
+extern "C" {
+// Returns 1 if machine is stopped (waiting for stdin), 0 otherwise
+EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
+    if (!g_machine) return 0;
+    return (g_machine->stopped() && !g_machine->instruction_limit_reached()) ? 1 : 0;
+}
+
+// Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
+EMSCRIPTEN_KEEPALIVE int friscy_resume() {
+    if (!g_machine) return 0;
+    g_machine->resume(MAX_INSTRUCTIONS);
+    return friscy_stopped();
+}
+}
+#endif
+
 // ============================================================================
 // Wizer pre-initialization support (Workstream E)
 // When built with -DFRISCY_WIZER, the wizer_init() function pre-loads the
@@ -417,46 +437,13 @@ int main(int argc, char** argv) {
         std::cout << "[friscy] Starting execution...\n";
         std::cout << "----------------------------------------\n";
 
-        // Run with stdin yield loop: when the guest reads from stdin and
-        // no data is available, the syscall handler calls machine.stop().
-        // We detect this (machine stopped but not at instruction limit),
-        // yield to the JS event loop via emscripten_sleep, then resume.
-        bool sim_result = machine.simulate(MAX_INSTRUCTIONS);
 #ifdef __EMSCRIPTEN__
-        {
-            auto [ic, _x] = machine.get_counters();
-            std::cerr << "[friscy-dbg] simulate returned=" << sim_result
-                      << " stopped=" << machine.stopped()
-                      << " ilr=" << machine.instruction_limit_reached()
-                      << " ic=" << ic << "\n";
-        }
-        // Stdin yield loop: syscall handler calls machine.stop() when
-        // stdin has no data. We yield to JS event loop, then resume.
-        while (machine.stopped() && !machine.instruction_limit_reached()) {
-            // Machine was stopped by stdin handler — yield and retry
-            emscripten_sleep(10);
-            // Check for EOF signal from JS
-            bool eof = EM_ASM_INT({
-                return (Module._stdinEOF === true) ? 1 : 0;
-            });
-            if (eof) {
-                std::cerr << "[friscy-dbg] EOF signaled from JS\n";
-                break;
-            }
-            // Check if stdin now has data
-            int has_data = EM_ASM_INT({
-                return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
-            });
-            auto [ic_before, _b] = machine.get_counters();
-            machine.resume(MAX_INSTRUCTIONS);
-            auto [ic_after, _a] = machine.get_counters();
-            std::cerr << "[friscy-dbg] resume: has_data=" << has_data
-                      << " ic_before=" << ic_before
-                      << " ic_after=" << ic_after
-                      << " stopped=" << machine.stopped()
-                      << " ilr=" << machine.instruction_limit_reached() << "\n";
-        }
+        g_machine = &machine;
 #endif
+        // Run! When the guest reads from stdin and no data is available,
+        // the syscall handler calls machine.stop(). JS calls friscy_resume()
+        // after new stdin data arrives to continue execution.
+        machine.simulate(MAX_INSTRUCTIONS);
 
         std::cout << "----------------------------------------\n";
 

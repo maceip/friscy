@@ -123,10 +123,9 @@ if(EMSCRIPTEN)
         -sEXPORT_ES6=1
         -sMODULARIZE=1
         -sEXPORTED_RUNTIME_METHODS=['FS','callMain']
-        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
-        -sASYNCIFY                          # Enable emscripten_sleep for stdin polling
-        -sASYNCIFY_STACK_SIZE=65536         # 64KB async stack
-        "-sASYNCIFY_IMPORTS=['emscripten_sleep']"
+        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_friscy_stopped','_friscy_resume']
+        # Note: stdin polling uses machine.stop()/resume() + JS setTimeout,
+        # NOT emscripten_sleep/ASYNCIFY (which can't unwind through libriscv)
     )
 
     if(FRISCY_PRODUCTION)

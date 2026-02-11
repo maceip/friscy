@@ -123,7 +123,7 @@ if(EMSCRIPTEN)
         -sEXPORT_ES6=1
         -sMODULARIZE=1
         -sEXPORTED_RUNTIME_METHODS=['FS','callMain','HEAPU8']
-        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
+        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_friscy_export_tar']
     )
 
     if(FRISCY_PRODUCTION)

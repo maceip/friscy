@@ -520,7 +520,12 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
 
                 if (friscyModule._friscy_stopped()) {
                     // Still waiting for more stdin — resume again if buffer has data
-                    if (inputBuffer.length > 0) scheduleResume();
+                    if (inputBuffer.length > 0) {
+                        scheduleResume();
+                    } else {
+                        // Machine idle, waiting for input — show prompt
+                        term.write('\x1b[32m/ # \x1b[0m');
+                    }
                 } else {
                     // Machine finished (guest called exit)
                     machineRunning = false;
@@ -570,10 +575,13 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
             term.open(terminalEl);
+            term.focus();
             updateTerminalSize();
 
             window.addEventListener('resize', updateTerminalSize);
             document.getElementById('fit-button').addEventListener('click', updateTerminalSize);
+            // Re-focus terminal when user clicks on it
+            terminalEl.addEventListener('click', () => term.focus());
 
             term.writeln('\x1b[1;32mfriscy\x1b[0m - Container runtime in WebAssembly');
             term.writeln(`Loading ${manifest.image}...`);
@@ -601,10 +609,48 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             friscyModule.FS.writeFile('/rootfs.tar', new Uint8Array(rootfs));
 
             // Wire keyboard → stdin buffer → machine resume
+            // Shell runs in batch mode (no TTY echo), so we provide:
+            //   - Local echo for visual feedback
+            //   - Line buffering with backspace support
+            //   - \r → \n translation (xterm sends \r, Unix needs \n)
+            let lineBuffer = '';
+
             term.onData((data) => {
-                const bytes = new TextEncoder().encode(data);
-                inputBuffer.push(...bytes);
-                scheduleResume();
+                if (!machineRunning) return;
+
+                for (const ch of data) {
+                    const code = ch.charCodeAt(0);
+
+                    if (ch === '\r') {
+                        // Enter → send buffered line + \n to shell
+                        term.write('\r\n');
+                        const line = lineBuffer + '\n';
+                        const bytes = new TextEncoder().encode(line);
+                        inputBuffer.push(...bytes);
+                        lineBuffer = '';
+                        scheduleResume();
+                    } else if (code === 127 || code === 8) {
+                        // Backspace
+                        if (lineBuffer.length > 0) {
+                            lineBuffer = lineBuffer.slice(0, -1);
+                            term.write('\b \b');
+                        }
+                    } else if (code === 3) {
+                        // Ctrl+C
+                        term.write('^C\r\n');
+                        lineBuffer = '';
+                    } else if (code === 4) {
+                        // Ctrl+D → EOF when line is empty
+                        if (lineBuffer.length === 0) {
+                            friscyModule._stdinEOF = true;
+                            scheduleResume();
+                        }
+                    } else if (code >= 32) {
+                        // Printable character → echo and buffer
+                        term.write(ch);
+                        lineBuffer += ch;
+                    }
+                }
             });
 
             // Build args matching main.cpp: --rootfs <tar> <entry> [args...]

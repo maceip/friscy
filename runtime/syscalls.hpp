@@ -159,8 +159,10 @@ inline vfs::VirtualFS& get_fs(Machine& m) {
 namespace handlers {
 
 static void sys_exit(Machine& m) {
+    auto code = m.template sysarg<int>(0);
+    std::cerr << "[debug] sys_exit called, code=" << code << "\n";
     m.stop();
-    m.set_result(m.template sysarg<int>(0));
+    m.set_result(code);
 }
 
 static void sys_openat(Machine& m) {
@@ -198,6 +200,7 @@ static void sys_read(Machine& m) {
     size_t count = m.sysarg(2);
 
     if (fd == 0) {
+        std::cerr << "[debug] sys_read fd=0, count=" << count << "\n";
 #ifdef __EMSCRIPTEN__
         // Try non-blocking read from JavaScript stdin buffer
         auto view = m.memory.memview(buf_addr, count);
@@ -1040,6 +1043,11 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::linkat, sys_linkat);
     machine.install_syscall_handler(nr::renameat, sys_renameat);
     machine.install_syscall_handler(nr::sysinfo, sys_sysinfo);
+
+    // Debug: catch-all for unhandled syscalls
+    Machine::on_unhandled_syscall = [](Machine&, size_t sysno) {
+        std::cerr << "[debug] UNHANDLED syscall " << sysno << "\n";
+    };
 }
 
 }  // namespace syscalls

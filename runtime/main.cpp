@@ -457,6 +457,17 @@ int main(int argc, char** argv) {
             // Return to JS — the resume loop will call friscy_resume().
             return 0;
         }
+        // Debug: trace why simulate() returned
+        {
+            auto [ic, _d] = machine.get_counters();
+            auto last_a7 = machine.cpu.reg(17); // a7 = syscall number
+            auto pc = machine.cpu.pc();
+            std::cerr << "[debug] simulate done: ic=" << ic
+                      << " stopped=" << machine.stopped()
+                      << " a7=" << last_a7
+                      << " pc=0x" << std::hex << pc << std::dec
+                      << " waiting=" << syscalls::g_waiting_for_stdin << "\n";
+        }
 #endif
 
         std::cout << "----------------------------------------\n";

@@ -417,8 +417,27 @@ int main(int argc, char** argv) {
         std::cout << "[friscy] Starting execution...\n";
         std::cout << "----------------------------------------\n";
 
-        // Run!
+        // Run with stdin yield loop: when the guest reads from stdin and
+        // no data is available, the syscall handler calls machine.stop().
+        // We detect this (machine stopped but not at instruction limit),
+        // yield to the JS event loop via emscripten_sleep, then resume.
         machine.simulate(MAX_INSTRUCTIONS);
+#ifdef __EMSCRIPTEN__
+        // Stdin yield loop: syscall handler calls machine.stop() when
+        // stdin has no data. We yield to JS event loop, then resume.
+        // simulate() returns true if stopped normally (instruction limit),
+        // false if stopped by machine.stop().
+        while (machine.stopped() && !machine.instruction_limit_reached()) {
+            // Machine was stopped by stdin handler — yield and retry
+            emscripten_sleep(10);
+            // Check for EOF signal from JS
+            bool eof = EM_ASM_INT({
+                return (Module._stdinEOF === true) ? 1 : 0;
+            });
+            if (eof) break;
+            machine.resume(MAX_INSTRUCTIONS);
+        }
+#endif
 
         std::cout << "----------------------------------------\n";
 

@@ -494,13 +494,11 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
         const statusEl = document.getElementById('status');
         const terminalEl = document.getElementById('terminal');
 
-        let term;
-        let fitAddon;
-        let friscyModule; // Renamed from Module to avoid conflicts
-        let inputBuffer = [];
-        let inputWaitingResolve = null; // Promise resolver for blocking stdin
+        let term, fitAddon, friscyModule;
+        const inputBuffer = [];
+        let machineRunning = false;
+        let resumeScheduled = false;
 
-        // Helper to update terminal dimensions on the Module object for C++
         function updateTerminalSize() {
             if (friscyModule && term && fitAddon) {
                 fitAddon.fit();
@@ -509,20 +507,44 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             }
         }
 
+        // Resume the RISC-V machine when it's waiting for stdin.
+        // Called on keyboard input and after callMain returns.
+        function scheduleResume() {
+            if (!machineRunning || resumeScheduled) return;
+            const stopped = friscyModule._friscy_stopped;
+            if (!stopped || !stopped()) return;
+
+            resumeScheduled = true;
+            setTimeout(() => {
+                resumeScheduled = false;
+                if (!machineRunning) return;
+
+                friscyModule._friscy_resume();
+
+                if (friscyModule._friscy_stopped()) {
+                    // Still waiting for more stdin — resume again if buffer has data
+                    if (inputBuffer.length > 0) scheduleResume();
+                } else {
+                    // Machine finished (guest called exit)
+                    machineRunning = false;
+                    term.writeln('\r\n\x1b[33mProcess exited\x1b[0m');
+                    statusEl.textContent = 'Exited';
+                }
+            }, 5);
+        }
+
         async function main() {
             statusEl.textContent = 'Loading manifest...';
-
-            // Load manifest
             const manifest = await fetch('./manifest.json').then(r => r.json());
             statusEl.textContent = `Image: ${manifest.image}`;
 
-            // Initialize terminal
+            // Initialize xterm.js
             terminalEl.innerHTML = '';
             terminalEl.classList.remove('loading');
 
             term = new Terminal({
                 cursorBlink: true,
-                convertEol: true, // Convert LF to CRLF
+                convertEol: true,
                 fontSize: 14,
                 fontFamily: 'Menlo, Monaco, "Courier New", monospace',
                 theme: {
@@ -551,7 +573,7 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
             term.open(terminalEl);
-            updateTerminalSize(); // Initial fit
+            updateTerminalSize();
 
             window.addEventListener('resize', updateTerminalSize);
             document.getElementById('fit-button').addEventListener('click', updateTerminalSize);
@@ -565,132 +587,64 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             const rootfs = await fetch('./rootfs.tar').then(r => r.arrayBuffer());
             term.writeln(`Loaded rootfs: ${(rootfs.byteLength / 1024 / 1024).toFixed(1)} MB`);
 
-            // Initialize friscy Emscripten Module
+            // Initialize friscy Wasm module
             statusEl.textContent = 'Initializing runtime...';
             friscyModule = await createFriscy({
-                // Emscripten's default output functions
+                noInitialRun: true,
                 print: (text) => term.writeln(text),
                 printErr: (text) => term.writeln('\x1b[31m' + text + '\x1b[0m'),
-
-                // Custom stdin/stdout/stderr for C++ syscalls.hpp
-                // These are called from EM_ASM blocks in C++
-                _stdinBuffer: inputBuffer, // Expose for C++ to read
+                _stdinBuffer: inputBuffer,
+                _stdinEOF: false,
                 _termRows: term.rows,
                 _termCols: term.cols,
-                _termWrite: (text) => term.write(text), // Raw write, not writeln
+                _termWrite: (text) => term.write(text),
             });
 
-            // Load rootfs into virtual filesystem
-            const rootfsData = new Uint8Array(rootfs);
-            friscyModule.FS.writeFile('/rootfs.tar', rootfsData);
+            // Load rootfs into Emscripten virtual FS
+            friscyModule.FS.writeFile('/rootfs.tar', new Uint8Array(rootfs));
 
-            // Set up stdin from terminal
+            // Wire keyboard → stdin buffer → machine resume
             term.onData((data) => {
                 const bytes = new TextEncoder().encode(data);
                 inputBuffer.push(...bytes);
-                if (inputWaitingResolve) {
-                    inputWaitingResolve();
-                    inputWaitingResolve = null;
-                }
+                scheduleResume();
             });
 
-            // Handle blocking stdin from C++
-            // This function will be called from C++ EM_ASM when stdin is empty
-            friscyModule._readStdin = async () => {
-                if (inputBuffer.length === 0) {
-                    await new Promise(resolve => { inputWaitingResolve = resolve; });
-                }
-                const charCode = inputBuffer.shift();
-                return charCode !== undefined ? charCode : -1; // -1 for EOF, or actual char code
-            };
+            // Build args matching main.cpp: --rootfs <tar> <entry> [args...]
+            const guestCmd = manifest.entrypoint.split(' ').filter(s => s);
+            const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
 
             statusEl.textContent = 'Running...';
             term.writeln('Starting: ' + manifest.entrypoint);
-            term.writeln('─'.repeat(40));
-
-            // Connect terminal output to xterm.js
-            Module._termWrite = (text) => term.write(text);
+            term.writeln('\u2500'.repeat(40));
 
             // Run the container
             try {
-                // Determine argv: entrypoint + manifest.env + manifest.cmd
-                // Emscripten Module.callMain expects:
-                // argv[0] = entrypoint
-                // argv[1..N] = args
-                const argv = [manifest.entrypoint];
-                // Assuming manifest.entrypoint might be an array, or a single string
-                // The current friscy-pack manifest.entrypoint is a single string.
-                // The C++ main uses entry_path, and then adds guest_args.
-                // Need to reconcile how args are passed.
+                machineRunning = true;
+                friscyModule.callMain(args);
 
-                // For simplicity, let's assume the manifest entrypoint is the full command.
-                // The original harness.sh passes:
-                // Module.callMain(['--rootfs', '/rootfs.tar', '--', manifest.entrypoint]);
-                // This means the C++ main() gets argv like:
-                // ['./friscy', '--rootfs', '/rootfs.tar', '--', '/bin/sh']
-                // The actual guest_args will be: ['/bin/sh']
-
-                // Let's adapt this.
-                const guestArgv = [manifest.entrypoint, ...manifest.env.map(e => `--env=${e}`)]; // Simplified for now
-                // This might need more careful parsing of manifest.entrypoint and manifest.cmd
-                // For now, let's use what Workstream D's problem section implies:
-                // "Starting: /bin/sh"
-                // So the target is just /bin/sh.
-
-                // Re-evaluate the arguments for Module.callMain
-                // It should be what the RISC-V guest receives.
-                // The `main.cpp` currently constructs `guest_args` for the RISC-V guest.
-                // So, the `Module.callMain` should ideally be called with:
-                // `Module.callMain(guest_args_for_wasm)`
-                // Where `guest_args_for_wasm` should mirror `guest_args` in `main.cpp`.
-                // For now, let's use a simplified approach as in the current `friscy-pack`.
-
-                // Original: Module.callMain([
-                //     '--rootfs', '/rootfs.tar',
-                //     '--', manifest.entrypoint
-                // ]);
-                // This implies that main.cpp parses its own arguments.
-                // The C++ `main` function is essentially the entry point of the compiled Wasm.
-                // It receives `argc` and `argv`. So `Module.callMain` parameters are `argv` for C++ main.
-                // My C++ `main.cpp` expects its own arguments, then the guest arguments after `--`.
-
-                const emscriptenArgs = [
-                    'friscy.wasm', // Conventionally, argv[0] is program name
-                    '--rootfs', '/rootfs.tar',
-                    '--',
-                    manifest.entrypoint, // This is the actual entrypoint for the guest
-                    // ... any args for manifest.entrypoint would go here
-                ];
-                // For now, assume manifest.entrypoint includes everything needed.
-                // If manifest.entrypoint is "/bin/sh -c 'ls /'", it needs to be parsed.
-                // Current manifest.json sets "entrypoint": "/bin/sh".
-                // So, we need the arguments that the original container would run.
-                // The current `friscy-pack` script uses `RUN_CMD` which combines ENTRYPOINT and CMD.
-                // Let's pass that to the C++ main after `--`.
-                // `manifest.entrypoint` is "$RUN_CMD" from friscy-pack.
-
-                const guestCmd = manifest.entrypoint.split(' ').filter(arg => arg.length > 0);
-                const fullEmscriptenArgs = ['friscy.wasm', '--rootfs', '/rootfs.tar', '--', ...guestCmd];
-
-                const exitCode = friscyModule.callMain(fullEmscriptenArgs);
-                term.writeln('');
-                term.writeln(`\x1b[33mProcess exited with code ${exitCode}\x1b[0m`);
-                statusEl.textContent = `Exited (${exitCode})`;
+                // If machine stopped for stdin, enter interactive mode
+                if (friscyModule._friscy_stopped && friscyModule._friscy_stopped()) {
+                    statusEl.textContent = 'Interactive';
+                    scheduleResume();
+                } else {
+                    machineRunning = false;
+                    term.writeln('\r\n\x1b[33mProcess exited\x1b[0m');
+                    statusEl.textContent = 'Exited';
+                }
             } catch (e) {
+                machineRunning = false;
                 term.writeln('\x1b[31mError: ' + e.message + '\x1b[0m');
                 statusEl.textContent = 'Error';
+                console.error(e);
             }
         }
 
-        document.getElementById('reset-button').addEventListener('click', () => {
-            // Simple reset: reload the page
-            location.reload();
-        });
+        document.getElementById('reset-button').addEventListener('click', () => location.reload());
 
         main().catch(e => {
             console.error(e);
             statusEl.textContent = 'Error: ' + e.message;
-            term.writeln('\x1b[31mFATAL ERROR: ' + e.message + '\x1b[0m');
         });
     </script>
 </body>

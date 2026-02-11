@@ -114,21 +114,19 @@ fi
 log "Extracting rootfs..."
 
 CONTAINER_NAME="friscy-temp-$$"
-docker create --platform linux/riscv64 --name "$CONTAINER_NAME" "$RISCV_IMAGE" /bin/true >/dev/null
 
-# Export filesystem
-docker export "$CONTAINER_NAME" > "$OUTPUT_DIR/rootfs.tar"
-log "Exported rootfs: $(du -h "$OUTPUT_DIR/rootfs.tar" | cut -f1)"
-
-# Get container config
-CONFIG=$(docker inspect "$CONTAINER_NAME")
+# Get config from the IMAGE (not the container) to preserve original CMD/ENTRYPOINT
+CONFIG=$(docker inspect "$RISCV_IMAGE")
 ENTRYPOINT=$(echo "$CONFIG" | jq -r '.[0].Config.Entrypoint // empty | if type == "array" then .[] else . end')
 CMD=$(echo "$CONFIG" | jq -r '.[0].Config.Cmd // empty | if type == "array" then .[] else . end')
 WORKDIR=$(echo "$CONFIG" | jq -r '.[0].Config.WorkingDir // "/"')
 ENV=$(echo "$CONFIG" | jq -r '.[0].Config.Env // [] | .[]')
 
-# Cleanup
+# Create temporary container for filesystem export (command doesn't matter)
+docker create --platform linux/riscv64 --name "$CONTAINER_NAME" "$RISCV_IMAGE" /bin/true >/dev/null
+docker export "$CONTAINER_NAME" > "$OUTPUT_DIR/rootfs.tar"
 docker rm "$CONTAINER_NAME" >/dev/null
+log "Exported rootfs: $(du -h "$OUTPUT_DIR/rootfs.tar" | cut -f1)"
 
 # Determine what to run
 if [[ -n "$ENTRYPOINT" ]]; then

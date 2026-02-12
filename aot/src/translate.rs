@@ -1190,21 +1190,18 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             emit_amo_op_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32Or);
         }
 
-        // Atomic min/max word (signed/unsigned) - stub for now
-        Opcode::AMOMIN_W | Opcode::AMOMAX_W | Opcode::AMOMINU_W | Opcode::AMOMAXU_W => {
-            body.push(WasmInst::Comment {
-                text: format!("AMO min/max stub: {:?}", inst.opcode),
-            });
-            // For now, just do a swap
-            if rd != 0 {
-                body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::I64Load { offset: rs1_offset });
-                body.push(WasmInst::I32WrapI64);
-                body.push(WasmInst::I32Load { offset: 0 });
-                body.push(WasmInst::I64ExtendI32S);
-                body.push(WasmInst::I64Store { offset: rd_offset });
-            }
+        // Atomic min/max word (signed/unsigned)
+        Opcode::AMOMIN_W => {
+            emit_amo_minmax_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32LtS);
+        }
+        Opcode::AMOMAX_W => {
+            emit_amo_minmax_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32GtS);
+        }
+        Opcode::AMOMINU_W => {
+            emit_amo_minmax_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32LtU);
+        }
+        Opcode::AMOMAXU_W => {
+            emit_amo_minmax_w(body, rd, rs1_offset, rs2_offset, WasmInst::I32GtU);
         }
 
         // 64-bit atomics (doubleword)
@@ -1257,18 +1254,17 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             emit_amo_op_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64Or);
         }
 
-        Opcode::AMOMIN_D | Opcode::AMOMAX_D | Opcode::AMOMINU_D | Opcode::AMOMAXU_D => {
-            body.push(WasmInst::Comment {
-                text: format!("AMO min/max-D stub: {:?}", inst.opcode),
-            });
-            if rd != 0 {
-                body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::I64Load { offset: rs1_offset });
-                body.push(WasmInst::I32WrapI64);
-                body.push(WasmInst::I64Load { offset: 0 });
-                body.push(WasmInst::I64Store { offset: rd_offset });
-            }
+        Opcode::AMOMIN_D => {
+            emit_amo_minmax_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64LtS);
+        }
+        Opcode::AMOMAX_D => {
+            emit_amo_minmax_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64GtS);
+        }
+        Opcode::AMOMINU_D => {
+            emit_amo_minmax_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64LtU);
+        }
+        Opcode::AMOMAXU_D => {
+            emit_amo_minmax_d(body, rd, rs1_offset, rs2_offset, WasmInst::I64GtU);
         }
 
         // FMA instructions (fused multiply-add) - single precision
@@ -2464,5 +2460,96 @@ fn emit_amo_op_d(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset:
     body.push(WasmInst::LocalGet { idx: 0 });
     body.push(WasmInst::I64Load { offset: rs2_offset });
     body.push(op);
+    body.push(WasmInst::I64Store { offset: 0 });
+}
+
+/// Helper for atomic word min/max operations (AMOMIN_W, AMOMAX_W, AMOMINU_W, AMOMAXU_W)
+/// cmp_op should be: I32LtS (min signed), I32LtU (min unsigned),
+///                   I32GtS (max signed), I32GtU (max unsigned)
+fn emit_amo_minmax_w(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, cmp_op: WasmInst) {
+    let rd_offset = rd * 8;
+
+    // Load old value to rd
+    if rd != 0 {
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::I64Load { offset: rs1_offset });
+        body.push(WasmInst::I32WrapI64);
+        body.push(WasmInst::I32Load { offset: 0 });
+        body.push(WasmInst::I64ExtendI32S);
+        body.push(WasmInst::I64Store { offset: rd_offset });
+    }
+
+    // Compute and store min/max: M[rs1] = select(old, rs2, old cmp rs2)
+    // Push store address
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    // Push old value (val1 for select - returned if condition is true)
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::I32Load { offset: 0 });
+    // Push rs2 value (val2 for select - returned if condition is false)
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs2_offset });
+    body.push(WasmInst::I32WrapI64);
+    // Push old and rs2 again for comparison
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::I32Load { offset: 0 });
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs2_offset });
+    body.push(WasmInst::I32WrapI64);
+    // Compare: e.g. I32LtS for min, I32GtS for max
+    body.push(cmp_op);
+    // Select: returns old if condition true, rs2 if false
+    body.push(WasmInst::Select);
+    // Store result to M[rs1]
+    body.push(WasmInst::I32Store { offset: 0 });
+}
+
+/// Helper for atomic doubleword min/max operations (AMOMIN_D, AMOMAX_D, AMOMINU_D, AMOMAXU_D)
+/// cmp_op should be: I64LtS (min signed), I64LtU (min unsigned),
+///                   I64GtS (max signed), I64GtU (max unsigned)
+fn emit_amo_minmax_d(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, cmp_op: WasmInst) {
+    let rd_offset = rd * 8;
+
+    // Load old value to rd
+    if rd != 0 {
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::LocalGet { idx: 0 });
+        body.push(WasmInst::I64Load { offset: rs1_offset });
+        body.push(WasmInst::I32WrapI64);
+        body.push(WasmInst::I64Load { offset: 0 });
+        body.push(WasmInst::I64Store { offset: rd_offset });
+    }
+
+    // Compute and store min/max: M[rs1] = select(old, rs2, old cmp rs2)
+    // Push store address
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    // Push old value (val1 for select - returned if condition is true)
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::I64Load { offset: 0 });
+    // Push rs2 value (val2 for select - returned if condition is false)
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs2_offset });
+    // Push old and rs2 again for comparison
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs1_offset });
+    body.push(WasmInst::I32WrapI64);
+    body.push(WasmInst::I64Load { offset: 0 });
+    body.push(WasmInst::LocalGet { idx: 0 });
+    body.push(WasmInst::I64Load { offset: rs2_offset });
+    // Compare: e.g. I64LtS for min, I64GtS for max
+    body.push(cmp_op);
+    // Select: returns old if condition true, rs2 if false
+    body.push(WasmInst::Select);
+    // Store result to M[rs1]
     body.push(WasmInst::I64Store { offset: 0 });
 }

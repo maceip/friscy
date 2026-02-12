@@ -122,8 +122,10 @@ if(EMSCRIPTEN)
         -sSTACK_SIZE=1048576            # 1MB stack
         -sEXPORT_ES6=1
         -sMODULARIZE=1
-        -sEXPORTED_RUNTIME_METHODS=['FS','callMain','HEAPU8']
-        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
+        -sEXPORTED_RUNTIME_METHODS=['FS','callMain','HEAPU8','HEAPU32']
+        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_friscy_stopped','_friscy_resume']
+        # Note: stdin polling uses machine.stop()/resume() + JS setTimeout,
+        # NOT emscripten_sleep/ASYNCIFY (which can't unwind through libriscv)
     )
 
     if(FRISCY_PRODUCTION)

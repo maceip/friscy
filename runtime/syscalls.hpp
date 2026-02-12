@@ -6,6 +6,7 @@
 
 #include <libriscv/machine.hpp>
 #include "vfs.hpp"
+#include "elf_loader.hpp"
 #include <ctime>
 #include <cstring>
 #include <random>
@@ -17,6 +18,56 @@
 namespace syscalls {
 
 using Machine = riscv::Machine<riscv::RISCV64>;
+
+// Flag: true when machine stopped because stdin has no data.
+// Used by JS resume loop to distinguish stdin-wait from program exit.
+inline bool g_waiting_for_stdin = false;
+
+// Cooperative fork state — single-process vfork emulation.
+// On clone(): save parent registers, return 0 (child runs).
+// On exit_group() in child: restore parent registers, return child PID.
+// On wait4(): return saved exit status.
+struct ForkState {
+    uint64_t regs[32];  // Saved parent registers (x0-x31)
+    uint64_t pc;        // Saved parent PC (the ecall instruction)
+    int exit_status;    // Child's exit code
+    pid_t child_pid;    // PID assigned to child
+    bool in_child;      // True while "child" is running
+    // Memory snapshots: saved at clone, restored when child exits.
+    // We save three separate regions to avoid unmapped guard pages:
+    //   1. Main binary data/BSS (globals, GOT)
+    //   2. Interpreter data/BSS (ld-musl state)
+    //   3. Stack (return addresses, locals)
+    struct MemRegion {
+        std::vector<uint8_t> data;
+        uint64_t addr;
+        uint64_t size;
+    };
+    MemRegion exec_data;
+    MemRegion interp_data;
+    MemRegion stack_data;
+};
+inline ForkState g_fork = {};
+inline pid_t g_next_pid = 100;
+
+// Execution context saved from initial load — used by execve to
+// reload binary segments and set up a fresh stack.
+struct ExecContext {
+    std::vector<uint8_t> exec_binary;    // Original main executable
+    std::vector<uint8_t> interp_binary;  // Original interpreter (ld-musl)
+    elf::ElfInfo exec_info;              // Adjusted ELF info (with PIE base)
+    uint64_t exec_base = 0;             // PIE base for main executable
+    uint64_t exec_rw_start = 0;         // First writable segment of main binary
+    uint64_t exec_rw_end = 0;           // End of writable segments of main binary
+    uint64_t interp_base = 0;           // Where interpreter was loaded
+    uint64_t interp_rw_start = 0;       // First writable segment of interpreter
+    uint64_t interp_rw_end = 0;         // End of writable segments of interpreter
+    uint64_t interp_entry = 0;          // Interpreter entry point
+    uint64_t original_stack_top = 0;    // Stack top from initial setup
+    std::vector<std::string> env;        // Environment variables
+    bool dynamic = false;                // Using dynamic linker?
+};
+inline ExecContext g_exec_ctx;
 
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
@@ -45,12 +96,14 @@ namespace nr {
     constexpr int pread64       = 67;
     constexpr int pwrite64      = 68;
     constexpr int sendfile      = 71;
+    constexpr int ppoll         = 73;
     constexpr int readlinkat    = 78;
     constexpr int newfstatat    = 79;
     constexpr int fstat         = 80;
     constexpr int exit          = 93;
     constexpr int exit_group    = 94;
     constexpr int set_tid_address = 96;
+    constexpr int set_robust_list = 99;
     constexpr int clock_gettime = 113;
     constexpr int sigaction     = 134;
     constexpr int sigprocmask   = 135;
@@ -64,8 +117,11 @@ namespace nr {
     constexpr int sysinfo       = 179;
     constexpr int brk           = 214;
     constexpr int munmap        = 215;
+    constexpr int clone         = 220;
+    constexpr int execve        = 221;
     constexpr int mmap          = 222;
     constexpr int mprotect      = 226;
+    constexpr int wait4         = 260;
     constexpr int prlimit64     = 261;
     constexpr int getrandom     = 278;
     constexpr int rseq          = 293;
@@ -154,8 +210,202 @@ inline vfs::VirtualFS& get_fs(Machine& m) {
 namespace handlers {
 
 static void sys_exit(Machine& m) {
+    if (g_fork.in_child) {
+        // "Child" is exiting — restore parent state
+        g_fork.exit_status = m.template sysarg<int>(0);
+        g_fork.in_child = false;
+
+        // Restore parent memory (data/BSS + interpreter + stack)
+        auto restore = [&](ForkState::MemRegion& r) {
+            if (!r.data.empty()) {
+                m.memory.memcpy(r.addr, r.data.data(), r.size);
+                r.data.clear();
+                r.data.shrink_to_fit();
+            }
+        };
+        restore(g_fork.exec_data);
+        restore(g_fork.interp_data);
+        restore(g_fork.stack_data);
+
+        // Restore parent registers (x0-x31)
+        for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
+            m.cpu.reg(i) = g_fork.regs[i];
+        }
+        // Resume parent at instruction after the clone ecall
+        m.cpu.jump(g_fork.pc);
+        // Parent sees child PID as clone() return value
+        m.set_result(g_fork.child_pid);
+        return;
+    }
     m.stop();
     m.set_result(m.template sysarg<int>(0));
+}
+
+// clone — cooperative vfork emulation for single-process emulator.
+// Saves parent state, returns 0 (child context). When child calls
+// exit/exit_group, parent state is restored with child PID as return.
+static void sys_clone(Machine& m) {
+    if (g_fork.in_child) {
+        // Nested fork not supported
+        m.set_result(-11);  // -EAGAIN
+        return;
+    }
+
+    // Save parent registers
+    for (int i = 0; i < 32; i++) {
+        g_fork.regs[i] = m.cpu.reg(i);
+    }
+    g_fork.pc = m.cpu.pc();  // Already past the ecall
+    g_fork.child_pid = g_next_pid++;
+    g_fork.in_child = true;
+    g_fork.exit_status = 0;
+
+    // Save parent memory in three separate regions (avoiding unmapped
+    // guard pages between data and stack):
+    //   1. Main binary data/BSS (globals, GOT)
+    //   2. Interpreter data/BSS (ld-musl state)
+    //   3. Stack (from SP to stack top)
+
+    // Region 1: main binary writable segments
+    if (g_exec_ctx.exec_rw_start > 0 && g_exec_ctx.exec_rw_end > g_exec_ctx.exec_rw_start) {
+        auto& r = g_fork.exec_data;
+        r.addr = g_exec_ctx.exec_rw_start;
+        r.size = g_exec_ctx.exec_rw_end - g_exec_ctx.exec_rw_start;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+    }
+
+    // Region 2: interpreter writable segments
+    if (g_exec_ctx.interp_rw_start > 0 && g_exec_ctx.interp_rw_end > g_exec_ctx.interp_rw_start) {
+        auto& r = g_fork.interp_data;
+        r.addr = g_exec_ctx.interp_rw_start;
+        r.size = g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+    }
+
+    // Region 3: stack (SP to stack top)
+    {
+        uint64_t sp = m.cpu.reg(riscv::REG_SP);
+        uint64_t stack_top = g_exec_ctx.original_stack_top;
+        auto& r = g_fork.stack_data;
+        r.addr = sp;
+        r.size = stack_top - sp;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+    }
+
+    // Return 0 = "you are the child"
+    m.set_result(0);
+}
+
+// wait4 — return status of the cooperatively-forked child.
+// In our model the child has always already exited by the time
+// the parent resumes, so this never blocks.
+static void sys_wait4(Machine& m) {
+    auto wstatus_addr = m.sysarg(1);
+
+    if (wstatus_addr != 0) {
+        // Encode in wait status format: WEXITSTATUS = (status & 0xff) << 8
+        int32_t wstatus = (g_fork.exit_status & 0xff) << 8;
+        m.memory.template write<int32_t>(wstatus_addr, wstatus);
+    }
+    m.set_result(g_fork.child_pid);
+}
+
+// execve — replace current "process" with a new program.
+// In our single-machine model, we reload ELF segments from the stored
+// binary data, set up a fresh stack with new argv, and jump to the
+// interpreter entry point. This works because all binaries in a
+// busybox-based container are the same executable.
+static void sys_execve(Machine& m) {
+    auto path_addr = m.sysarg(0);
+    auto argv_addr = m.sysarg(1);
+
+    if (!g_exec_ctx.dynamic || g_exec_ctx.exec_binary.empty()) {
+        m.set_result(-38);  // -ENOSYS
+        return;
+    }
+
+    // Read target path
+    std::string path;
+    try {
+        path = m.memory.memstring(path_addr);
+    } catch (...) {
+        m.set_result(-14);  // -EFAULT
+        return;
+    }
+
+    // Resolve symlinks to verify the file exists
+    auto& fs = get_fs(m);
+    std::string resolved = path;
+    for (int i = 0; i < 10; i++) {
+        vfs::Entry entry;
+        if (!fs.stat(resolved, entry)) {
+            m.set_result(-2);  // -ENOENT
+            return;
+        }
+        if (entry.type == vfs::FileType::Symlink) {
+            char target[256];
+            ssize_t n = fs.readlink(resolved, target, sizeof(target));
+            if (n > 0) {
+                std::string link(target, n);
+                if (link[0] != '/') {
+                    // Relative symlink — resolve against dirname
+                    auto slash = resolved.rfind('/');
+                    if (slash != std::string::npos)
+                        link = resolved.substr(0, slash + 1) + link;
+                }
+                resolved = link;
+                continue;
+            }
+        }
+        break;
+    }
+
+    // Read argv from guest memory
+    std::vector<std::string> args;
+    try {
+        for (int i = 0; i < 256; i++) {
+            uint64_t ptr = m.memory.template read<uint64_t>(argv_addr + i * 8);
+            if (ptr == 0) break;
+            args.push_back(m.memory.memstring(ptr));
+        }
+    } catch (...) {
+        m.set_result(-14);  // -EFAULT
+        return;
+    }
+
+    if (args.empty()) {
+        args.push_back(path);
+    }
+
+    // Note: we do NOT reload ELF segments here. The same binary (busybox)
+    // is already loaded in memory — code segments are identical. Skipping
+    // the reload avoids protection faults from writing to execute-only pages.
+    // The dynamic linker will redo relocations on its own init path.
+
+    // Set up fresh stack with new argv/envp/auxv
+    uint64_t sp = dynlink::setup_dynamic_stack(
+        m,
+        g_exec_ctx.exec_info,
+        g_exec_ctx.interp_base,
+        args,
+        g_exec_ctx.env,
+        g_exec_ctx.original_stack_top
+    );
+
+    // Clear all registers (execve starts with clean state)
+    for (int i = 1; i < 32; i++) {
+        m.cpu.reg(i) = 0;
+    }
+
+    // Set SP and jump to interpreter entry
+    m.cpu.reg(riscv::REG_SP) = sp;
+    m.cpu.jump(g_exec_ctx.interp_entry);
+
+    // execve doesn't "return" on success — execution continues at new entry.
+    // Do NOT call set_result() — the new process starts fresh.
 }
 
 static void sys_openat(Machine& m) {
@@ -194,23 +444,29 @@ static void sys_read(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Read from JavaScript stdin buffer
-        size_t bytes_read = 0;
-        std::vector<uint8_t> buf(count);
-        for (size_t i = 0; i < count; i++) {
-            int ch = EM_ASM_INT({
-                if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
-                    return Module._stdinBuffer.shift();
+        // Try non-blocking read from JavaScript stdin buffer
+        auto view = m.memory.memview(buf_addr, count);
+        int bytes_read = EM_ASM_INT({
+            if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
+                var toRead = Math.min($1, Module._stdinBuffer.length);
+                for (var i = 0; i < toRead; i++) {
+                    Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
                 }
-                return -1;
-            });
-            if (ch < 0) break;
-            buf[bytes_read++] = (uint8_t)ch;
+                return toRead;
+            }
+            if (Module._stdinEOF) return 0; // EOF
+            return -1; // -1 means "no data yet", NOT EOF
+        }, view.data(), count);
+        if (bytes_read >= 0) {
+            m.set_result(bytes_read);
+        } else {
+            // No data available — rewind PC to the ecall instruction
+            // and stop the machine. When resumed, the ecall will
+            // re-execute this syscall handler, retrying the read.
+            g_waiting_for_stdin = true;
+            m.cpu.increment_pc(-4);  // Rewind past ecall (4 bytes)
+            m.stop();
         }
-        if (bytes_read > 0) {
-            m.memory.memcpy(buf_addr, buf.data(), bytes_read);
-        }
-        m.set_result(bytes_read);
 #else
         m.set_result(0);  // EOF for stdin
 #endif
@@ -235,9 +491,7 @@ static void sys_write(Machine& m) {
     if (fd == 1 || fd == 2) {
         try {
             auto view = m.memory.memview(buf_addr, count);
-            auto& out = (fd == 1) ? std::cout : std::cerr;
-            out.write(reinterpret_cast<const char*>(view.data()), count);
-            out.flush();
+            m.print(reinterpret_cast<const char*>(view.data()), count);
             m.set_result(count);
         } catch (...) {
             m.set_result(err::INVAL);
@@ -266,18 +520,15 @@ static void sys_writev(Machine& m) {
     // stdout/stderr go to host
     if (fd == 1 || fd == 2) {
         size_t total = 0;
-        auto& out = (fd == 1) ? std::cout : std::cerr;
-
         for (int i = 0; i < iovcnt; i++) {
             uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
             uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
             if (len > 0) {
                 auto view = m.memory.memview(base, len);
-                out.write(reinterpret_cast<const char*>(view.data()), len);
+                m.print(reinterpret_cast<const char*>(view.data()), len);
                 total += len;
             }
         }
-        out.flush();
         m.set_result(total);
         return;
     }
@@ -504,6 +755,7 @@ static void sys_geteuid(Machine& m) { m.set_result(0); }
 static void sys_getgid(Machine& m) { m.set_result(0); }
 static void sys_getegid(Machine& m) { m.set_result(0); }
 static void sys_set_tid_address(Machine& m) { m.set_result(1); }
+static void sys_set_robust_list(Machine& m) { m.set_result(0); }
 
 static void sys_clock_gettime(Machine& m) {
     auto tp_addr = m.sysarg(1);
@@ -581,38 +833,63 @@ static void sys_ioctl(Machine& m) {
     unsigned long request = m.sysarg(1);
 
     // TIOCGWINSZ - get window size
-    if (request == 0x5413 && (fd == 0 || fd == 1 || fd == 2)) {
-        auto ws_addr = m.sysarg(2);
-        uint16_t ws[4] = { 24, 80, 0, 0 };
-        m.memory.memcpy(ws_addr, ws, sizeof(ws));
-        m.set_result(0);
-        return;
+    if (request == 0x5413) {
+        if (fd == 0) {
+            m.set_result(-25);  // -ENOTTY (stdin is not a terminal)
+            return;
+        }
+        if (fd == 1 || fd == 2) {
+            auto ws_addr = m.sysarg(2);
+            struct { uint16_t rows, cols, xpixel, ypixel; } ws = { 24, 80, 0, 0 };
+#ifdef __EMSCRIPTEN__
+            ws.rows = EM_ASM_INT({ return Module._termRows || 24; });
+            ws.cols = EM_ASM_INT({ return Module._termCols || 80; });
+#endif
+            m.memory.memcpy(ws_addr, &ws, sizeof(ws));
+            m.set_result(0);
+            return;
+        }
     }
 
     // TCGETS - get terminal attributes
-    if (request == 0x5401 && (fd == 0 || fd == 1 || fd == 2)) {
-        auto termios_addr = m.sysarg(2);
-        // Return a plausible raw-mode termios struct
-        // struct termios { c_iflag, c_oflag, c_cflag, c_lflag, c_line, c_cc[32], c_ispeed, c_ospeed }
-        uint8_t termios_buf[60] = {};
-        uint32_t c_iflag = 0;
-        uint32_t c_oflag = 0;
-        uint32_t c_cflag = 0x00bf;  // CS8 | CREAD | CLOCAL
-        uint32_t c_lflag = 0;
-        std::memcpy(termios_buf + 0, &c_iflag, 4);
-        std::memcpy(termios_buf + 4, &c_oflag, 4);
-        std::memcpy(termios_buf + 8, &c_cflag, 4);
-        std::memcpy(termios_buf + 12, &c_lflag, 4);
-        m.memory.memcpy(termios_addr, termios_buf, sizeof(termios_buf));
-        m.set_result(0);
-        return;
+    // For stdin (fd 0): return -ENOTTY so isatty(0) returns false.
+    // This puts ash into non-interactive batch mode where it reads
+    // commands from stdin with simple read() calls instead of trying
+    // to do raw-mode character-by-character line editing (which requires
+    // poll/signal infrastructure we don't have).
+    // For stdout/stderr (fd 1,2): return success so output formatting works.
+    if (request == 0x5401) {
+        if (fd == 0) {
+            m.set_result(-25);  // -ENOTTY
+            return;
+        }
+        if (fd == 1 || fd == 2) {
+            auto termios_addr = m.sysarg(2);
+            uint8_t termios_buf[60] = {};
+            uint32_t c_iflag = 0;
+            uint32_t c_oflag = 0x0005;  // OPOST | ONLCR
+            uint32_t c_cflag = 0x00bf;  // CS8 | CREAD | CLOCAL
+            uint32_t c_lflag = 0x8a3b;  // ECHO|ICANON|ISIG|IEXTEN|ECHOCTL|ECHOKE|ECHOE
+            std::memcpy(termios_buf + 0, &c_iflag, 4);
+            std::memcpy(termios_buf + 4, &c_oflag, 4);
+            std::memcpy(termios_buf + 8, &c_cflag, 4);
+            std::memcpy(termios_buf + 12, &c_lflag, 4);
+            m.memory.memcpy(termios_addr, termios_buf, sizeof(termios_buf));
+            m.set_result(0);
+            return;
+        }
     }
 
     // TCSETS, TCSETSW, TCSETSF - set terminal attributes (accept silently)
-    if ((request == 0x5402 || request == 0x5403 || request == 0x5404) &&
-        (fd == 0 || fd == 1 || fd == 2)) {
-        m.set_result(0);
-        return;
+    if ((request == 0x5402 || request == 0x5403 || request == 0x5404)) {
+        if (fd == 0) {
+            m.set_result(-25);  // -ENOTTY (stdin is not a terminal)
+            return;
+        }
+        if (fd == 1 || fd == 2) {
+            m.set_result(0);
+            return;
+        }
     }
 
     m.set_result(err::NOTSUP);
@@ -675,29 +952,43 @@ static void sys_readv(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        // Read from JavaScript stdin buffer into iovec
+        // Try non-blocking read from JavaScript stdin buffer into iovec
+        int has_data = EM_ASM_INT({
+            return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
+                   (Module._stdinEOF ? -1 : 0);
+        });
+        if (has_data == -1) {
+            // EOF
+            m.set_result(0);
+            return;
+        }
+        if (has_data == 0) {
+            // No data — rewind PC and stop machine so main loop can yield
+            g_waiting_for_stdin = true;
+            m.cpu.increment_pc(-4);  // Rewind past ecall (4 bytes)
+            m.stop();
+            return;
+        }
         size_t total = 0;
         for (int i = 0; i < iovcnt; i++) {
             uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
             uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
             if (len > 0) {
-                std::vector<uint8_t> buf(len);
-                size_t bytes_read = 0;
-                for (size_t j = 0; j < len; j++) {
-                    int ch = EM_ASM_INT({
-                        if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
-                            return Module._stdinBuffer.shift();
+                auto view = m.memory.memview(base, len);
+                int bytes_read = EM_ASM_INT({
+                    if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
+                        var toRead = Math.min($1, Module._stdinBuffer.length);
+                        for (var i = 0; i < toRead; i++) {
+                            Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
                         }
-                        return -1;
-                    });
-                    if (ch < 0) break;
-                    buf[bytes_read++] = (uint8_t)ch;
-                }
+                        return toRead;
+                    }
+                    return 0;
+                }, view.data(), len);
                 if (bytes_read > 0) {
-                    m.memory.memcpy(base, buf.data(), bytes_read);
                     total += bytes_read;
                 }
-                if (bytes_read < len) break;  // Short read
+                if (static_cast<size_t>(bytes_read) < len) break;
             }
         }
         m.set_result(total);
@@ -870,7 +1161,6 @@ static void sys_sysinfo(Machine& m) {
         uint64_t loads[3];
         uint64_t totalram;
         uint64_t freeram;
-        uint64_t sharedram;
         uint64_t bufferram;
         uint64_t totalswap;
         uint64_t freeswap;
@@ -891,6 +1181,73 @@ static void sys_sysinfo(Machine& m) {
 
     m.memory.memcpy(info_addr, &si, sizeof(si));
     m.set_result(0);
+}
+
+// ppoll - poll file descriptors for events
+// Ash uses this to check if stdin has data before reading.
+static void sys_ppoll(Machine& m) {
+    auto fds_addr = m.sysarg(0);
+    uint64_t nfds = m.sysarg(1);
+    // args 2,3: timeout (ignored), sigmask (ignored)
+
+    if (nfds == 0) {
+        m.set_result(0);
+        return;
+    }
+    if (nfds > 64) nfds = 64;
+
+    int ready = 0;
+    bool needs_stdin = false;
+
+    for (uint64_t i = 0; i < nfds; i++) {
+        uint64_t entry_addr = fds_addr + i * 8;
+        int32_t fd = m.memory.template read<int32_t>(entry_addr);
+        int16_t events = m.memory.template read<int16_t>(entry_addr + 4);
+        int16_t revents = 0;
+
+        if (fd == 0 && (events & 0x0001 /*POLLIN*/)) {
+#ifdef __EMSCRIPTEN__
+            int has_data = EM_ASM_INT({
+                return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
+                       (Module._stdinEOF ? -1 : 0);
+            });
+            if (has_data == 1) {
+                revents |= 0x0001; // POLLIN
+                ready++;
+            } else if (has_data == -1) {
+                revents |= 0x0010; // POLLHUP (EOF)
+                ready++;
+            } else {
+                needs_stdin = true;
+            }
+#else
+            revents |= 0x0010; // POLLHUP (EOF in native mode)
+            ready++;
+#endif
+        } else if (fd == 1 || fd == 2) {
+            if (events & 0x0004 /*POLLOUT*/) {
+                revents |= 0x0004;
+                ready++;
+            }
+        } else if (fd >= 0) {
+            // VFS file descriptors are always ready
+            revents |= (events & 0x0001); // POLLIN if requested
+            if (revents) ready++;
+        }
+
+        m.memory.template write<int16_t>(entry_addr + 6, revents);
+    }
+
+    if (ready > 0) {
+        m.set_result(ready);
+    } else if (needs_stdin) {
+        // No data on stdin — stop and let JS resume when data arrives
+        g_waiting_for_stdin = true;
+        m.cpu.increment_pc(-4);
+        m.stop();
+    } else {
+        m.set_result(0);
+    }
 }
 
 }  // namespace handlers
@@ -926,8 +1283,12 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::getgid, sys_getgid);
     machine.install_syscall_handler(nr::getegid, sys_getegid);
     machine.install_syscall_handler(nr::set_tid_address, sys_set_tid_address);
+    machine.install_syscall_handler(nr::set_robust_list, sys_set_robust_list);
     machine.install_syscall_handler(nr::clock_gettime, sys_clock_gettime);
     machine.install_syscall_handler(nr::getrandom, sys_getrandom);
+    machine.install_syscall_handler(nr::clone, sys_clone);
+    machine.install_syscall_handler(nr::execve, sys_execve);
+    machine.install_syscall_handler(nr::wait4, sys_wait4);
     // brk, mmap, munmap, mprotect: handled by libriscv (do not override)
     machine.install_syscall_handler(nr::sigaction, sys_sigaction);
     machine.install_syscall_handler(nr::sigprocmask, sys_sigprocmask);
@@ -939,6 +1300,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::dup3, sys_dup3);
     machine.install_syscall_handler(nr::pipe2, sys_pipe2);
     machine.install_syscall_handler(nr::readv, sys_readv);
+    machine.install_syscall_handler(nr::ppoll, sys_ppoll);
     machine.install_syscall_handler(nr::sendfile, sys_sendfile);
     machine.install_syscall_handler(nr::pread64, sys_pread64);
     machine.install_syscall_handler(nr::pwrite64, sys_pwrite64);
@@ -949,6 +1311,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::linkat, sys_linkat);
     machine.install_syscall_handler(nr::renameat, sys_renameat);
     machine.install_syscall_handler(nr::sysinfo, sys_sysinfo);
+
 }
 
 }  // namespace syscalls

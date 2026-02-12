@@ -37,6 +37,67 @@ static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 // Global VFS instance (needed for syscall handlers)
 static vfs::VirtualFS g_vfs;
 
+// Global machine pointer for JS interop (stdin resume loop)
+#ifdef __EMSCRIPTEN__
+static Machine* g_machine = nullptr;
+
+extern "C" {
+// Returns 1 if machine is stopped waiting for stdin, 0 otherwise.
+// Uses g_waiting_for_stdin flag (set by syscall handlers) to distinguish
+// stdin-wait from program exit (both call machine.stop()).
+EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
+    return syscalls::g_waiting_for_stdin ? 1 : 0;
+}
+
+// Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
+// Handles page protection faults by making the faulting page writable and
+// retrying. This acts as a simple page fault handler for pages at the
+// boundary between read-only code and writable data segments.
+EMSCRIPTEN_KEEPALIVE int friscy_resume() {
+    if (!g_machine) return 0;
+    syscalls::g_waiting_for_stdin = false;
+    for (int retries = 0; retries < 8; retries++) {
+        try {
+            g_machine->resume(MAX_INSTRUCTIONS);
+            return friscy_stopped();
+        } catch (const riscv::MachineException& e) {
+            uint64_t fault_addr = e.data();
+            // If this looks like a page protection fault (data address != 0),
+            // make the page writable and retry.
+            if (fault_addr != 0 && retries < 7) {
+                constexpr uint64_t PAGE_MASK = ~0xFFFULL;
+                uint64_t page = fault_addr & PAGE_MASK;
+                riscv::PageAttributes attr;
+                attr.read = true;
+                attr.write = true;
+                attr.exec = true;
+                g_machine->memory.set_page_attr(page, 4096, attr);
+                continue;  // retry
+            }
+            // Give up — report to terminal
+            EM_ASM({
+                if (typeof Module._termWrite === 'function') {
+                    Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
+                        UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                        ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+                }
+            }, e.what(), (uint32_t)e.data(), (uint32_t)g_machine->cpu.pc());
+            return 0;
+        } catch (const std::exception& e) {
+            EM_ASM({
+                if (typeof Module._termWrite === 'function') {
+                    Module._termWrite('\r\n\x1b[31m[friscy] Error: ' +
+                        UTF8ToString($0) + '\x1b[0m\r\n');
+                }
+            }, e.what());
+            return 0;
+        }
+    }
+    return friscy_stopped();
+}
+}
+#endif
+
 // ============================================================================
 // Wizer pre-initialization support (Workstream E)
 // When built with -DFRISCY_WIZER, the wizer_init() function pre-loads the
@@ -209,6 +270,18 @@ int main(int argc, char** argv) {
     try {
         std::vector<uint8_t> binary;
 
+#ifdef FRISCY_WIZER
+        if (g_wizer_initialized) {
+            // Wizer pre-initialization already loaded rootfs into VFS
+            // and pre-loaded the entry binary — skip redundant I/O.
+            binary = g_wizer_binary;
+            entry_path = g_wizer_entry;
+            container_mode = true;  // VFS is already loaded
+            std::cout << "[friscy] Using wizer pre-initialized snapshot\n";
+            std::cout << "[friscy] Entry point: " << entry_path << "\n";
+            std::cout << "[friscy] Binary size: " << binary.size() << " bytes\n";
+        } else
+#endif
         if (container_mode) {
             std::cout << "[friscy] Loading rootfs: " << rootfs_path << "\n";
 
@@ -288,7 +361,11 @@ int main(int argc, char** argv) {
         }
 
         // Create machine with main executable
-        Machine machine{binary};
+        // Use static unique_ptr so machine survives after main() returns,
+        // allowing JS to call friscy_resume() for stdin polling.
+        static std::unique_ptr<Machine> machine_ptr;
+        machine_ptr = std::make_unique<Machine>(binary);
+        auto& machine = *machine_ptr;
 
         // If dynamic, also load the interpreter at a high address
         if (use_dynamic_linker) {
@@ -320,10 +397,34 @@ int main(int argc, char** argv) {
                 exec_info.phdr_addr += exec_base;
                 exec_info.entry_point = actual_entry;
                 std::cout << "[friscy] PIE base: 0x" << std::hex << exec_base << std::dec << "\n";
+
+                // Save PIE base for execve: load_elf_segments needs the
+                // address where the first segment starts (exec_base + lo)
+                auto [lo, hi] = elf::get_load_range(binary);
+                syscalls::g_exec_ctx.exec_base = exec_base + lo;
+                // Find writable data segment range (skip code segments)
+                auto [rw_lo, rw_hi] = elf::get_writable_range(binary);
+                syscalls::g_exec_ctx.exec_rw_start = exec_base + rw_lo;
+                syscalls::g_exec_ctx.exec_rw_end = exec_base + rw_hi;
             }
 
             // We'll jump to interpreter's entry point instead of main binary's
             machine.cpu.jump(interp_entry);
+        }
+
+        // Save execution context for execve support (clone+execve needs
+        // to reload segments and set up a fresh stack for the new process)
+        syscalls::g_exec_ctx.exec_binary = binary;
+        syscalls::g_exec_ctx.exec_info = exec_info;  // Already adjusted for PIE
+        if (use_dynamic_linker) {
+            syscalls::g_exec_ctx.interp_binary = interp_binary;
+            syscalls::g_exec_ctx.interp_base = interp_base;
+            syscalls::g_exec_ctx.interp_entry = machine.cpu.pc();  // interp_entry
+            syscalls::g_exec_ctx.dynamic = true;
+            // Find interpreter's writable data segment range
+            auto [irw_lo, irw_hi] = elf::get_writable_range(interp_binary);
+            syscalls::g_exec_ctx.interp_rw_start = interp_base + irw_lo;
+            syscalls::g_exec_ctx.interp_rw_end = interp_base + irw_hi;
         }
 
         // Set up Linux syscall emulation (provided by libriscv)
@@ -348,6 +449,7 @@ int main(int argc, char** argv) {
             "TERM=xterm-256color",
             "LANG=C.UTF-8",
         };
+        syscalls::g_exec_ctx.env = env;
 
         // Set up argv
         if (guest_args.empty()) {
@@ -361,6 +463,7 @@ int main(int argc, char** argv) {
 
             // Use the machine's actual stack pointer (set by Machine constructor)
             uint64_t stack_top = machine.cpu.reg(riscv::REG_SP);
+            syscalls::g_exec_ctx.original_stack_top = stack_top;
             std::cout << "[friscy] Machine stack top: 0x" << std::hex << stack_top << std::dec << "\n";
 
             uint64_t sp = dynlink::setup_dynamic_stack(
@@ -385,11 +488,13 @@ int main(int argc, char** argv) {
 #ifdef __EMSCRIPTEN__
         machine.set_printer([](const auto&, const char* data, size_t len) {
             EM_ASM({
-                var text = UTF8ToString($0, $1);
                 if (typeof Module._termWrite === 'function') {
-                    Module._termWrite(text);
+                    // Use TextDecoder to handle potential partial UTF-8 sequences between chunks
+                    if (!Module._decoder) Module._decoder = new TextDecoder();
+                    var view = Module.HEAPU8.subarray($0, $0 + $1);
+                    Module._termWrite(Module._decoder.decode(view, {stream: true}));
                 } else {
-                    out(text);
+                    out(UTF8ToString($0, $1));
                 }
             }, data, len);
         });
@@ -403,8 +508,51 @@ int main(int argc, char** argv) {
         std::cout << "[friscy] Starting execution...\n";
         std::cout << "----------------------------------------\n";
 
-        // Run!
-        machine.simulate(MAX_INSTRUCTIONS);
+#ifdef __EMSCRIPTEN__
+        g_machine = &machine;
+#endif
+        // Run! When the guest reads from stdin and no data is available,
+        // the syscall handler calls machine.stop(). JS calls friscy_resume()
+        // after new stdin data arrives to continue execution.
+        // Page faults on boundary pages are handled by making them writable.
+        for (int retries = 0; retries < 8; retries++) {
+            try {
+                machine.simulate(MAX_INSTRUCTIONS);
+                break;
+            } catch (const riscv::MachineException& e) {
+                uint64_t fault_addr = e.data();
+                if (fault_addr != 0 && retries < 7) {
+                    constexpr uint64_t PAGE_MASK = ~0xFFFULL;
+                    uint64_t page = fault_addr & PAGE_MASK;
+                    riscv::PageAttributes attr;
+                    attr.read = true;
+                    attr.write = true;
+                    attr.exec = true;
+                    machine.memory.set_page_attr(page, 4096, attr);
+                    continue;
+                }
+#ifdef __EMSCRIPTEN__
+                EM_ASM({
+                    if (typeof Module._termWrite === 'function') {
+                        Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
+                            UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                            ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+                    }
+                }, e.what(), (uint32_t)e.data(), (uint32_t)machine.cpu.pc());
+                return 1;
+#else
+                throw;
+#endif
+            }
+        }
+
+#ifdef __EMSCRIPTEN__
+        if (syscalls::g_waiting_for_stdin) {
+            // Machine stopped because stdin has no data.
+            // Return to JS — the resume loop will call friscy_resume().
+            return 0;
+        }
+#endif
 
         std::cout << "----------------------------------------\n";
 

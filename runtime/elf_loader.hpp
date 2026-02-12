@@ -414,27 +414,27 @@ inline uint64_t load_elf_segments(
     // For each page touched by any segment, OR the permissions from all
     // overlapping segments. This prevents a data segment (RW) from removing
     // execute permission on a page shared with a code segment (RX).
-    constexpr uint64_t PAGE_SIZE = 4096;
-    constexpr uint64_t PAGE_MASK = ~(PAGE_SIZE - 1);
+    constexpr uint64_t RISCV_PAGE = 4096;
+    constexpr uint64_t RISCV_PAGE_MASK = ~(RISCV_PAGE - 1);
 
     // Find overall page range
     uint64_t range_lo = UINT64_MAX, range_hi = 0;
     for (const auto& seg : segments) {
-        uint64_t lo = seg.vaddr & PAGE_MASK;
-        uint64_t hi = (seg.vaddr + seg.memsz + PAGE_SIZE - 1) & PAGE_MASK;
+        uint64_t lo = seg.vaddr & RISCV_PAGE_MASK;
+        uint64_t hi = (seg.vaddr + seg.memsz + RISCV_PAGE - 1) & RISCV_PAGE_MASK;
         if (lo < range_lo) range_lo = lo;
         if (hi > range_hi) range_hi = hi;
     }
 
     // Set merged permissions per page
-    for (uint64_t page = range_lo; page < range_hi; page += PAGE_SIZE) {
+    for (uint64_t page = range_lo; page < range_hi; page += RISCV_PAGE) {
         bool r = false, w = false, x = false;
         bool touched = false;
 
         for (const auto& seg : segments) {
             uint64_t seg_end = seg.vaddr + seg.memsz;
             // Does this page overlap with this segment?
-            if (page < seg_end && page + PAGE_SIZE > seg.vaddr) {
+            if (page < seg_end && page + RISCV_PAGE > seg.vaddr) {
                 touched = true;
                 r |= (seg.flags & elf::PF_R) != 0;
                 w |= (seg.flags & elf::PF_W) != 0;
@@ -447,7 +447,7 @@ inline uint64_t load_elf_segments(
             attr.read = r;
             attr.write = w;
             attr.exec = x;
-            machine.memory.set_page_attr(page, PAGE_SIZE, attr);
+            machine.memory.set_page_attr(page, RISCV_PAGE, attr);
         }
     }
 

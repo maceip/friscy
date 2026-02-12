@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "image": "alpine:latest",
+  "entrypoint": "/bin/sh",
+  "workdir": "/",
+  "env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "aot": [],
+  "created": "2026-02-11T20:13:04+00:00"
+}

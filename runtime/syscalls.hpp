@@ -33,6 +33,15 @@ struct ForkState {
     int exit_status;    // Child's exit code
     pid_t child_pid;    // PID assigned to child
     bool in_child;      // True while "child" is running
+    // Memory snapshot: saved at clone, restored when child exits.
+    // Execve overwrites the stack and dynamic linker re-runs (modifying
+    // GOT/BSS), so we must restore the parent's memory state.
+    std::vector<uint8_t> mem_snapshot;
+    uint64_t mem_start;  // Start address of saved region
+    uint64_t mem_size;   // Size of saved region
+    std::vector<uint8_t> interp_snapshot;  // Interpreter data/BSS
+    uint64_t interp_start;
+    uint64_t interp_size;
 };
 inline ForkState g_fork = {};
 inline pid_t g_next_pid = 100;
@@ -44,7 +53,9 @@ struct ExecContext {
     std::vector<uint8_t> interp_binary;  // Original interpreter (ld-musl)
     elf::ElfInfo exec_info;              // Adjusted ELF info (with PIE base)
     uint64_t exec_base = 0;             // PIE base for main executable
+    uint64_t exec_rw_start = 0;         // First writable segment of main binary
     uint64_t interp_base = 0;           // Where interpreter was loaded
+    uint64_t interp_rw_start = 0;       // First writable segment of interpreter
     uint64_t interp_entry = 0;          // Interpreter entry point
     uint64_t original_stack_top = 0;    // Stack top from initial setup
     std::vector<std::string> env;        // Environment variables
@@ -198,10 +209,22 @@ static void sys_exit(Machine& m) {
         g_fork.exit_status = m.template sysarg<int>(0);
         g_fork.in_child = false;
 
-        std::cerr << "[exit] child exit_status=" << g_fork.exit_status
-                  << " restoring parent pc=0x" << std::hex << g_fork.pc
-                  << " sp=0x" << g_fork.regs[2]
-                  << std::dec << "\n";
+        // Restore parent memory (stack + data/BSS + interpreter) before
+        // registers, since execve overwrote these regions.
+        if (!g_fork.mem_snapshot.empty()) {
+            m.memory.memcpy(g_fork.mem_start,
+                            g_fork.mem_snapshot.data(),
+                            g_fork.mem_size);
+            g_fork.mem_snapshot.clear();
+            g_fork.mem_snapshot.shrink_to_fit();
+        }
+        if (!g_fork.interp_snapshot.empty()) {
+            m.memory.memcpy(g_fork.interp_start,
+                            g_fork.interp_snapshot.data(),
+                            g_fork.interp_size);
+            g_fork.interp_snapshot.clear();
+            g_fork.interp_snapshot.shrink_to_fit();
+        }
 
         // Restore parent registers (x0-x31)
         for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
@@ -227,9 +250,6 @@ static void sys_clone(Machine& m) {
         return;
     }
 
-    uint64_t flags = m.sysarg(0);
-    uint64_t child_stack = m.sysarg(1);
-
     // Save parent registers
     for (int i = 0; i < 32; i++) {
         g_fork.regs[i] = m.cpu.reg(i);
@@ -239,11 +259,31 @@ static void sys_clone(Machine& m) {
     g_fork.in_child = true;
     g_fork.exit_status = 0;
 
-    std::cerr << "[clone] flags=0x" << std::hex << flags
-              << " child_stack=0x" << child_stack
-              << " pc=0x" << g_fork.pc
-              << " sp=0x" << m.cpu.reg(2)
-              << std::dec << "\n";
+    // Save parent memory: stack + data/BSS regions.
+    // Execve overwrites the stack (setup_dynamic_stack) and the dynamic
+    // linker re-runs (modifying BSS/GOT). We must restore these so the
+    // parent can resume correctly after the child exits.
+    //
+    // We save from exec_base (covers main binary data/BSS + heap + stack)
+    // up to original_stack_top. This is typically ~18MB.
+    uint64_t save_start = g_exec_ctx.exec_base;
+    uint64_t save_end = g_exec_ctx.original_stack_top;
+    if (save_start < save_end) {
+        g_fork.mem_start = save_start;
+        g_fork.mem_size = save_end - save_start;
+        g_fork.mem_snapshot.resize(g_fork.mem_size);
+        m.memory.memcpy_out(g_fork.mem_snapshot.data(), save_start, g_fork.mem_size);
+    }
+
+    // Also save the interpreter region (ld-musl data/BSS).
+    // Execve re-runs the dynamic linker which modifies its internal state.
+    if (g_exec_ctx.interp_base > 0 && !g_exec_ctx.interp_binary.empty()) {
+        g_fork.interp_start = g_exec_ctx.interp_base;
+        g_fork.interp_size = g_exec_ctx.interp_binary.size();
+        g_fork.interp_snapshot.resize(g_fork.interp_size);
+        m.memory.memcpy_out(g_fork.interp_snapshot.data(),
+                            g_fork.interp_start, g_fork.interp_size);
+    }
 
     // Return 0 = "you are the child"
     m.set_result(0);

@@ -1,0 +1,22 @@
+name: Docs Lint
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "AGENTS.md"
+      - "scripts/docs-lint.sh"
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - "AGENTS.md"
+      - "scripts/docs-lint.sh"
+
+jobs:
+  docs-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint documentation structure and cross-links
+        run: bash scripts/docs-lint.sh

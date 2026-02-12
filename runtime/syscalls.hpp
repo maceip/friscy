@@ -413,6 +413,10 @@ static void sys_openat(Machine& m) {
     int dirfd = m.template sysarg<int>(0);
     auto path_addr = m.sysarg(1);
     int flags = m.template sysarg<int>(2);
+    try {
+        std::string p = m.memory.memstring(path_addr);
+        std::cerr << "[openat] path=" << p << " flags=0x" << std::hex << flags << std::dec << "\n";
+    } catch (...) {}
 
     if (dirfd != AT_FDCWD) {
         m.set_result(err::NOTSUP);
@@ -441,6 +445,7 @@ static void sys_read(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
+    std::cerr << "[read] fd=" << fd << " count=" << count << "\n";
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
@@ -831,6 +836,7 @@ static void sys_sendfile(Machine& m) {
 static void sys_ioctl(Machine& m) {
     int fd = m.template sysarg<int>(0);
     unsigned long request = m.sysarg(1);
+    std::cerr << "[ioctl] fd=" << fd << " req=0x" << std::hex << request << std::dec << "\n";
 
     // TIOCGWINSZ - get window size
     if (request == 0x5413) {

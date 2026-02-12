@@ -114,7 +114,6 @@ fi
 log "Extracting rootfs..."
 
 CONTAINER_NAME="friscy-temp-$$"
-
 # Get config from the IMAGE (not the container) to preserve original CMD/ENTRYPOINT
 CONFIG=$(docker inspect "$RISCV_IMAGE")
 ENTRYPOINT=$(echo "$CONFIG" | jq -r '.[0].Config.Entrypoint // empty | if type == "array" then .[] else . end')

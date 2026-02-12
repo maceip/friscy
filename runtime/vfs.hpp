@@ -828,11 +828,21 @@ private:
         }
 
         auto current = root_;
+        std::vector<std::shared_ptr<Entry>> stack;
+        stack.push_back(root_);
         for (const auto& part : parts) {
             if (!current || !current->is_dir()) return nullptr;
+            if (part == ".") {
+                continue;
+            } else if (part == "..") {
+                if (stack.size() > 1) stack.pop_back();
+                current = stack.back();
+                continue;
+            }
             auto it = current->children.find(part);
             if (it == current->children.end()) return nullptr;
             current = it->second;
+            stack.push_back(current);
         }
         return current;
     }

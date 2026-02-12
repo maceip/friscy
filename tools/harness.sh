@@ -70,6 +70,8 @@ mkdir -p build
 # Use latest emsdk for best Wasm optimizations
 EMSDK_VERSION="3.1.50"
 
+# Mount the entire project root (not just tools/) so cmake can find
+# runtime/CMakeLists.txt and vendor/libriscv
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 docker run --rm \

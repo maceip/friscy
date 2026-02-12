@@ -114,21 +114,19 @@ fi
 log "Extracting rootfs..."
 
 CONTAINER_NAME="friscy-temp-$$"
-docker create --platform linux/riscv64 --name "$CONTAINER_NAME" "$RISCV_IMAGE" /bin/true >/dev/null
 
-# Export filesystem
-docker export "$CONTAINER_NAME" > "$OUTPUT_DIR/rootfs.tar"
-log "Exported rootfs: $(du -h "$OUTPUT_DIR/rootfs.tar" | cut -f1)"
-
-# Get container config
-CONFIG=$(docker inspect "$CONTAINER_NAME")
+# Get config from the IMAGE (not the container) to preserve original CMD/ENTRYPOINT
+CONFIG=$(docker inspect "$RISCV_IMAGE")
 ENTRYPOINT=$(echo "$CONFIG" | jq -r '.[0].Config.Entrypoint // empty | if type == "array" then .[] else . end')
 CMD=$(echo "$CONFIG" | jq -r '.[0].Config.Cmd // empty | if type == "array" then .[] else . end')
 WORKDIR=$(echo "$CONFIG" | jq -r '.[0].Config.WorkingDir // "/"')
 ENV=$(echo "$CONFIG" | jq -r '.[0].Config.Env // [] | .[]')
 
-# Cleanup
+# Create temporary container for filesystem export (command doesn't matter)
+docker create --platform linux/riscv64 --name "$CONTAINER_NAME" "$RISCV_IMAGE" /bin/true >/dev/null
+docker export "$CONTAINER_NAME" > "$OUTPUT_DIR/rootfs.tar"
 docker rm "$CONTAINER_NAME" >/dev/null
+log "Exported rootfs: $(du -h "$OUTPUT_DIR/rootfs.tar" | cut -f1)"
 
 # Determine what to run
 if [[ -n "$ENTRYPOINT" ]]; then
@@ -269,7 +267,108 @@ else
 fi
 
 # =============================================================================
-# Step 5: Generate HTML
+# Step 5: Generate Service Worker
+# =============================================================================
+log "Generating service-worker.js..."
+
+cat > "$OUTPUT_DIR/service-worker.js" << 'SWEOF'
+const CACHE_NAME = 'friscy-cache-v1'; // Tagged cache for versioning
+const CACHE_ASSETS = [
+  './', // Cache index.html
+  './index.html',
+  './friscy.js',
+  './friscy.wasm',
+  './rootfs.tar',
+  './manifest.json',
+  'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
+  'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm',
+  'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm',
+];
+
+// Install event: cache assets
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => {
+        console.log('[Service Worker] Caching all assets');
+        return cache.addAll(CACHE_ASSETS);
+      })
+      .catch(error => {
+        console.error('[Service Worker] Caching failed:', error);
+      })
+  );
+});
+
+// Activate event: clean up old caches
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((cacheNames) => {
+      return Promise.all(
+        cacheNames.map((cacheName) => {
+          if (cacheName !== CACHE_NAME) {
+            console.log('[Service Worker] Deleting old cache:', cacheName);
+            return caches.delete(cacheName);
+          }
+        })
+      );
+    })
+  );
+});
+
+// Fetch event: serve from cache if available, otherwise fetch from network
+self.addEventListener('fetch', (event) => {
+  // Always go to network for friscy.js and friscy.wasm if they are not yet in cache
+  // This is because friscy.js might be re-generated often during development
+  // We want to serve friscy.js and friscy.wasm from cache only if they are already present
+  // For other assets, use a cache-first strategy.
+  const url = new URL(event.request.url);
+  const isLocalAsset = url.origin === self.location.origin && ( // Use self.location.origin in SW
+    url.pathname.endsWith('/friscy.js') ||
+    url.pathname.endsWith('/friscy.wasm') ||
+    url.pathname.endsWith('/rootfs.tar') ||
+    url.pathname.endsWith('/manifest.json')
+  );
+
+  if (isLocalAsset) {
+    event.respondWith(
+      caches.match(event.request).then((cachedResponse) => {
+        // Cache-first, but update cache from network in background
+        const fetchAndCache = fetch(event.request).then((networkResponse) => {
+          if (networkResponse.ok) {
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, networkResponse.clone());
+            });
+          }
+          return networkResponse;
+        }).catch(() => {
+            // Network failed, return cached response if available
+            return cachedResponse || new Response('Network request failed and no cache available', { status: 408, headers: { 'Content-Type': 'text/plain' } });
+        });
+
+        return cachedResponse || fetchAndCache;
+      })
+    );
+  } else {
+    // For all other requests (like CDN assets), use a cache-first strategy
+    event.respondWith(
+      caches.match(event.request).then((cachedResponse) => {
+        return cachedResponse || fetch(event.request).then((networkResponse) => {
+          // Cache successful responses
+          if (networkResponse.ok) {
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, networkResponse.clone());
+            });
+          }
+          return networkResponse;
+        });
+      })
+    );
+  }
+});
+SWEOF
+
+# =============================================================================
+# Step 6: Generate HTML
 # =============================================================================
 log "Generating index.html..."
 
@@ -280,7 +379,7 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>friscy container</title>
-    <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -295,17 +394,27 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             padding: 1rem;
             background: #16213e;
             border-bottom: 1px solid #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         h1 { font-size: 1.2rem; font-weight: 500; }
         .status { font-size: 0.85rem; color: #888; margin-top: 0.25rem; }
         #terminal-container {
             flex: 1;
             padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden; /* Prevent scrollbars from container itself */
         }
         #terminal {
-            height: 100%;
+            flex: 1;
             border-radius: 8px;
             overflow: hidden;
+            display: flex; /* Ensure terminal content fills space */
+        }
+        .xterm-viewport {
+             overflow-y: auto; /* Enable scroll for terminal content */
         }
         .loading {
             display: flex;
@@ -313,6 +422,7 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             justify-content: center;
             height: 100%;
             font-size: 1.1rem;
+            text-align: center;
         }
         .loading::after {
             content: '';
@@ -323,53 +433,155 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             border-radius: 50%;
             animation: spin 1s linear infinite;
             margin-left: 1rem;
+            flex-shrink: 0;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+
+        .terminal-actions button {
+            background-color: #0f3460;
+            color: #eee;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            margin-left: 0.5rem;
+        }
+        .terminal-actions button:hover {
+            background-color: #16213e;
+        }
     </style>
 </head>
 <body>
     <header>
-        <h1>friscy container</h1>
-        <div class="status" id="status">Loading...</div>
+        <div>
+            <h1>friscy container</h1>
+            <div class="status" id="status">Loading...</div>
+        </div>
+        <div class="terminal-actions">
+            <button id="fit-button">Fit Terminal</button>
+            <button id="reset-button">Reset</button>
+        </div>
     </header>
     <div id="terminal-container">
         <div id="terminal" class="loading">Initializing container...</div>
     </div>
 
-    <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.min.js"></script>
-    <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <!-- Register service worker -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./service-worker.js')
+                    .then(registration => {
+                        console.log('Service Worker registered: ', registration);
+                    })
+                    .catch(registrationError => {
+                        console.log('Service Worker registration failed: ', registrationError);
+                    });
+            });
+        }
+    </script>
+
+    <!-- Import xterm.js and addons as ES Modules from CDN -->
     <script type="module">
+        import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm';
+        import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm';
         import createFriscy from './friscy.js';
 
         const statusEl = document.getElementById('status');
         const terminalEl = document.getElementById('terminal');
 
+        let term, fitAddon, friscyModule;
+        const inputBuffer = [];
+        let machineRunning = false;
+        let resumeScheduled = false;
+
+        function updateTerminalSize() {
+            if (friscyModule && term && fitAddon) {
+                fitAddon.fit();
+                friscyModule._termRows = term.rows;
+                friscyModule._termCols = term.cols;
+            }
+        }
+
+        // Resume the RISC-V machine when it's waiting for stdin.
+        // Called on keyboard input and after callMain returns.
+        function scheduleResume() {
+            if (!machineRunning || resumeScheduled) return;
+            const stopped = friscyModule._friscy_stopped;
+            if (!stopped || !stopped()) return;
+
+            resumeScheduled = true;
+            setTimeout(() => {
+                resumeScheduled = false;
+                if (!machineRunning) return;
+
+                friscyModule._friscy_resume();
+
+                if (friscyModule._friscy_stopped()) {
+                    // Still waiting for more stdin — resume again if buffer has data
+                    if (inputBuffer.length > 0) {
+                        scheduleResume();
+                    } else {
+                        // Machine idle, waiting for input — show prompt
+                        term.write('\x1b[32m/ # \x1b[0m');
+                    }
+                } else {
+                    // Machine finished (guest called exit)
+                    machineRunning = false;
+                    term.writeln('\r\n\x1b[33mProcess exited\x1b[0m');
+                    statusEl.textContent = 'Exited';
+                }
+            }, 5);
+        }
+
         async function main() {
             statusEl.textContent = 'Loading manifest...';
-
-            // Load manifest
             const manifest = await fetch('./manifest.json').then(r => r.json());
             statusEl.textContent = `Image: ${manifest.image}`;
 
-            // Initialize terminal
+            // Initialize xterm.js
             terminalEl.innerHTML = '';
             terminalEl.classList.remove('loading');
 
-            const term = new Terminal({
+            term = new Terminal({
                 cursorBlink: true,
+                convertEol: true,
                 fontSize: 14,
                 fontFamily: 'Menlo, Monaco, "Courier New", monospace',
                 theme: {
                     background: '#0d1117',
                     foreground: '#c9d1d9',
+                    selectionBackground: '#00507a',
+                    cursor: '#c9d1d9',
+                    black: '#000000',
+                    red: '#e06c75',
+                    green: '#98c379',
+                    yellow: '#e5c07b',
+                    blue: '#61afef',
+                    magenta: '#c678dd',
+                    cyan: '#56b6c2',
+                    white: '#ffffff',
+                    brightBlack: '#5c6370',
+                    brightRed: '#e06c75',
+                    brightGreen: '#98c379',
+                    brightYellow: '#e5c07b',
+                    brightBlue: '#61afef',
+                    brightMagenta: '#c678dd',
+                    brightCyan: '#56b6c2',
+                    brightWhite: '#ffffff',
                 }
             });
-            const fitAddon = new FitAddon.FitAddon();
+            fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
             term.open(terminalEl);
-            fitAddon.fit();
+            term.focus();
+            updateTerminalSize();
 
-            window.addEventListener('resize', () => fitAddon.fit());
+            window.addEventListener('resize', updateTerminalSize);
+            document.getElementById('fit-button').addEventListener('click', updateTerminalSize);
+            // Re-focus terminal when user clicks on it
+            terminalEl.addEventListener('click', () => term.focus());
 
             term.writeln('\x1b[1;32mfriscy\x1b[0m - Container runtime in WebAssembly');
             term.writeln(`Loading ${manifest.image}...`);
@@ -380,46 +592,98 @@ cat > "$OUTPUT_DIR/index.html" << 'HTMLEOF'
             const rootfs = await fetch('./rootfs.tar').then(r => r.arrayBuffer());
             term.writeln(`Loaded rootfs: ${(rootfs.byteLength / 1024 / 1024).toFixed(1)} MB`);
 
-            // Initialize friscy
+            // Initialize friscy Wasm module
             statusEl.textContent = 'Initializing runtime...';
-            const Module = await createFriscy({
+            friscyModule = await createFriscy({
+                noInitialRun: true,
                 print: (text) => term.writeln(text),
                 printErr: (text) => term.writeln('\x1b[31m' + text + '\x1b[0m'),
+                _stdinBuffer: inputBuffer,
+                _stdinEOF: false,
+                _termRows: term.rows,
+                _termCols: term.cols,
+                _termWrite: (text) => term.write(text),
             });
 
-            // Load rootfs into virtual filesystem
-            const rootfsData = new Uint8Array(rootfs);
-            Module.FS.writeFile('/rootfs.tar', rootfsData);
+            // Load rootfs into Emscripten virtual FS
+            friscyModule.FS.writeFile('/rootfs.tar', new Uint8Array(rootfs));
 
-            // Set up stdin from terminal
+            // Wire keyboard → stdin buffer → machine resume
+            // Shell runs in batch mode (no TTY echo), so we provide:
+            //   - Local echo for visual feedback
+            //   - Line buffering with backspace support
+            //   - \r → \n translation (xterm sends \r, Unix needs \n)
+            let lineBuffer = '';
+
             term.onData((data) => {
-                if (!Module._stdinBuffer) Module._stdinBuffer = [];
-                for (let i = 0; i < data.length; i++) {
-                    Module._stdinBuffer.push(data.charCodeAt(i));
+                if (!machineRunning) return;
+
+                for (const ch of data) {
+                    const code = ch.charCodeAt(0);
+
+                    if (ch === '\r') {
+                        // Enter → send buffered line + \n to shell
+                        term.write('\r\n');
+                        const line = lineBuffer + '\n';
+                        const bytes = new TextEncoder().encode(line);
+                        inputBuffer.push(...bytes);
+                        lineBuffer = '';
+                        scheduleResume();
+                    } else if (code === 127 || code === 8) {
+                        // Backspace
+                        if (lineBuffer.length > 0) {
+                            lineBuffer = lineBuffer.slice(0, -1);
+                            term.write('\b \b');
+                        }
+                    } else if (code === 3) {
+                        // Ctrl+C
+                        term.write('^C\r\n');
+                        lineBuffer = '';
+                    } else if (code === 4) {
+                        // Ctrl+D → EOF when line is empty
+                        if (lineBuffer.length === 0) {
+                            friscyModule._stdinEOF = true;
+                            scheduleResume();
+                        }
+                    } else if (code >= 32) {
+                        // Printable character → echo and buffer
+                        term.write(ch);
+                        lineBuffer += ch;
+                    }
                 }
             });
 
+            // Build args matching main.cpp: --rootfs <tar> <entry> [args...]
+            const guestCmd = manifest.entrypoint.split(' ').filter(s => s);
+            const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
+
             statusEl.textContent = 'Running...';
             term.writeln('Starting: ' + manifest.entrypoint);
-            term.writeln('─'.repeat(40));
-
-            // Connect terminal output to xterm.js
-            Module._termWrite = (text) => term.write(text);
+            term.writeln('\u2500'.repeat(40));
 
             // Run the container
             try {
-                const exitCode = Module.callMain([
-                    '--rootfs', '/rootfs.tar',
-                    '--', manifest.entrypoint
-                ]);
-                term.writeln('');
-                term.writeln(`\x1b[33mProcess exited with code ${exitCode}\x1b[0m`);
-                statusEl.textContent = `Exited (${exitCode})`;
+                machineRunning = true;
+                friscyModule.callMain(args);
+
+                // If machine stopped for stdin, enter interactive mode
+                if (friscyModule._friscy_stopped && friscyModule._friscy_stopped()) {
+                    statusEl.textContent = 'Interactive';
+                    scheduleResume();
+                } else {
+                    machineRunning = false;
+                    term.writeln('\r\n\x1b[33mProcess exited\x1b[0m');
+                    statusEl.textContent = 'Exited';
+                }
             } catch (e) {
+                machineRunning = false;
                 term.writeln('\x1b[31mError: ' + e.message + '\x1b[0m');
                 statusEl.textContent = 'Error';
+                console.error(e);
             }
         }
+
+        document.getElementById('reset-button').addEventListener('click', () => location.reload());
 
         main().catch(e => {
             console.error(e);

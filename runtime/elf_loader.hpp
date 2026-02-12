@@ -193,6 +193,27 @@ inline ElfInfo parse_elf(const std::vector<uint8_t>& data) {
     return info;
 }
 
+// Get the range of writable PT_LOAD segments (data/BSS).
+// Returns {lo, hi} where lo is the lowest writable vaddr and hi is the
+// highest writable vaddr+memsz. Used by cooperative fork to save/restore
+// only writable memory (skip code segments and unmapped gaps).
+inline std::pair<uint64_t, uint64_t> get_writable_range(const std::vector<uint8_t>& data) {
+    const auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(data.data());
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
+    size_t phoff = ehdr->e_phoff;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const auto* phdr = reinterpret_cast<const Elf64_Phdr*>(data.data() + phoff);
+        if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_W)) {
+            if (phdr->p_vaddr < lo) lo = phdr->p_vaddr;
+            uint64_t seg_hi = phdr->p_vaddr + phdr->p_memsz;
+            if (seg_hi > hi) hi = seg_hi;
+        }
+        phoff += ehdr->e_phentsize;
+    }
+    return {lo, hi};
+}
+
 // Get the lowest and highest virtual addresses from PT_LOAD segments
 inline std::pair<uint64_t, uint64_t> get_load_range(const std::vector<uint8_t>& data) {
     const auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(data.data());
@@ -332,8 +353,12 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // └──────────────────────────────┘ ← sp
 // Low addresses
 
-// Load an ELF file into memory at the specified base
-// Returns the actual base address used (may differ for PIE)
+// Load an ELF file into memory at the specified base.
+// Uses two-pass approach: first copies data, then merges page permissions
+// across all segments. This correctly handles shared pages where a code
+// segment (RX) and data segment (RW) overlap on the same 4KB page —
+// the shared page gets RWX instead of the data segment clobbering the
+// code segment's execute permission.
 inline uint64_t load_elf_segments(
     Machine& machine,
     const std::vector<uint8_t>& elf_data,
@@ -350,39 +375,80 @@ inline uint64_t load_elf_segments(
         base_adjust = requested_base - lo;
     }
 
+    // Collect all PT_LOAD segments
+    struct SegInfo {
+        uint64_t vaddr, filesz, memsz, offset;
+        uint32_t flags;
+    };
+    std::vector<SegInfo> segments;
+
     size_t phoff = ehdr->e_phoff;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const auto* phdr = reinterpret_cast<const elf::Elf64_Phdr*>(
             elf_data.data() + phoff);
 
         if (phdr->p_type == elf::PT_LOAD) {
-            uint64_t vaddr = phdr->p_vaddr + base_adjust;
-            uint64_t filesz = phdr->p_filesz;
-            uint64_t memsz = phdr->p_memsz;
-
-            // Copy file data
-            if (filesz > 0) {
-                machine.memory.memcpy(
-                    vaddr,
-                    elf_data.data() + phdr->p_offset,
-                    filesz
-                );
-            }
-
-            // Zero BSS (memsz > filesz)
-            if (memsz > filesz) {
-                machine.memory.memset(vaddr + filesz, 0, memsz - filesz);
-            }
-
-            // Set page permissions (critical for execute access)
-            riscv::PageAttributes attr;
-            attr.read  = (phdr->p_flags & elf::PF_R) != 0;
-            attr.write = (phdr->p_flags & elf::PF_W) != 0;
-            attr.exec  = (phdr->p_flags & elf::PF_X) != 0;
-            machine.memory.set_page_attr(vaddr, memsz, attr);
+            segments.push_back({
+                phdr->p_vaddr + base_adjust,
+                phdr->p_filesz,
+                phdr->p_memsz,
+                phdr->p_offset,
+                phdr->p_flags
+            });
         }
 
         phoff += ehdr->e_phentsize;
+    }
+
+    // Pass 1: Copy segment data into guest memory
+    for (const auto& seg : segments) {
+        if (seg.filesz > 0) {
+            machine.memory.memcpy(seg.vaddr, elf_data.data() + seg.offset, seg.filesz);
+        }
+        if (seg.memsz > seg.filesz) {
+            machine.memory.memset(seg.vaddr + seg.filesz, 0, seg.memsz - seg.filesz);
+        }
+    }
+
+    // Pass 2: Set page permissions with proper merging.
+    // For each page touched by any segment, OR the permissions from all
+    // overlapping segments. This prevents a data segment (RW) from removing
+    // execute permission on a page shared with a code segment (RX).
+    constexpr uint64_t RISCV_PAGE = 4096;
+    constexpr uint64_t RISCV_PAGE_MASK = ~(RISCV_PAGE - 1);
+
+    // Find overall page range
+    uint64_t range_lo = UINT64_MAX, range_hi = 0;
+    for (const auto& seg : segments) {
+        uint64_t lo = seg.vaddr & RISCV_PAGE_MASK;
+        uint64_t hi = (seg.vaddr + seg.memsz + RISCV_PAGE - 1) & RISCV_PAGE_MASK;
+        if (lo < range_lo) range_lo = lo;
+        if (hi > range_hi) range_hi = hi;
+    }
+
+    // Set merged permissions per page
+    for (uint64_t page = range_lo; page < range_hi; page += RISCV_PAGE) {
+        bool r = false, w = false, x = false;
+        bool touched = false;
+
+        for (const auto& seg : segments) {
+            uint64_t seg_end = seg.vaddr + seg.memsz;
+            // Does this page overlap with this segment?
+            if (page < seg_end && page + RISCV_PAGE > seg.vaddr) {
+                touched = true;
+                r |= (seg.flags & elf::PF_R) != 0;
+                w |= (seg.flags & elf::PF_W) != 0;
+                x |= (seg.flags & elf::PF_X) != 0;
+            }
+        }
+
+        if (touched) {
+            riscv::PageAttributes attr;
+            attr.read = r;
+            attr.write = w;
+            attr.exec = x;
+            machine.memory.set_page_attr(page, RISCV_PAGE, attr);
+        }
     }
 
     return base_adjust;

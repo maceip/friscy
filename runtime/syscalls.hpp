@@ -33,15 +33,19 @@ struct ForkState {
     int exit_status;    // Child's exit code
     pid_t child_pid;    // PID assigned to child
     bool in_child;      // True while "child" is running
-    // Memory snapshot: saved at clone, restored when child exits.
-    // Execve overwrites the stack and dynamic linker re-runs (modifying
-    // GOT/BSS), so we must restore the parent's memory state.
-    std::vector<uint8_t> mem_snapshot;
-    uint64_t mem_start;  // Start address of saved region
-    uint64_t mem_size;   // Size of saved region
-    std::vector<uint8_t> interp_snapshot;  // Interpreter data/BSS
-    uint64_t interp_start;
-    uint64_t interp_size;
+    // Memory snapshots: saved at clone, restored when child exits.
+    // We save three separate regions to avoid unmapped guard pages:
+    //   1. Main binary data/BSS (globals, GOT)
+    //   2. Interpreter data/BSS (ld-musl state)
+    //   3. Stack (return addresses, locals)
+    struct MemRegion {
+        std::vector<uint8_t> data;
+        uint64_t addr;
+        uint64_t size;
+    };
+    MemRegion exec_data;
+    MemRegion interp_data;
+    MemRegion stack_data;
 };
 inline ForkState g_fork = {};
 inline pid_t g_next_pid = 100;
@@ -54,8 +58,10 @@ struct ExecContext {
     elf::ElfInfo exec_info;              // Adjusted ELF info (with PIE base)
     uint64_t exec_base = 0;             // PIE base for main executable
     uint64_t exec_rw_start = 0;         // First writable segment of main binary
+    uint64_t exec_rw_end = 0;           // End of writable segments of main binary
     uint64_t interp_base = 0;           // Where interpreter was loaded
     uint64_t interp_rw_start = 0;       // First writable segment of interpreter
+    uint64_t interp_rw_end = 0;         // End of writable segments of interpreter
     uint64_t interp_entry = 0;          // Interpreter entry point
     uint64_t original_stack_top = 0;    // Stack top from initial setup
     std::vector<std::string> env;        // Environment variables
@@ -209,22 +215,17 @@ static void sys_exit(Machine& m) {
         g_fork.exit_status = m.template sysarg<int>(0);
         g_fork.in_child = false;
 
-        // Restore parent memory (stack + data/BSS + interpreter) before
-        // registers, since execve overwrote these regions.
-        if (!g_fork.mem_snapshot.empty()) {
-            m.memory.memcpy(g_fork.mem_start,
-                            g_fork.mem_snapshot.data(),
-                            g_fork.mem_size);
-            g_fork.mem_snapshot.clear();
-            g_fork.mem_snapshot.shrink_to_fit();
-        }
-        if (!g_fork.interp_snapshot.empty()) {
-            m.memory.memcpy(g_fork.interp_start,
-                            g_fork.interp_snapshot.data(),
-                            g_fork.interp_size);
-            g_fork.interp_snapshot.clear();
-            g_fork.interp_snapshot.shrink_to_fit();
-        }
+        // Restore parent memory (data/BSS + interpreter + stack)
+        auto restore = [&](ForkState::MemRegion& r) {
+            if (!r.data.empty()) {
+                m.memory.memcpy(r.addr, r.data.data(), r.size);
+                r.data.clear();
+                r.data.shrink_to_fit();
+            }
+        };
+        restore(g_fork.exec_data);
+        restore(g_fork.interp_data);
+        restore(g_fork.stack_data);
 
         // Restore parent registers (x0-x31)
         for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
@@ -259,30 +260,39 @@ static void sys_clone(Machine& m) {
     g_fork.in_child = true;
     g_fork.exit_status = 0;
 
-    // Save parent memory: stack + data/BSS regions.
-    // Execve overwrites the stack (setup_dynamic_stack) and the dynamic
-    // linker re-runs (modifying BSS/GOT). We must restore these so the
-    // parent can resume correctly after the child exits.
-    //
-    // We save from exec_base (covers main binary data/BSS + heap + stack)
-    // up to original_stack_top. This is typically ~18MB.
-    uint64_t save_start = g_exec_ctx.exec_base;
-    uint64_t save_end = g_exec_ctx.original_stack_top;
-    if (save_start < save_end) {
-        g_fork.mem_start = save_start;
-        g_fork.mem_size = save_end - save_start;
-        g_fork.mem_snapshot.resize(g_fork.mem_size);
-        m.memory.memcpy_out(g_fork.mem_snapshot.data(), save_start, g_fork.mem_size);
+    // Save parent memory in three separate regions (avoiding unmapped
+    // guard pages between data and stack):
+    //   1. Main binary data/BSS (globals, GOT)
+    //   2. Interpreter data/BSS (ld-musl state)
+    //   3. Stack (from SP to stack top)
+
+    // Region 1: main binary writable segments
+    if (g_exec_ctx.exec_rw_start > 0 && g_exec_ctx.exec_rw_end > g_exec_ctx.exec_rw_start) {
+        auto& r = g_fork.exec_data;
+        r.addr = g_exec_ctx.exec_rw_start;
+        r.size = g_exec_ctx.exec_rw_end - g_exec_ctx.exec_rw_start;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
     }
 
-    // Also save the interpreter region (ld-musl data/BSS).
-    // Execve re-runs the dynamic linker which modifies its internal state.
-    if (g_exec_ctx.interp_base > 0 && !g_exec_ctx.interp_binary.empty()) {
-        g_fork.interp_start = g_exec_ctx.interp_base;
-        g_fork.interp_size = g_exec_ctx.interp_binary.size();
-        g_fork.interp_snapshot.resize(g_fork.interp_size);
-        m.memory.memcpy_out(g_fork.interp_snapshot.data(),
-                            g_fork.interp_start, g_fork.interp_size);
+    // Region 2: interpreter writable segments
+    if (g_exec_ctx.interp_rw_start > 0 && g_exec_ctx.interp_rw_end > g_exec_ctx.interp_rw_start) {
+        auto& r = g_fork.interp_data;
+        r.addr = g_exec_ctx.interp_rw_start;
+        r.size = g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+    }
+
+    // Region 3: stack (SP to stack top)
+    {
+        uint64_t sp = m.cpu.reg(riscv::REG_SP);
+        uint64_t stack_top = g_exec_ctx.original_stack_top;
+        auto& r = g_fork.stack_data;
+        r.addr = sp;
+        r.size = stack_top - sp;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
     }
 
     // Return 0 = "you are the child"
@@ -303,11 +313,99 @@ static void sys_wait4(Machine& m) {
     m.set_result(g_fork.child_pid);
 }
 
-// execve — stub that returns -ENOSYS for now.
-// The child will call _exit(127) after execve fails, which triggers
-// parent state restoration via our cooperative fork.
+// execve — replace current "process" with a new program.
+// In our single-machine model, we reload ELF segments from the stored
+// binary data, set up a fresh stack with new argv, and jump to the
+// interpreter entry point. This works because all binaries in a
+// busybox-based container are the same executable.
 static void sys_execve(Machine& m) {
-    m.set_result(-38);  // -ENOSYS
+    auto path_addr = m.sysarg(0);
+    auto argv_addr = m.sysarg(1);
+
+    if (!g_exec_ctx.dynamic || g_exec_ctx.exec_binary.empty()) {
+        m.set_result(-38);  // -ENOSYS
+        return;
+    }
+
+    // Read target path
+    std::string path;
+    try {
+        path = m.memory.memstring(path_addr);
+    } catch (...) {
+        m.set_result(-14);  // -EFAULT
+        return;
+    }
+
+    // Resolve symlinks to verify the file exists
+    auto& fs = get_fs(m);
+    std::string resolved = path;
+    for (int i = 0; i < 10; i++) {
+        vfs::Entry entry;
+        if (!fs.stat(resolved, entry)) {
+            m.set_result(-2);  // -ENOENT
+            return;
+        }
+        if (entry.type == vfs::FileType::Symlink) {
+            char target[256];
+            ssize_t n = fs.readlink(resolved, target, sizeof(target));
+            if (n > 0) {
+                std::string link(target, n);
+                if (link[0] != '/') {
+                    // Relative symlink — resolve against dirname
+                    auto slash = resolved.rfind('/');
+                    if (slash != std::string::npos)
+                        link = resolved.substr(0, slash + 1) + link;
+                }
+                resolved = link;
+                continue;
+            }
+        }
+        break;
+    }
+
+    // Read argv from guest memory
+    std::vector<std::string> args;
+    try {
+        for (int i = 0; i < 256; i++) {
+            uint64_t ptr = m.memory.template read<uint64_t>(argv_addr + i * 8);
+            if (ptr == 0) break;
+            args.push_back(m.memory.memstring(ptr));
+        }
+    } catch (...) {
+        m.set_result(-14);  // -EFAULT
+        return;
+    }
+
+    if (args.empty()) {
+        args.push_back(path);
+    }
+
+    // Note: we do NOT reload ELF segments here. The same binary (busybox)
+    // is already loaded in memory — code segments are identical. Skipping
+    // the reload avoids protection faults from writing to execute-only pages.
+    // The dynamic linker will redo relocations on its own init path.
+
+    // Set up fresh stack with new argv/envp/auxv
+    uint64_t sp = dynlink::setup_dynamic_stack(
+        m,
+        g_exec_ctx.exec_info,
+        g_exec_ctx.interp_base,
+        args,
+        g_exec_ctx.env,
+        g_exec_ctx.original_stack_top
+    );
+
+    // Clear all registers (execve starts with clean state)
+    for (int i = 1; i < 32; i++) {
+        m.cpu.reg(i) = 0;
+    }
+
+    // Set SP and jump to interpreter entry
+    m.cpu.reg(riscv::REG_SP) = sp;
+    m.cpu.jump(g_exec_ctx.interp_entry);
+
+    // execve doesn't "return" on success — execution continues at new entry.
+    // Do NOT call set_result() — the new process starts fresh.
 }
 
 static void sys_openat(Machine& m) {

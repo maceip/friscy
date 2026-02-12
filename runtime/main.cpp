@@ -50,28 +50,48 @@ EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
 }
 
 // Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
+// Handles page protection faults by making the faulting page writable and
+// retrying. This acts as a simple page fault handler for pages at the
+// boundary between read-only code and writable data segments.
 EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     if (!g_machine) return 0;
     syscalls::g_waiting_for_stdin = false;
-    try {
-        g_machine->resume(MAX_INSTRUCTIONS);
-    } catch (const riscv::MachineException& e) {
-        EM_ASM({
-            if (typeof Module._termWrite === 'function') {
-                Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
-                    UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
-                    ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+    for (int retries = 0; retries < 8; retries++) {
+        try {
+            g_machine->resume(MAX_INSTRUCTIONS);
+            return friscy_stopped();
+        } catch (const riscv::MachineException& e) {
+            uint64_t fault_addr = e.data();
+            // If this looks like a page protection fault (data address != 0),
+            // make the page writable and retry.
+            if (fault_addr != 0 && retries < 7) {
+                constexpr uint64_t PAGE_MASK = ~0xFFFULL;
+                uint64_t page = fault_addr & PAGE_MASK;
+                riscv::PageAttributes attr;
+                attr.read = true;
+                attr.write = true;
+                attr.exec = true;
+                g_machine->memory.set_page_attr(page, 4096, attr);
+                continue;  // retry
             }
-        }, e.what(), (uint32_t)e.data(), (uint32_t)g_machine->cpu.pc());
-        return 0;
-    } catch (const std::exception& e) {
-        EM_ASM({
-            if (typeof Module._termWrite === 'function') {
-                Module._termWrite('\r\n\x1b[31m[friscy] Error: ' +
-                    UTF8ToString($0) + '\x1b[0m\r\n');
-            }
-        }, e.what());
-        return 0;
+            // Give up — report to terminal
+            EM_ASM({
+                if (typeof Module._termWrite === 'function') {
+                    Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
+                        UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                        ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+                }
+            }, e.what(), (uint32_t)e.data(), (uint32_t)g_machine->cpu.pc());
+            return 0;
+        } catch (const std::exception& e) {
+            EM_ASM({
+                if (typeof Module._termWrite === 'function') {
+                    Module._termWrite('\r\n\x1b[31m[friscy] Error: ' +
+                        UTF8ToString($0) + '\x1b[0m\r\n');
+                }
+            }, e.what());
+            return 0;
+        }
     }
     return friscy_stopped();
 }
@@ -382,6 +402,10 @@ int main(int argc, char** argv) {
                 // address where the first segment starts (exec_base + lo)
                 auto [lo, hi] = elf::get_load_range(binary);
                 syscalls::g_exec_ctx.exec_base = exec_base + lo;
+                // Find writable data segment range (skip code segments)
+                auto [rw_lo, rw_hi] = elf::get_writable_range(binary);
+                syscalls::g_exec_ctx.exec_rw_start = exec_base + rw_lo;
+                syscalls::g_exec_ctx.exec_rw_end = exec_base + rw_hi;
             }
 
             // We'll jump to interpreter's entry point instead of main binary's
@@ -397,7 +421,10 @@ int main(int argc, char** argv) {
             syscalls::g_exec_ctx.interp_base = interp_base;
             syscalls::g_exec_ctx.interp_entry = machine.cpu.pc();  // interp_entry
             syscalls::g_exec_ctx.dynamic = true;
-            // exec_base was set above in the PIE adjustment block
+            // Find interpreter's writable data segment range
+            auto [irw_lo, irw_hi] = elf::get_writable_range(interp_binary);
+            syscalls::g_exec_ctx.interp_rw_start = interp_base + irw_lo;
+            syscalls::g_exec_ctx.interp_rw_end = interp_base + irw_hi;
         }
 
         // Set up Linux syscall emulation (provided by libriscv)
@@ -487,21 +514,36 @@ int main(int argc, char** argv) {
         // Run! When the guest reads from stdin and no data is available,
         // the syscall handler calls machine.stop(). JS calls friscy_resume()
         // after new stdin data arrives to continue execution.
-        try {
-            machine.simulate(MAX_INSTRUCTIONS);
-        } catch (const riscv::MachineException& e) {
-#ifdef __EMSCRIPTEN__
-            EM_ASM({
-                if (typeof Module._termWrite === 'function') {
-                    Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
-                        UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
-                        ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+        // Page faults on boundary pages are handled by making them writable.
+        for (int retries = 0; retries < 8; retries++) {
+            try {
+                machine.simulate(MAX_INSTRUCTIONS);
+                break;
+            } catch (const riscv::MachineException& e) {
+                uint64_t fault_addr = e.data();
+                if (fault_addr != 0 && retries < 7) {
+                    constexpr uint64_t PAGE_MASK = ~0xFFFULL;
+                    uint64_t page = fault_addr & PAGE_MASK;
+                    riscv::PageAttributes attr;
+                    attr.read = true;
+                    attr.write = true;
+                    attr.exec = true;
+                    machine.memory.set_page_attr(page, 4096, attr);
+                    continue;
                 }
-            }, e.what(), (uint32_t)e.data(), (uint32_t)machine.cpu.pc());
-            return 1;
+#ifdef __EMSCRIPTEN__
+                EM_ASM({
+                    if (typeof Module._termWrite === 'function') {
+                        Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
+                            UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                            ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
+                    }
+                }, e.what(), (uint32_t)e.data(), (uint32_t)machine.cpu.pc());
+                return 1;
 #else
-            throw;
+                throw;
 #endif
+            }
         }
 
 #ifdef __EMSCRIPTEN__

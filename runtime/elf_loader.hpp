@@ -193,21 +193,25 @@ inline ElfInfo parse_elf(const std::vector<uint8_t>& data) {
     return info;
 }
 
-// Get the lowest virtual address of writable PT_LOAD segments.
-// Used by cooperative fork to know where to start saving memory
-// (skip read-only/execute-only code segments).
-inline uint64_t get_first_writable_addr(const std::vector<uint8_t>& data) {
+// Get the range of writable PT_LOAD segments (data/BSS).
+// Returns {lo, hi} where lo is the lowest writable vaddr and hi is the
+// highest writable vaddr+memsz. Used by cooperative fork to save/restore
+// only writable memory (skip code segments and unmapped gaps).
+inline std::pair<uint64_t, uint64_t> get_writable_range(const std::vector<uint8_t>& data) {
     const auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(data.data());
     uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
     size_t phoff = ehdr->e_phoff;
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const auto* phdr = reinterpret_cast<const Elf64_Phdr*>(data.data() + phoff);
         if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_W)) {
             if (phdr->p_vaddr < lo) lo = phdr->p_vaddr;
+            uint64_t seg_hi = phdr->p_vaddr + phdr->p_memsz;
+            if (seg_hi > hi) hi = seg_hi;
         }
         phoff += ehdr->e_phentsize;
     }
-    return lo;
+    return {lo, hi};
 }
 
 // Get the lowest and highest virtual addresses from PT_LOAD segments

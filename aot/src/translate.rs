@@ -2683,6 +2683,10 @@ fn cache_gpr_i64_values(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<WasmI
         offset != 0 && offset < (32 * 8) && offset % 8 == 0
     }
 
+    fn gpr_cache_range_end() -> u32 {
+        32 * 8
+    }
+
     fn get_or_alloc_local_for_offset(
         offset_to_local: &mut HashMap<u32, u32>,
         offset: u32,
@@ -2697,25 +2701,100 @@ fn cache_gpr_i64_values(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<WasmI
         idx
     }
 
+    fn store_offset(inst: &WasmInst) -> Option<u32> {
+        match inst {
+            WasmInst::I32Store { offset }
+            | WasmInst::I64Store { offset }
+            | WasmInst::I32Store8 { offset }
+            | WasmInst::I32Store16 { offset }
+            | WasmInst::I64Store8 { offset }
+            | WasmInst::I64Store16 { offset }
+            | WasmInst::I64Store32 { offset } => Some(*offset),
+            _ => None,
+        }
+    }
+
+    fn store_width_bytes(inst: &WasmInst) -> Option<u32> {
+        match inst {
+            WasmInst::I32Store { .. } => Some(4),
+            WasmInst::I64Store { .. } => Some(8),
+            WasmInst::I32Store8 { .. } | WasmInst::I64Store8 { .. } => Some(1),
+            WasmInst::I32Store16 { .. } | WasmInst::I64Store16 { .. } => Some(2),
+            WasmInst::I64Store32 { .. } => Some(4),
+            _ => None,
+        }
+    }
+
+    fn ranges_overlap(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> bool {
+        let a_end = a_start.saturating_add(a_len);
+        let b_end = b_start.saturating_add(b_len);
+        a_start < b_end && b_start < a_end
+    }
+
+    fn invalidate_overlapping_gpr_caches(
+        offset_to_local: &mut HashMap<u32, u32>,
+        store_off: u32,
+        store_width: u32,
+    ) {
+        let mut remove = Vec::new();
+        for cached_off in offset_to_local.keys().copied() {
+            if ranges_overlap(cached_off, 8, store_off, store_width) {
+                remove.push(cached_off);
+            }
+        }
+        for cached_off in remove {
+            offset_to_local.remove(&cached_off);
+        }
+    }
+
     let mut out = Vec::with_capacity(body.len());
     let mut i = 0usize;
     let mut changes = 0usize;
     let mut offset_to_local = HashMap::<u32, u32>::new();
 
     while i < body.len() {
-        // Rewrite register-file reloads into local.get when we have a known
-        // cached value from an earlier register store in this block.
+        // Rewrite register-file reloads into local.get when cached.
+        // If uncached, seed the cache by teeing the first load.
         if i + 1 < body.len()
             && is_local_get(&body[i], 0)
             && matches!(body[i + 1], WasmInst::I64Load { offset } if is_cacheable_gpr_offset(offset))
         {
             if let WasmInst::I64Load { offset } = body[i + 1] {
                 if let Some(local_idx) = offset_to_local.get(&offset).copied() {
+                    if i + 2 < body.len()
+                        && matches!(body[i + 2], WasmInst::LocalTee { idx } if idx == local_idx)
+                    {
+                        out.push(WasmInst::LocalGet { idx: local_idx });
+                        i += 3;
+                        changes += 1;
+                        continue;
+                    }
+
                     out.push(WasmInst::LocalGet { idx: local_idx });
                     i += 2;
                     changes += 1;
                     continue;
                 }
+
+                if i + 2 < body.len() {
+                    if let WasmInst::LocalTee { idx } = body[i + 2] {
+                        offset_to_local.insert(offset, idx);
+                        out.push(body[i].clone());
+                        out.push(body[i + 1].clone());
+                        out.push(body[i + 2].clone());
+                        i += 3;
+                        continue;
+                    }
+                }
+
+                let cache_local =
+                    get_or_alloc_local_for_offset(&mut offset_to_local, offset, next_local);
+                out.push(WasmInst::LocalGet { idx: 0 });
+                out.push(WasmInst::I64Load { offset });
+                out.push(WasmInst::LocalTee { idx: cache_local });
+                i += 2;
+                changes += 1;
+                continue;
             }
         }
 
@@ -2747,6 +2826,14 @@ fn cache_gpr_i64_values(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<WasmI
                 out.push(WasmInst::I64Store { offset });
                 i += 1;
                 continue;
+            }
+        }
+
+        // Conservative invalidation: any static store into the register-file
+        // byte range invalidates overlapping cached registers.
+        if let (Some(off), Some(width)) = (store_offset(&body[i]), store_width_bytes(&body[i])) {
+            if off < gpr_cache_range_end() {
+                invalidate_overlapping_gpr_caches(&mut offset_to_local, off, width);
             }
         }
 
@@ -3136,5 +3223,59 @@ mod tests {
 
         assert_eq!(format!("{:?}", func.body), first_body_dbg);
         assert_eq!(func.num_locals, first_locals);
+    }
+
+    #[test]
+    fn optimize_preseeds_cache_from_first_register_load() {
+        let mut func = make_test_function(vec![
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            WasmInst::I64Const { value: 3 },
+            WasmInst::I64Add,
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            WasmInst::I64Add,
+        ]);
+
+        optimize_function(&mut func);
+
+        let load40_count = func
+            .body
+            .iter()
+            .filter(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40))
+            .count();
+        assert_eq!(load40_count, 1, "first load should seed cache, second should reuse local");
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::LocalTee { idx } if *idx >= 4)));
+    }
+
+    #[test]
+    fn optimize_invalidates_cache_on_overlapping_partial_store() {
+        let mut func = make_test_function(vec![
+            // Seed x5 cache.
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Const { value: 7 },
+            WasmInst::I64Store { offset: 40 },
+            // Should use cached local.
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            // Partial static store overlaps bytes [44,46) of x5 slot [40,48).
+            WasmInst::I32Const { value: 0 },
+            WasmInst::I32Store16 { offset: 44 },
+            // Must not reuse stale cache after partial clobber.
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+        ]);
+
+        optimize_function(&mut func);
+
+        let load40_count = func
+            .body
+            .iter()
+            .filter(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40))
+            .count();
+        assert!(load40_count >= 1, "overlapping store must invalidate x5 cache");
     }
 }

@@ -17,6 +17,7 @@ wrong results).
 | **2** | Wasm-internal JIT dispatch | `aot/src/wasm_builder.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js` | 5-50x JIT throughput | Low |
 | **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium |
 | **4** | Trace-driven region prefetch | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Fewer region-miss fallbacks on hot cross-region paths | Low |
+| **5** | Two-tier JIT promotion (fast -> optimized) | `aot/src/translate.rs`, `aot-jit/src/lib.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Faster first-compile with hotter-region quality recovery | Medium |
 
 ---
 
@@ -44,6 +45,46 @@ edges indicate a hot path spanning multiple regions.
 ### 4.3 Required Verification Proof
 
 Keep the Claude proof workload as the phase gate:
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+---
+
+## Phase 5: Two-Tier JIT Promotion (Fast Baseline -> Optimized Recompile)
+
+### 5.1 Problem Statement
+
+A single JIT tier forces a tradeoff: either compile quickly with minimal
+optimization, or compile slower with better code quality. Hot code needs both:
+fast first hit and stronger optimization once it proves hot.
+
+### 5.2 Implementation Summary
+
+- Added fast JIT translation path in `aot/src/translate.rs`:
+  - `translate_jit_fast(...)` (skips optimization pass)
+  - `translate_jit_with_options(...)` for explicit mode selection.
+- Added wasm-bindgen exports in `aot-jit/src/lib.rs`:
+  - `compile_region_fast(...)`
+  - `compile_region_optimized(...)`
+  - existing `compile_region(...)` kept as optimized compatibility entry.
+- Updated `jit_manager.js` to:
+  - compile baseline regions with fast tier,
+  - track per-region hit counts,
+  - promote baseline regions to optimized tier at `optimizeThreshold`,
+  - preserve optimized regions from downgrade.
+- Added runtime controls:
+  - `?nojittier` disables promotion,
+  - `?jitopt=N` sets promotion threshold.
+
+### 5.3 Required Verification Proof
 
 ```bash
 FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \

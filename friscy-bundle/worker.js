@@ -20,6 +20,7 @@ let jitManager = {
     execute() { return null; },
     recordExecution() {},
     recordTraceTransition() {},
+    configureTiering() {},
     configureTrace() {},
 };
 let installInvalidationHook = () => {};
@@ -328,6 +329,8 @@ self.onmessage = async function(e) {
         const netSab = msg.netSab;
         const enableJit = msg.enableJit !== false;
         const jitHotThreshold = Number.isFinite(msg.jitHotThreshold) ? msg.jitHotThreshold : null;
+        const jitTierEnabled = msg.jitTierEnabled !== false;
+        const jitOptimizeThreshold = Number.isFinite(msg.jitOptimizeThreshold) ? msg.jitOptimizeThreshold : null;
         const jitTraceEnabled = msg.jitTraceEnabled !== false;
         const jitEdgeHotThreshold = Number.isFinite(msg.jitEdgeHotThreshold) ? msg.jitEdgeHotThreshold : null;
 
@@ -405,6 +408,10 @@ self.onmessage = async function(e) {
                 if (jitHotThreshold !== null && jitHotThreshold > 0) {
                     jitManager.hotThreshold = jitHotThreshold;
                 }
+                jitManager.configureTiering({
+                    enabled: jitTierEnabled,
+                    optimizeThreshold: jitOptimizeThreshold,
+                });
                 jitManager.configureTrace({
                     enabled: jitTraceEnabled,
                     edgeHotThreshold: jitEdgeHotThreshold,
@@ -412,6 +419,8 @@ self.onmessage = async function(e) {
                 console.log(
                     `[worker] JIT manager loaded ` +
                     `(hotThreshold=${jitManager.hotThreshold ?? 'default'}, ` +
+                    `tiering=${jitManager.tieringEnabled ? 'on' : 'off'}, ` +
+                    `optHot=${jitManager.optimizeThreshold ?? 'default'}, ` +
                     `trace=${jitManager.traceEnabled ? 'on' : 'off'}, ` +
                     `edgeHot=${jitManager.traceEdgeHotThreshold ?? 'default'})`
                 );

@@ -1171,6 +1171,11 @@
             const jitHotThreshold = jitHotThresholdRaw !== null
                 ? Number.parseInt(jitHotThresholdRaw, 10)
                 : null;
+            const jitTierEnabled = !params.has('nojittier');
+            const jitOptimizeThresholdRaw = params.get('jitopt');
+            const jitOptimizeThreshold = jitOptimizeThresholdRaw !== null
+                ? Number.parseInt(jitOptimizeThresholdRaw, 10)
+                : null;
             const jitTraceEnabled = !params.has('nojittrace');
             const jitEdgeHotThresholdRaw = params.get('jitedgehot');
             const jitEdgeHotThreshold = jitEdgeHotThresholdRaw !== null
@@ -1185,6 +1190,8 @@
                 netSab,
                 enableJit,
                 jitHotThreshold: Number.isFinite(jitHotThreshold) ? jitHotThreshold : null,
+                jitTierEnabled,
+                jitOptimizeThreshold: Number.isFinite(jitOptimizeThreshold) ? jitOptimizeThreshold : null,
                 jitTraceEnabled,
                 jitEdgeHotThreshold: Number.isFinite(jitEdgeHotThreshold) ? jitEdgeHotThreshold : null,
             });

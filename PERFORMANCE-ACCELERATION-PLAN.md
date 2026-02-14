@@ -231,6 +231,19 @@ fn test_constant_folding() {
 }
 ```
 
+#### Browser Smoke (Node.js + Claude)
+
+Phase 1 rollout requires a browser-level smoke run to ensure we still boot real
+workloads that exercise the hot translation paths:
+
+```bash
+# Full smoke: Node.js boot + claude --version
+bash ./tests/smoke_phase1_peephole.sh
+
+# Quicker local loop (Node.js only)
+bash ./tests/smoke_phase1_peephole.sh --skip-claude
+```
+
 #### Cheater-Detection: Deterministic Output Programs
 
 These programs have specific, computable correct answers. If an optimization

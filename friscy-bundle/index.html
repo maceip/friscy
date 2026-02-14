@@ -951,17 +951,23 @@
             await workerReady;
 
             // Connect network bridge (optional — needs proxy server)
-            setProgress(-1, 'Connecting network...');
+            // Only connect if ?proxy= URL is explicitly provided, or on localhost
             const proxyUrl = new URLSearchParams(location.search).get('proxy')
-                             || `https://${location.hostname}:4433/connect`;
-            try {
-                updateNetStatus('connecting');
-                netBridge = new FriscyNetworkBridge(proxyUrl);
-                await netBridge.connect();
-                updateNetStatus('connected');
-            } catch (e) {
+                             || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+                                 ? `https://${location.hostname}:4433/connect` : null);
+            if (proxyUrl) {
+                setProgress(-1, 'Connecting network...');
+                try {
+                    updateNetStatus('connecting');
+                    netBridge = new FriscyNetworkBridge(proxyUrl);
+                    await netBridge.connect();
+                    updateNetStatus('connected');
+                } catch (e) {
+                    updateNetStatus('disconnected');
+                    console.warn('[friscy] Network bridge not available:', e.message);
+                }
+            } else {
                 updateNetStatus('disconnected');
-                console.warn('[friscy] Network bridge not available:', e.message);
             }
 
             // Start network RPC host (polls netSab for worker requests)

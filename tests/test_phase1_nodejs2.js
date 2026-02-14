@@ -85,14 +85,27 @@ async function main() {
         let found = false;
 
         while (Date.now() - start < 600000) { // 10 minute timeout
-            const content = await page.evaluate(() => {
-                const el = document.querySelector('.xterm-rows');
-                return el ? el.textContent : '';
-            });
-            const status = await page.evaluate(() => {
-                const el = document.getElementById('status');
-                return el ? el.textContent : '';
-            });
+            let content = '';
+            let status = '';
+            try {
+                content = await page.evaluate(() => {
+                    const el = document.querySelector('.xterm-rows');
+                    return el ? el.textContent : '';
+                });
+                status = await page.evaluate(() => {
+                    const el = document.getElementById('status');
+                    return el ? el.textContent : '';
+                });
+            } catch (err) {
+                const message = err && err.message ? err.message : String(err);
+                // The page occasionally reloads during startup; retry after navigation settles.
+                if (message.includes('Execution context was destroyed') ||
+                    message.includes('Cannot find context with specified id')) {
+                    await new Promise(r => setTimeout(r, 250));
+                    continue;
+                }
+                throw err;
+            }
 
             if (content.includes(MARKER)) {
                 const elapsed = ((Date.now() - start) / 1000).toFixed(1);

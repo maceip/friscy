@@ -1302,7 +1302,8 @@
                 rootfsData: rootfsArray.buffer,
             }, [rootfsArray.buffer]);
 
-            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + document.getElementById('net-status').outerHTML;
+            const netStatusHtml = document.getElementById('net-status')?.outerHTML || '';
+            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + netStatusHtml;
 
             // Auto-run uname -a on Alpine boot — wait until shell is ready (requesting stdin)
             if (activeExample === 'alpine') {
@@ -1694,7 +1695,8 @@
             machineRunning = true;
             const rootfsArray = new Uint8Array(rootfs);
             worker.postMessage({ type: 'run', args, rootfsData: rootfsArray.buffer }, [rootfsArray.buffer]);
-            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + document.getElementById('net-status').outerHTML;
+            const netStatusHtml = document.getElementById('net-status')?.outerHTML || '';
+            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + netStatusHtml;
         }
 
         function debounce(fn, ms) {

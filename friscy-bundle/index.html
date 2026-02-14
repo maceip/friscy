@@ -847,18 +847,11 @@
             // Resolve example-specific config (rootfs, entrypoint, image name)
             const exampleCfg = (activeExample && manifest.examples && manifest.examples[activeExample]) || {};
             const imageName = exampleCfg.image || manifest.image;
-            const fallbackUrl = exampleCfg.rootfs_url || manifest.rootfs_url;
+            const rootfsUrl = exampleCfg.rootfs || manifest.rootfs || './rootfs.tar';
             statusEl.textContent = `Image: ${imageName}`;
 
-            // Download rootfs with progress (local first, then fallback URL)
+            // Download rootfs with progress
             setProgress(0, `Downloading ${imageName}...`, 'Starting download...');
-            let rootfsUrl = './rootfs.tar';
-            {
-                const probe = await fetch(rootfsUrl, { method: 'HEAD' });
-                if (!probe.ok && fallbackUrl) {
-                    rootfsUrl = fallbackUrl;
-                }
-            }
             const rootfs = await fetchWithProgress(rootfsUrl);
 
             // Initialize runtime (indeterminate)

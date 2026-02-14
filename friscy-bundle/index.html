@@ -318,18 +318,19 @@
             overflow: hidden;
         }
         #dual-terminal-container {
-            display: none; flex: 1; gap: 0.5rem;
+            display: none; flex: 1; gap: 0.5rem; min-height: 0;
         }
         #dual-terminal-container.active { display: flex; }
-        .dual-pane { display: flex; flex-direction: column; overflow: hidden; border-radius: 8px; }
+        .dual-pane { display: flex; flex-direction: column; overflow: hidden; border-radius: 8px; min-height: 0; }
         .dual-pane.primary { flex: 2; }
         .dual-pane.companion { flex: 1; }
         .pane-label {
             font-size: 0.7rem; color: #6e7681; padding: 4px 8px;
             background: #161b22; border-bottom: 1px solid #21262d;
             text-transform: uppercase; letter-spacing: 0.05em;
+            flex-shrink: 0;
         }
-        .dual-term { flex: 1; display: flex; overflow: hidden; }
+        .dual-term { flex: 1; display: flex; overflow: hidden; min-height: 0; }
         #reset-btn {
             display: none;
             position: absolute;
@@ -1192,6 +1193,11 @@
                 ? document.getElementById('terminal-server')
                 : terminalEl;
 
+            // Dual container must be visible before xterm.open() so it can measure
+            if (isDual) {
+                document.getElementById('dual-terminal-container').classList.add('active');
+            }
+
             // Initialize xterm.js (hidden behind overlay)
             term = new Terminal({
                 cursorBlink: true,
@@ -1307,14 +1313,14 @@
 
             // Transition: hide progress overlay, show terminal + reset button
             overlayEl.classList.add('hidden');
-            if (isDual) {
-                document.getElementById('dual-terminal-container').classList.add('active');
-            } else {
+            if (!isDual) {
                 terminalEl.style.display = 'flex';
             }
             document.getElementById('reset-btn').style.display = 'block';
             term.focus();
             updateTerminalSize();
+            // Re-fit after layout settles (overlay hidden, flex recalculated)
+            requestAnimationFrame(() => updateTerminalSize());
 
             const rootfsMB = (rootfs.byteLength / 1024 / 1024).toFixed(1);
             term.writeln('\x1b[4:3m\x1b[58;2;255;0;255mRun Docker containers in the browser. friscy cross-compiles Linux containers to RISC-V and executes them in a userland emulator compiled to WebAssembly.\x1b[0m');

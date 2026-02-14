@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // test_phase1_nodejs2.js — Rigorous Node.js boot test
 //
-// Verifies node -e 'console.log(42)' actually runs in the emulator.
-// Uses a unique marker to avoid false positives.
+// Verifies node -e 'console.log("42")' actually runs in the emulator.
 
 import puppeteer from 'puppeteer';
 import { createServer } from 'net';
@@ -56,6 +55,7 @@ async function main() {
     let server = null;
     let browser = null;
     let originalManifest = null;
+    let found = false;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -127,7 +127,6 @@ async function main() {
 
         console.log(`[test] Waiting for output: ${EXPECTED_OUTPUT}`);
         const start = Date.now();
-        let found = false;
 
         while (Date.now() - start < 600000) { // 10 minute timeout
             let content = '';
@@ -183,8 +182,7 @@ async function main() {
         if (!found) {
             console.log(`[FAIL] Did not find ${EXPECTED_OUTPUT} in terminal output`);
         }
-
-        process.exit(found ? 0 : 1);
+        return found;
     } finally {
         if (originalManifest) {
             try { writeFileSync(join(BUNDLE_DIR, 'manifest.json'), originalManifest); } catch {}
@@ -194,4 +192,6 @@ async function main() {
     }
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main()
+    .then(found => process.exit(found ? 0 : 1))
+    .catch(e => { console.error(e); process.exit(1); });

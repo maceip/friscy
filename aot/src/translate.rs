@@ -3115,12 +3115,12 @@ mod tests {
         ]);
 
         optimize_function(&mut func);
-        let first_body = func.body.clone();
+        let first_body_dbg = format!("{:?}", func.body);
         let first_locals = func.num_locals;
 
         optimize_function(&mut func);
 
-        assert_eq!(func.body, first_body);
+        assert_eq!(format!("{:?}", func.body), first_body_dbg);
         assert_eq!(func.num_locals, first_locals);
     }
 }

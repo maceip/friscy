@@ -478,7 +478,7 @@
             ctx.restore();
         }
 
-        // --- Sinusoidal wave: indeterminate mode ---
+        // --- Sinusoidal wave: indeterminate mode (pulsing full-width wave) ---
         function drawSineIndeterminate(ctx, W, H, now, color) {
             const midY = H / 2;
             const amp = SINE_AMP;
@@ -487,9 +487,7 @@
             const step = SINE_STEP;
             const phase = (now / 1000) * SINE_PHASE_SPEED;
 
-            // Continuous forward sweep (3s cycle, ease in-out)
-            const cycle = (now % 3000) / 3000;
-            const fakeProgress = cycle;
+            const fakeProgress = 1; // full width, just animate the wave
             const totalProgressPx = W * fakeProgress;
 
             ctx.save();
@@ -590,8 +588,7 @@
         // --- Squiggly (bezier) wave: indeterminate mode ---
         function drawSquigglyIndeterminate(ctx, W, H, now, color) {
             const midY = H / 2;
-            const cycle = (now % 3000) / 3000;
-            const fakeProgress = cycle;
+            const fakeProgress = 1; // full width, just animate the wave
             const totalProgressPx = W * fakeProgress;
             const waveStart = -sqPhaseOffset - SQ_WAVE_LENGTH / 2;
             const path = buildWavePath(waveStart, W, totalProgressPx, true);

@@ -81,27 +81,12 @@
             font-variant-numeric: tabular-nums;
         }
 
-        /* Test wave strips: always visible top-left and top-right */
-        .test-waves {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex: 1;
-            margin: 0 1rem;
-            gap: 0.5rem;
+        .header-logo {
+            height: 24px;
+            opacity: 0.7;
+            margin-left: 1rem;
         }
-        .test-wave-label {
-            font-size: 0.6rem;
-            color: #586069;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            white-space: nowrap;
-        }
-        .test-wave-canvas {
-            height: 18px;
-            flex: 1;
-            max-width: 200px;
-        }
+        .header-logo:hover { opacity: 1; }
         .terminal-actions button {
             background-color: #0f3460;
             color: #eee;
@@ -123,16 +108,11 @@
             <h1>friscy container</h1>
             <div class="status" id="status">Loading...<span id="net-status" class="net-status disconnected">net: off</span></div>
         </div>
-        <div class="test-waves">
-            <span class="test-wave-label">sine</span>
-            <canvas id="test-sine-canvas" class="test-wave-canvas"></canvas>
-            <canvas id="test-squiggly-canvas" class="test-wave-canvas"></canvas>
-            <span class="test-wave-label">squiggly</span>
-        </div>
         <div class="terminal-actions">
             <button id="fit-button">Fit Terminal</button>
             <button id="reset-button">Reset</button>
         </div>
+        <img src="./riscv-logo.png" alt="RISC-V" class="header-logo">
     </header>
     <div id="terminal-container">
         <div id="progress-overlay">
@@ -144,7 +124,23 @@
         <div id="terminal" style="display:none;"></div>
     </div>
 
-    <!-- Register service worker -->
+    <!-- Cross-origin isolation service worker (for GitHub Pages / hosts without COOP/COEP headers) -->
+    <script>
+        if (!crossOriginIsolated && 'serviceWorker' in navigator) {
+            navigator.serviceWorker.register('./coi-serviceworker.js').then(reg => {
+                console.log('COI service worker registered, reloading for isolation...');
+                reg.addEventListener('updatefound', () => {
+                    const sw = reg.installing;
+                    sw.addEventListener('statechange', () => {
+                        if (sw.state === 'activated') location.reload();
+                    });
+                });
+                if (reg.active) location.reload();
+            });
+        }
+    </script>
+
+    <!-- Register cache service worker -->
     <script>
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
@@ -305,12 +301,6 @@
         // Main progress bar uses squiggly for page load
         let waveMode = 'squiggly';
 
-        // Test wave canvases (always visible in header)
-        const testSineCanvas = document.getElementById('test-sine-canvas');
-        const testSineCtx = testSineCanvas.getContext('2d');
-        const testSquigglyCanvas = document.getElementById('test-squiggly-canvas');
-        const testSquigglyCtx = testSquigglyCanvas.getContext('2d');
-
         // SquigglyProgress — ported from Android SystemUI SquigglyProgress.kt
         // All measurements in CSS pixels (DPI-scaled automatically on canvas)
         const SQ_WAVE_LENGTH = 32;     // CSS px, one full wave period
@@ -354,9 +344,6 @@
             }
         }
         setupCanvasDPI(waveCanvas, waveCtx);
-        setupCanvasDPI(testSineCanvas, testSineCtx);
-        setupCanvasDPI(testSquigglyCanvas, testSquigglyCtx);
-
         // Helper: clamp-lerp inverse (lerpInvSat)
         function lerpInvSat(a, b, v) {
             return Math.max(0, Math.min(1, (v - a) / (b - a)));
@@ -673,20 +660,6 @@
                 }
             }
 
-            // --- Test sine canvas (top-left in header) ---
-            {
-                const { W, H } = ensureCanvasDPI(testSineCanvas, testSineCtx);
-                testSineCtx.clearRect(0, 0, W, H);
-                drawSineProgress(testSineCtx, W, H, now, progress, color);
-            }
-
-            // --- Test squiggly canvas (top-right in header) ---
-            {
-                const { W, H } = ensureCanvasDPI(testSquigglyCanvas, testSquigglyCtx);
-                testSquigglyCtx.clearRect(0, 0, W, H);
-                drawSquigglyProgress(testSquigglyCtx, W, H, now, progress, color);
-            }
-
             waveAnimId = requestAnimationFrame(drawWave);
         }
 
@@ -861,7 +834,14 @@
 
             // Download rootfs with progress
             setProgress(0, `Downloading ${manifest.image}...`, 'Starting download...');
-            const rootfs = await fetchWithProgress('./rootfs.tar');
+            let rootfsUrl = './rootfs.tar';
+            {
+                const probe = await fetch(rootfsUrl, { method: 'HEAD' });
+                if (!probe.ok && manifest.rootfs_url) {
+                    rootfsUrl = manifest.rootfs_url;
+                }
+            }
+            const rootfs = await fetchWithProgress(rootfsUrl);
 
             // Initialize runtime (indeterminate)
             setProgress(-1, 'Initializing runtime...');

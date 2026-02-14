@@ -20,6 +20,8 @@ const NODE_EVAL = process.env.FRISCY_TEST_NODE_EVAL || 'console.log("42")';
 const EXPECTED_OUTPUT = process.env.FRISCY_TEST_EXPECTED_OUTPUT || '42';
 const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './rootfs.tar';
 const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '';
+const WAIT_FOR_EXIT = process.env.FRISCY_TEST_WAIT_FOR_EXIT === '1';
+const METRIC_WAIT_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_METRIC_WAIT_TIMEOUT_MS || '30000', 10);
 
 async function canBindPort(port) {
     return new Promise((resolve) => {
@@ -59,6 +61,7 @@ async function main() {
     let instructionCount = null;
     let found = false;
     let elapsedSeconds = null;
+    let foundAtMs = null;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -100,6 +103,7 @@ async function main() {
         console.log(`[test] Node eval: ${NODE_EVAL}`);
         console.log(`[test] Expected output: ${EXPECTED_OUTPUT}`);
         console.log(`[test] Page query: ${PAGE_QUERY || '(none)'}`);
+        console.log(`[test] Wait for exit metrics: ${WAIT_FOR_EXIT ? 'yes' : 'no'}`);
         console.log(`[test] Server on :${port}`);
 
         browser = await puppeteer.launch({
@@ -159,11 +163,15 @@ async function main() {
                 throw err;
             }
 
-            if (content.includes(EXPECTED_OUTPUT)) {
+            if (!found && content.includes(EXPECTED_OUTPUT)) {
                 elapsedSeconds = Number(((Date.now() - start) / 1000).toFixed(3));
                 console.log(`[PASS] Node.js produced output in ${elapsedSeconds}s`);
                 found = true;
-                break;
+                foundAtMs = Date.now();
+                if (!WAIT_FOR_EXIT) {
+                    break;
+                }
+                console.log('[test] Output observed; waiting for completion metrics...');
             }
 
             if (status.includes('Error')) {
@@ -171,7 +179,19 @@ async function main() {
                 break;
             }
 
-            if (status.includes('Exited')) {
+            if (found && WAIT_FOR_EXIT) {
+                const metricWaitElapsed = Date.now() - (foundAtMs || start);
+                if (status.includes('Exited')) {
+                    break;
+                }
+                if (instructionCount !== null && metricWaitElapsed >= 1000) {
+                    break;
+                }
+                if (metricWaitElapsed >= METRIC_WAIT_TIMEOUT_MS) {
+                    console.log('[test] Metric wait timeout reached; continuing without full completion stats');
+                    break;
+                }
+            } else if (status.includes('Exited')) {
                 // Machine exited — dump terminal content
                 console.log('[INFO] Machine exited. Status:', status);
                 console.log('[INFO] Terminal content (first 1000 chars):');

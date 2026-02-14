@@ -89,6 +89,7 @@ for i in $(seq 1 "$RUNS"); do
         FRISCY_TEST_NODE_EVAL='console.log("42")' \
         FRISCY_TEST_EXPECTED_OUTPUT='42' \
         FRISCY_TEST_QUERY="$PAGE_QUERY" \
+        FRISCY_TEST_WAIT_FOR_EXIT=1 \
         node --experimental-default-type=module ./tests/test_phase1_nodejs2.js
     ) >"$LOG_FILE" 2>&1; then
         echo "[bench] ERROR: run ${i} failed. Full log:"

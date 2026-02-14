@@ -6,20 +6,21 @@
 // Architecture:
 //   1. Interpreter runs RISC-V code, calls machine.stop() at certain PCs
 //   2. JS resume loop checks JIT map before calling friscy_resume()
-//   3. If JIT'd function exists for current PC, call it directly
-//   4. JIT'd function returns next PC (or syscall marker)
-//   5. JS dispatches: chain to next JIT'd block, or fall back to interpreter
+//   3. If JIT'd region exists for current PC, call region.run(m, pc)
+//   4. run() chains blocks internally inside Wasm
+//   5. JS falls back only on syscall / halt / region miss
 //
 // Protocol:
-//   - Block functions: (param $m i32) -> (result i32)
-//   - Return < 0x80000000: next PC to execute
-//   - Return >= 0x80000000: syscall (pass to friscy_resume with high bit)
+//   - run function: (param $m i32, $start_pc i32) -> (result i32)
 //   - Return == -1 (0xFFFFFFFF): halt
+//   - Return with high bit set: syscall marker (0x80000000 | pc)
+//   - Otherwise: region miss PC (fallback to interpreter/other region)
 
 class JITManager {
     constructor() {
-        // Map<pc_address, { wasmFunc, module, instance, hitCount }>
-        this.compiledBlocks = new Map();
+        // Map<region_base, { run, instance, regionStart, regionEnd }>
+        this.compiledRegions = new Map();
+        this.compilingRegions = new Set();
 
         // Execution counters for hot-region detection
         // Map<page_address, count>
@@ -47,6 +48,8 @@ class JITManager {
             jitHits: 0,
             jitMisses: 0,
             compilationTimeMs: 0,
+            dispatchCalls: 0,
+            regionMisses: 0,
         };
 
         // Invalidation bitmap (1 bit per 4KB page)
@@ -88,10 +91,12 @@ class JITManager {
      * Returns true if this PC now has a JIT'd function available.
      */
     recordExecution(pc) {
-        const page = (pc >>> 0) & ~(this.pageSize - 1);
+        const upc = pc >>> 0;
+        const page = upc & ~(this.pageSize - 1);
+        const regionBase = upc & ~(this.regionSize - 1);
 
         // Already compiled?
-        if (this.compiledBlocks.has(pc)) {
+        if (this.compiledRegions.has(regionBase)) {
             this.stats.jitHits++;
             return true;
         }
@@ -101,10 +106,13 @@ class JITManager {
         this.pageHitCounts.set(page, count);
 
         if (count >= this.hotThreshold && this.jitCompiler) {
+            const hotRegionBase = page & ~(this.regionSize - 1);
             // Don't block — compile async and use on next hit
-            this.compileRegion(page).catch(e => {
-                console.warn(`[JIT] Compile failed for 0x${page.toString(16)}:`, e.message);
-            });
+            if (!this.compiledRegions.has(hotRegionBase) && !this.compilingRegions.has(hotRegionBase)) {
+                this.compileRegion(hotRegionBase).catch(e => {
+                    console.warn(`[JIT] Compile failed for 0x${hotRegionBase.toString(16)}:`, e.message);
+                });
+            }
         }
 
         this.stats.jitMisses++;
@@ -112,40 +120,47 @@ class JITManager {
     }
 
     /**
-     * Try to get a JIT'd function for a given PC.
-     * Returns the Wasm function or null.
+     * Try to get a compiled region for a given PC.
+     * Returns region entry or null.
      */
-    getCompiledFunction(pc) {
-        const entry = this.compiledBlocks.get(pc);
+    getCompiledRegion(pc) {
+        const upc = pc >>> 0;
+        const regionBase = upc & ~(this.regionSize - 1);
+        const entry = this.compiledRegions.get(regionBase);
         if (!entry) return null;
 
-        // Check if the page has been dirtied (invalidated)
-        const page = (pc >>> 0) & ~(this.pageSize - 1);
-        if (this.dirtyPages.has(page)) {
-            this.invalidatePage(page);
-            return null;
+        // Invalidate eagerly if any page in the region was dirtied.
+        for (let page = entry.regionStart; page < entry.regionEnd; page += this.pageSize) {
+            const normPage = page >>> 0;
+            if (this.dirtyPages.has(normPage)) {
+                this.invalidatePage(normPage);
+                return null;
+            }
         }
 
-        return entry.wasmFunc;
+        return entry;
     }
 
     /**
-     * Execute a JIT'd function for the given PC.
-     * Returns { nextPC, isSyscall, isHalt }
+     * Execute a JIT region for the given PC.
+     * Returns { nextPC, isSyscall, isHalt, regionMiss? } or null.
      */
     execute(pc, machineStatePtr) {
-        const func = this.getCompiledFunction(pc);
-        if (!func) return null;
+        const region = this.getCompiledRegion(pc);
+        if (!region) return null;
 
-        const result = func(machineStatePtr);
+        this.stats.dispatchCalls++;
+        const result = region.run(machineStatePtr, pc >>> 0);
+        const value = result >>> 0;
 
-        if (result === -1 || result === 0xFFFFFFFF) {
+        if (value === 0xFFFFFFFF) {
             return { nextPC: 0, isSyscall: false, isHalt: true };
         }
-        if ((result & 0x80000000) !== 0) {
-            return { nextPC: result, isSyscall: true, isHalt: false };
+        if ((value & 0x80000000) !== 0) {
+            return { nextPC: value & 0x7FFFFFFF, isSyscall: true, isHalt: false };
         }
-        return { nextPC: result, isSyscall: false, isHalt: false };
+        this.stats.regionMisses++;
+        return { nextPC: value, isSyscall: false, isHalt: false, regionMiss: true };
     }
 
     /**
@@ -154,54 +169,57 @@ class JITManager {
     async compileRegion(pageAddr) {
         if (!this.jitCompiler || !this.wasmMemory) return;
 
-        const start = performance.now();
-
-        // Read RISC-V bytes from the emulator's linear memory
-        const memBuffer = new Uint8Array(this.wasmMemory.buffer);
-        const regionStart = pageAddr;
-        const regionEnd = Math.min(regionStart + this.regionSize, memBuffer.length);
-        const codeBytes = memBuffer.slice(regionStart, regionEnd);
-
-        // Compile to Wasm via rv2wasm
-        let wasmBytes;
-        try {
-            wasmBytes = this.jitCompiler.compile_region(codeBytes, regionStart);
-        } catch (e) {
-            // Compilation can fail for regions with unsupported instructions
+        const regionStart = (pageAddr >>> 0) & ~(this.regionSize - 1);
+        if (this.compiledRegions.has(regionStart) || this.compilingRegions.has(regionStart)) {
             return;
         }
+        this.compilingRegions.add(regionStart);
 
-        // Instantiate the compiled Wasm module with shared memory
-        const importObject = {
-            env: {
-                memory: this.wasmMemory,
-            },
-        };
+        const start = performance.now();
+        try {
+            // Read RISC-V bytes from the emulator's linear memory
+            const memBuffer = new Uint8Array(this.wasmMemory.buffer);
+            const regionEnd = Math.min(regionStart + this.regionSize, memBuffer.length);
+            const codeBytes = memBuffer.slice(regionStart, regionEnd);
 
-        const { instance } = await WebAssembly.instantiate(wasmBytes, importObject);
-
-        // Register all exported block functions
-        for (const [name, func] of Object.entries(instance.exports)) {
-            if (typeof func === 'function' && name.startsWith('block_')) {
-                const addr = parseInt(name.substring(6), 16);
-                if (!isNaN(addr)) {
-                    this.compiledBlocks.set(addr, {
-                        wasmFunc: func,
-                        instance,
-                        regionStart,
-                    });
-                }
+            // Compile to Wasm via rv2wasm
+            let wasmBytes;
+            try {
+                wasmBytes = this.jitCompiler.compile_region(codeBytes, regionStart);
+            } catch (e) {
+                // Compilation can fail for regions with unsupported instructions.
+                return;
             }
+
+            // Instantiate the compiled Wasm module with shared memory.
+            const importObject = {
+                env: {
+                    memory: this.wasmMemory,
+                },
+            };
+            const { instance } = await WebAssembly.instantiate(wasmBytes, importObject);
+            if (typeof instance.exports.run !== 'function') {
+                throw new Error('compiled JIT module missing run export');
+            }
+
+            this.compiledRegions.set(regionStart, {
+                run: instance.exports.run,
+                instance,
+                regionStart,
+                regionEnd,
+            });
+
+            const elapsed = performance.now() - start;
+            this.stats.regionsCompiled++;
+            this.stats.compilationTimeMs += elapsed;
+
+            console.log(
+                `[JIT] Compiled region 0x${regionStart.toString(16)} ` +
+                `(${regionEnd - regionStart} bytes, ${elapsed.toFixed(1)}ms)`
+            );
+        } finally {
+            this.compilingRegions.delete(regionStart);
         }
-
-        const elapsed = performance.now() - start;
-        this.stats.regionsCompiled++;
-        this.stats.compilationTimeMs += elapsed;
-
-        console.log(
-            `[JIT] Compiled region 0x${pageAddr.toString(16)} ` +
-            `(${Object.keys(instance.exports).length} blocks, ${elapsed.toFixed(1)}ms)`
-        );
     }
 
     /**
@@ -219,14 +237,14 @@ class JITManager {
         const page = pageAddr & ~(this.pageSize - 1);
         const toDelete = [];
 
-        for (const [pc, entry] of this.compiledBlocks) {
-            if ((pc & ~(this.pageSize - 1)) === page) {
-                toDelete.push(pc);
+        for (const [regionBase, entry] of this.compiledRegions) {
+            if (page >= entry.regionStart && page < entry.regionEnd) {
+                toDelete.push(regionBase);
             }
         }
 
-        for (const pc of toDelete) {
-            this.compiledBlocks.delete(pc);
+        for (const regionBase of toDelete) {
+            this.compiledRegions.delete(regionBase);
         }
 
         this.dirtyPages.delete(page);
@@ -234,7 +252,7 @@ class JITManager {
 
         if (toDelete.length > 0) {
             console.log(
-                `[JIT] Invalidated ${toDelete.length} blocks in page 0x${page.toString(16)}`
+                `[JIT] Invalidated ${toDelete.length} region(s) for page 0x${page.toString(16)}`
             );
         }
     }
@@ -245,7 +263,7 @@ class JITManager {
     getStats() {
         return {
             ...this.stats,
-            compiledBlockCount: this.compiledBlocks.size,
+            compiledRegionCount: this.compiledRegions.size,
             hotPages: this.pageHitCounts.size,
             dirtyPages: this.dirtyPages.size,
         };
@@ -255,7 +273,8 @@ class JITManager {
      * Reset all JIT state (e.g., after execve).
      */
     reset() {
-        this.compiledBlocks.clear();
+        this.compiledRegions.clear();
+        this.compilingRegions.clear();
         this.pageHitCounts.clear();
         this.dirtyPages.clear();
         this.stats = {
@@ -263,6 +282,8 @@ class JITManager {
             jitHits: 0,
             jitMisses: 0,
             compilationTimeMs: 0,
+            dispatchCalls: 0,
+            regionMisses: 0,
         };
     }
 }

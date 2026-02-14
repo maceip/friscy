@@ -243,21 +243,48 @@ function runResumeLoop() {
             }
         }
 
-        // Try JIT execution before falling back to interpreter
-        let jitHandled = false;
+        // Try JIT execution before falling back to interpreter.
+        // The JIT run() function chains blocks inside Wasm and returns only on:
+        //   - halt
+        //   - syscall
+        //   - region miss (PC not compiled in this region)
         if (jitManager.jitCompiler) {
-            const pc = friscy_get_pc();
-            const jitResult = jitManager.execute(pc, friscy_get_state_ptr());
-            if (jitResult) {
-                jitHandled = true;
-                if (jitResult.isHalt) return;
-                if (jitResult.isSyscall) {
-                    friscy_set_pc(jitResult.nextPC & 0x7FFFFFFF);
-                } else {
-                    friscy_set_pc(jitResult.nextPC);
+            let pc = friscy_get_pc() >>> 0;
+            const statePtr = friscy_get_state_ptr();
+            const MAX_CHAIN = 32;
+            let chainCount = 0;
+
+            while (chainCount < MAX_CHAIN) {
+                const jitResult = jitManager.execute(pc, statePtr);
+                if (!jitResult) {
+                    // No compiled region for this PC. Keep interpreter PC aligned
+                    // with the latest miss target before falling back.
+                    jitManager.recordExecution(pc);
+                    friscy_set_pc(pc);
+                    break;
                 }
-            } else {
-                jitManager.recordExecution(pc);
+
+                if (jitResult.isHalt) return;
+
+                if (jitResult.isSyscall) {
+                    friscy_set_pc(jitResult.nextPC >>> 0);
+                    break;
+                }
+
+                if (jitResult.regionMiss) {
+                    pc = jitResult.nextPC >>> 0;
+                    chainCount++;
+                    continue;
+                }
+
+                // Defensive fallback: unexpected plain return.
+                friscy_set_pc(jitResult.nextPC >>> 0);
+                break;
+            }
+
+            // Avoid getting stuck in pathological miss cycles.
+            if (chainCount >= MAX_CHAIN) {
+                friscy_set_pc(pc >>> 0);
             }
         }
 

@@ -13,7 +13,8 @@ use wasm_bindgen::prelude::*;
 /// binary that can be instantiated with `WebAssembly.instantiate()`.
 ///
 /// The returned Wasm module imports shared memory from "env"/"memory" and
-/// exports block functions that read/write registers via linear memory.
+/// exports a `run(m, pc)` dispatch function that chains compiled blocks
+/// internally and returns only on syscall/halt/cache miss.
 #[wasm_bindgen]
 pub fn compile_region(code: &[u8], base_addr: u32) -> Result<Vec<u8>, JsValue> {
     compile_region_inner(code, base_addr)

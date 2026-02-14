@@ -18,6 +18,7 @@ const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './nodejs.tar';
 const CLAUDE_CMD = process.env.FRISCY_TEST_CLAUDE_CMD || '/usr/bin/node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --version';
 const EXPECTED_OUTPUT = process.env.FRISCY_TEST_EXPECTED_OUTPUT || 'Claude Code';
 const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '?noproxy';
+const VERSION_REGEX = /\b\d+\.\d+\.\d+\s+\(Claude Code\)\b/;
 
 async function canBindPort(port) {
     return new Promise((resolve) => {
@@ -61,6 +62,8 @@ async function main() {
     let originalManifest = null;
     let jitCompilerLoaded = false;
     let jitRegionsCompiled = 0;
+    let instructionCount = null;
+    let guestExitCode = null;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -129,6 +132,14 @@ async function main() {
             if (text.includes('[JIT] Compiled region')) {
                 jitRegionsCompiled += 1;
             }
+            const instMatch = text.match(/Instructions:\s*([0-9]+)/);
+            if (instMatch) {
+                instructionCount = Number.parseInt(instMatch[1], 10);
+            }
+            const guestExitMatch = text.match(/Exit code:\s*([0-9]+)/);
+            if (guestExitMatch) {
+                guestExitCode = Number.parseInt(guestExitMatch[1], 10);
+            }
             console.log(`[chrome] [${msg.type()}] ${text}`);
         });
         page.on('pageerror', err => {
@@ -195,13 +206,32 @@ async function main() {
         console.log(termData.slice(0, 1200));
         console.log(`=== END (${termData.length} chars) ===\n`);
 
+        const matchedVersion = VERSION_REGEX.test(termData);
+        const hasModuleError =
+            termData.includes('MODULE_NOT_FOUND') ||
+            termData.includes('Cannot find module') ||
+            termData.includes('[worker] Error:');
+        const pass =
+            found &&
+            matchedVersion &&
+            !hasModuleError &&
+            guestExitCode === 0;
+
         console.log(`"${EXPECTED_OUTPUT}" found: ${found}`);
+        console.log(`[METRIC] claude_version_match=${matchedVersion ? 1 : 0}`);
+        console.log(`[METRIC] guest_exit_code=${guestExitCode ?? -1}`);
+        console.log(`[METRIC] instructions=${instructionCount ?? -1}`);
         console.log(`[METRIC] jit_compiler_loaded=${jitCompilerLoaded ? 1 : 0}`);
         console.log(`[METRIC] jit_regions_compiled=${jitRegionsCompiled}`);
         const elapsed = ((Date.now() - start) / 1000).toFixed(1);
         console.log(`Total time: ${elapsed}s`);
 
-        return found ? 0 : 1;
+        if (!pass) {
+            if (!matchedVersion) console.log('[FAIL] missing semantic Claude version line');
+            if (guestExitCode !== 0) console.log(`[FAIL] guest exit code is not 0: ${guestExitCode}`);
+            if (hasModuleError) console.log('[FAIL] detected module/runtime error in terminal output');
+        }
+        return pass ? 0 : 1;
     } finally {
         if (originalManifest) {
             try { writeFileSync(join(BUNDLE_DIR, 'manifest.json'), originalManifest); } catch {}

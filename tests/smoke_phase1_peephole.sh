@@ -35,6 +35,22 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
+ROOTFS="$PROJECT_DIR/friscy-bundle/rootfs.tar"
+if [[ ! -f "$ROOTFS" ]]; then
+    echo "[smoke] ERROR: missing rootfs: $ROOTFS"
+    exit 1
+fi
+
+if ! tar -tf "$ROOTFS" 2>/dev/null | grep -Eq '(^|/)(usr/bin/node)$'; then
+    echo "[smoke] ERROR: rootfs does not contain /usr/bin/node (Node.js smoke prerequisite)"
+    exit 1
+fi
+
+if $RUN_CLAUDE && ! tar -tf "$ROOTFS" 2>/dev/null | grep -Eq '(^|/)(usr/bin/claude)$'; then
+    echo "[smoke] ERROR: rootfs does not contain /usr/bin/claude (Claude smoke prerequisite)"
+    exit 1
+fi
+
 NODE_OPTS=(--experimental-default-type=module)
 
 echo "[smoke] Phase 1 peephole smoke: Node.js boot"

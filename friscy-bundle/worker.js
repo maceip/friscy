@@ -10,7 +10,16 @@
 // This eliminates JSPI and setTimeout polling -- the worker can block freely
 // on Atomics.wait() without freezing the browser UI.
 
-import jitManager, { installInvalidationHook } from './jit_manager.js';
+// Lazy-load JIT manager (non-critical — Worker must not fail if unavailable)
+let jitManager = { jitCompiler: null, init() {}, loadCompiler() { return Promise.resolve(); }, execute() { return null; }, recordExecution() {} };
+let installInvalidationHook = () => {};
+try {
+    const jitMod = await import('./jit_manager.js');
+    jitManager = jitMod.default;
+    installInvalidationHook = jitMod.installInvalidationHook;
+} catch (e) {
+    console.warn('[worker] JIT manager not available:', e.message);
+}
 
 // Control SAB layout (4KB):
 //   [0]   i32: command   (0=idle, 1=stdout, 2=stdin_request, 3=stdin_ready,
@@ -266,6 +275,16 @@ function runResumeLoop() {
     }
 }
 
+// Global error handler — surface errors to main thread
+self.addEventListener('error', (e) => {
+    console.error('[worker] Uncaught error:', e.message, e.filename, e.lineno);
+    self.postMessage({ type: 'error', message: `${e.message} (${e.filename}:${e.lineno})` });
+});
+self.addEventListener('unhandledrejection', (e) => {
+    console.error('[worker] Unhandled rejection:', e.reason);
+    self.postMessage({ type: 'error', message: String(e.reason) });
+});
+
 // Handle messages from main thread
 self.onmessage = async function(e) {
     const msg = e.data;
@@ -290,6 +309,12 @@ self.onmessage = async function(e) {
         // Store initial terminal dimensions from control SAB
         const initCols = Atomics.load(controlView, 6); // offset 24
         const initRows = Atomics.load(controlView, 7); // offset 28
+
+        console.log('[worker] crossOriginIsolated:', self.crossOriginIsolated);
+        console.log('[worker] SharedArrayBuffer available:', typeof SharedArrayBuffer !== 'undefined');
+        if (!self.crossOriginIsolated) {
+            throw new Error('Worker not cross-origin isolated — COOP/COEP headers missing. SharedArrayBuffer unavailable.');
+        }
 
         console.log('[worker] Loading Emscripten module...');
         // Load Emscripten module (ES module import)

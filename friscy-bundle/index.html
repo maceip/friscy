@@ -915,11 +915,16 @@
 
             // Wait for Worker to be ready
             const workerReady = new Promise((resolve, reject) => {
-                worker.onmessage = (e) => {
-                    if (e.data.type === 'ready') resolve();
-                    if (e.data.type === 'error') reject(new Error(`Worker init failed: ${e.data.message}`));
+                const onMsg = (e) => {
+                    if (e.data.type === 'ready') { resolve(); worker.onmessage = null; }
+                    if (e.data.type === 'error') reject(new Error(`Worker: ${e.data.message}`));
                 };
-                worker.onerror = (e) => reject(new Error(e.message));
+                worker.onmessage = onMsg;
+                worker.onerror = (e) => {
+                    const detail = e.message || `${e.filename || 'worker.js'}:${e.lineno || '?'}`;
+                    console.error('[main] Worker error:', detail, e);
+                    reject(new Error(`Worker failed: ${detail}`));
+                };
             });
 
             // Send init message with SABs
@@ -1068,6 +1073,9 @@
         main().catch(e => {
             console.error(e);
             statusEl.textContent = 'Error: ' + e.message;
+            stageEl.textContent = 'Error';
+            detailEl.textContent = e.message;
+            waveColor = ERR_COLOR;
         });
     </script>
 </body>

@@ -59,6 +59,8 @@ async function main() {
     let server = null;
     let browser = null;
     let originalManifest = null;
+    let jitCompilerLoaded = false;
+    let jitRegionsCompiled = 0;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -121,11 +123,13 @@ async function main() {
 
         page.on('console', msg => {
             const text = msg.text();
-            if (text.includes('error') || text.includes('Error') ||
-                text.includes('[JIT]') ||
-                text.includes(EXPECTED_OUTPUT) || text.includes('Instructions') ||
-                text.includes('Exit code') || text.includes('Execution complete'))
-                console.log(`[chrome] [${msg.type()}] ${text}`);
+            if (text.includes('[JIT] Compiler loaded')) {
+                jitCompilerLoaded = true;
+            }
+            if (text.includes('[JIT] Compiled region')) {
+                jitRegionsCompiled += 1;
+            }
+            console.log(`[chrome] [${msg.type()}] ${text}`);
         });
         page.on('pageerror', err => {
             console.log(`[chrome-error] ${err.message}`);
@@ -192,6 +196,8 @@ async function main() {
         console.log(`=== END (${termData.length} chars) ===\n`);
 
         console.log(`"${EXPECTED_OUTPUT}" found: ${found}`);
+        console.log(`[METRIC] jit_compiler_loaded=${jitCompilerLoaded ? 1 : 0}`);
+        console.log(`[METRIC] jit_regions_compiled=${jitRegionsCompiled}`);
         const elapsed = ((Date.now() - start) / 1000).toFixed(1);
         console.log(`Total time: ${elapsed}s`);
 

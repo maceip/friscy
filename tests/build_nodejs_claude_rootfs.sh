@@ -61,8 +61,11 @@ exec /usr/bin/node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js "$@"
 EOF
 chmod 755 "$OVERLAY/usr/bin/claude"
 
-cp "$BASE_ROOTFS" "$OUT_ROOTFS"
-tar --append -f "$OUT_ROOTFS" -C "$OVERLAY" .
+ROOTFS_TREE="$TMP_DIR/rootfs_tree"
+mkdir -p "$ROOTFS_TREE"
+tar -xf "$BASE_ROOTFS" -C "$ROOTFS_TREE"
+cp -a "$OVERLAY/." "$ROOTFS_TREE/"
+tar -cf "$OUT_ROOTFS" -C "$ROOTFS_TREE" .
 
 if ! tar -tf "$OUT_ROOTFS" 2>/dev/null | rg -q '(^|/)(usr/bin/claude)$'; then
     echo "[build-claude-rootfs] ERROR: output rootfs missing /usr/bin/claude"

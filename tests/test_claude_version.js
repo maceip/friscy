@@ -15,7 +15,7 @@ const BUNDLE_DIR = join(PROJECT_ROOT, 'friscy-bundle');
 
 const REQUESTED_PORT = Number.parseInt(process.env.FRISCY_TEST_PORT || '8099', 10);
 const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './nodejs.tar';
-const CLAUDE_CMD = process.env.FRISCY_TEST_CLAUDE_CMD || '/usr/bin/claude --version';
+const CLAUDE_CMD = process.env.FRISCY_TEST_CLAUDE_CMD || '/usr/bin/node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --version';
 const EXPECTED_OUTPUT = process.env.FRISCY_TEST_EXPECTED_OUTPUT || 'Claude Code';
 const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '?noproxy';
 

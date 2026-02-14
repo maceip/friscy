@@ -98,26 +98,46 @@
             color: #8b949e;
             line-height: 1.4;
         }
-        .example-bar {
+        .tab-bar {
             display: flex;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            background: #16213e;
-            border-bottom: 1px solid #0f3460;
+            padding: 0 1rem;
+            padding-top: 0.4rem;
+            gap: 2px;
+            align-items: flex-end;
         }
-        .example-bar button {
-            background-color: #0f3460;
-            color: #eee;
-            border: none;
-            padding: 0.4rem 0.8rem;
-            border-radius: 5px;
+        .tab {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            background: #0d1117;
+            color: #8b949e;
+            border: 1px solid #30363d;
+            border-bottom: none;
+            border-radius: 8px 8px 0 0;
             cursor: pointer;
             font-size: 0.8rem;
+            font-family: inherit;
+            position: relative;
+            bottom: -1px;
+            transition: background 0.2s, color 0.2s;
         }
-        .example-bar button:hover { background-color: #1a3a6e; }
-        .example-bar button.active {
-            background-color: #1a4d2e;
-            color: #98c379;
+        .tab:hover { background: #161b22; color: #c9d1d9; }
+        .tab.active {
+            background: #1a1a2e;
+            color: #e6edf3;
+            border-color: #30363d;
+            z-index: 1;
+        }
+        .tab-icon {
+            width: 16px;
+            height: 16px;
+            flex-shrink: 0;
+        }
+        .tab-strip-border {
+            height: 0;
+            border-bottom: 1px solid #30363d;
+            margin: 0 1rem;
         }
         #terminal-wrapper {
             position: relative;
@@ -154,6 +174,21 @@
         </div>
         <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
     </header>
+    <div class="description">
+        Run Docker containers in the browser. friscy cross-compiles Linux containers to RISC-V and executes them in a userland emulator compiled to WebAssembly.
+    </div>
+    <div class="tab-bar">
+        <button class="tab active" id="tab-alpine" data-example="alpine" title="Alpine Linux shell">
+            <img src="./alpine-icon.svg" alt="" class="tab-icon">Alpine
+        </button>
+        <button class="tab" id="tab-nodejs" data-example="nodejs" title="Interactive Node.js REPL">
+            <img src="./nodejs-icon.svg" alt="" class="tab-icon">Node.js
+        </button>
+        <button class="tab" id="tab-server" data-example="server" title="HTTP echo server on port 8080">
+            <img src="./go-icon.svg" alt="" class="tab-icon">Go Server
+        </button>
+    </div>
+    <div class="tab-strip-border"></div>
     <div id="terminal-container">
         <div id="progress-overlay">
             <div class="progress-title">friscy</div>
@@ -165,14 +200,6 @@
             <button id="reset-btn" title="Reset">&#x21bb;</button>
             <div id="terminal" style="display:none;"></div>
         </div>
-    </div>
-    <div class="description">
-        Run Docker containers in the browser. friscy cross-compiles Linux containers to RISC-V and executes them in a userland emulator compiled to WebAssembly.
-    </div>
-    <div class="example-bar">
-        <button id="example-alpine" title="Alpine Linux shell">Load Alpine</button>
-        <button id="example-nodejs" title="Interactive Node.js REPL">Load Node.js</button>
-        <button id="example-server" title="HTTP echo server on port 8080">Load Server</button>
     </div>
 
     <!-- Service worker: caching + COOP/COEP for cross-origin isolation -->
@@ -1070,13 +1097,15 @@
             statusEl.textContent = 'Interactive';
         }
 
-        // --- Example preset buttons ---
+        // --- Tab bar ---
         const params = new URLSearchParams(location.search);
-        const activeExample = params.get('example');
+        const activeExample = params.get('example') || 'alpine';
 
-        // Highlight active example button (default = alpine when no param)
-        const activeBtn = document.getElementById('example-' + (activeExample || 'alpine'));
-        if (activeBtn) activeBtn.classList.add('active');
+        // Set active tab
+        document.querySelectorAll('.tab').forEach(tab => {
+            if (tab.dataset.example === activeExample) tab.classList.add('active');
+            else tab.classList.remove('active');
+        });
 
         function switchExample(name) {
             const u = new URL(location);
@@ -1084,9 +1113,9 @@
             else u.searchParams.set('example', name);
             location.href = u;
         }
-        document.getElementById('example-alpine').addEventListener('click', () => switchExample('alpine'));
-        document.getElementById('example-nodejs').addEventListener('click', () => switchExample('nodejs'));
-        document.getElementById('example-server').addEventListener('click', () => switchExample('server'));
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => switchExample(tab.dataset.example));
+        });
         document.getElementById('reset-btn').addEventListener('click', () => location.reload());
 
         main().catch(e => {

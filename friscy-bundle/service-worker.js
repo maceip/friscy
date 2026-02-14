@@ -1,4 +1,4 @@
-const CACHE_NAME = 'friscy-cache-v14';
+const CACHE_NAME = 'friscy-cache-v15';
 const CACHE_ASSETS = [
   './',
   './index.html',
@@ -8,6 +8,9 @@ const CACHE_ASSETS = [
   './network_bridge.js',
   './worker.js',
   './jit_manager.js',
+  './alpine-icon.svg',
+  './nodejs-icon.svg',
+  './go-icon.svg',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm',
   'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm',

@@ -59,6 +59,8 @@ async function main() {
     let browser = null;
     let originalManifest = null;
     let instructionCount = null;
+    let jitRegionsCompiled = 0;
+    let jitCompilerLoaded = false;
     let found = false;
     let elapsedSeconds = null;
     let foundAtMs = null;
@@ -123,8 +125,15 @@ async function main() {
             if (instMatch) {
                 instructionCount = Number.parseInt(instMatch[1], 10);
             }
+            if (text.includes('[JIT] Compiler loaded')) {
+                jitCompilerLoaded = true;
+            }
+            if (text.includes('[JIT] Compiled region')) {
+                jitRegionsCompiled += 1;
+            }
             // Log key events
             if (text.includes('error') || text.includes('Error') ||
+                text.includes('[JIT]') ||
                 text.includes(EXPECTED_OUTPUT) || text.includes('Instructions') ||
                 text.includes('Exit code') || text.includes('exit_group') ||
                 text.includes('Execution complete'))
@@ -216,7 +225,9 @@ async function main() {
         if (instructionCount !== null) {
             console.log(`[METRIC] instructions=${instructionCount}`);
         }
-        return { found, elapsedSeconds, instructionCount };
+        console.log(`[METRIC] jit_compiler_loaded=${jitCompilerLoaded ? 1 : 0}`);
+        console.log(`[METRIC] jit_regions_compiled=${jitRegionsCompiled}`);
+        return { found, elapsedSeconds, instructionCount, jitCompilerLoaded, jitRegionsCompiled };
     } finally {
         if (originalManifest) {
             try { writeFileSync(join(BUNDLE_DIR, 'manifest.json'), originalManifest); } catch {}

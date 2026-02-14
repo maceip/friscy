@@ -79,6 +79,8 @@ echo
 
 elapsed_values=()
 instruction_values=()
+jit_region_values=()
+jit_loaded_values=()
 
 for i in $(seq 1 "$RUNS"); do
     echo "[bench] Run ${i}/${RUNS}..."
@@ -100,6 +102,8 @@ for i in $(seq 1 "$RUNS"); do
 
     elapsed="$(awk -F= '/\[METRIC\] elapsed_s=/{print $2; exit}' "$LOG_FILE")"
     instructions="$(awk -F= '/\[METRIC\] instructions=/{print $2; exit}' "$LOG_FILE")"
+    jit_loaded="$(awk -F= '/\[METRIC\] jit_compiler_loaded=/{print $2; exit}' "$LOG_FILE")"
+    jit_regions="$(awk -F= '/\[METRIC\] jit_regions_compiled=/{print $2; exit}' "$LOG_FILE")"
 
     if [[ -z "$elapsed" ]]; then
         echo "[bench] ERROR: run ${i} missing elapsed metric. Full log:"
@@ -113,15 +117,31 @@ for i in $(seq 1 "$RUNS"); do
         rm -f "$LOG_FILE"
         exit 1
     fi
+    if [[ -z "$jit_loaded" ]]; then
+        echo "[bench] ERROR: run ${i} missing jit_compiler_loaded metric. Full log:"
+        awk '1' "$LOG_FILE"
+        rm -f "$LOG_FILE"
+        exit 1
+    fi
+    if [[ -z "$jit_regions" ]]; then
+        echo "[bench] ERROR: run ${i} missing jit_regions_compiled metric. Full log:"
+        awk '1' "$LOG_FILE"
+        rm -f "$LOG_FILE"
+        exit 1
+    fi
 
     elapsed_values+=("$elapsed")
     instruction_values+=("$instructions")
-    echo "[bench] Run ${i}: elapsed=${elapsed}s instructions=${instructions}"
+    jit_loaded_values+=("$jit_loaded")
+    jit_region_values+=("$jit_regions")
+    echo "[bench] Run ${i}: elapsed=${elapsed}s instructions=${instructions} jit_loaded=${jit_loaded} jit_regions=${jit_regions}"
     rm -f "$LOG_FILE"
 done
 
 elapsed_csv="$(IFS=,; echo "${elapsed_values[*]}")"
 instructions_csv="$(IFS=,; echo "${instruction_values[*]}")"
+jit_regions_csv="$(IFS=,; echo "${jit_region_values[*]}")"
+jit_loaded_csv="$(IFS=,; echo "${jit_loaded_values[*]}")"
 git_commit="$(cd "$PROJECT_DIR" && git rev-parse HEAD)"
 timestamp_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -156,12 +176,14 @@ function pctDelta(current, base) {
 
 const elapsed = process.argv[1].split(",").map(Number).filter(Number.isFinite);
 const instructions = process.argv[2].split(",").map(Number).filter(Number.isFinite);
-const rootfsUrl = process.argv[3];
-const pageQuery = process.argv[4];
-const commit = process.argv[5];
-const timestamp = process.argv[6];
-const outFile = process.argv[7];
-const baselineFile = process.argv[8];
+const jitRegions = process.argv[3].split(",").map(Number).filter(Number.isFinite);
+const jitLoaded = process.argv[4].split(",").map(Number).filter(Number.isFinite);
+const rootfsUrl = process.argv[5];
+const pageQuery = process.argv[6];
+const commit = process.argv[7];
+const timestamp = process.argv[8];
+const outFile = process.argv[9];
+const baselineFile = process.argv[10];
 
 const result = {
   benchmark: "browser_node42",
@@ -173,6 +195,8 @@ const result = {
   timestampUtc: timestamp,
   elapsedSeconds: stats(elapsed),
   instructions: stats(instructions),
+  jitRegionsCompiled: stats(jitRegions),
+  jitCompilerLoadedRuns: jitLoaded.reduce((a, b) => a + (b > 0 ? 1 : 0), 0),
 };
 
 if (fs.existsSync(baselineFile)) {
@@ -197,7 +221,7 @@ if (fs.existsSync(baselineFile)) {
 }
 
 fs.writeFileSync(outFile, JSON.stringify(result, null, 2));
-' "$elapsed_csv" "$instructions_csv" "$ROOTFS_URL" "$PAGE_QUERY" "$git_commit" "$timestamp_utc" "$OUT_FILE" "$BASELINE_FILE"
+' "$elapsed_csv" "$instructions_csv" "$jit_regions_csv" "$jit_loaded_csv" "$ROOTFS_URL" "$PAGE_QUERY" "$git_commit" "$timestamp_utc" "$OUT_FILE" "$BASELINE_FILE"
 
 echo
 echo "[bench] Summary:"
@@ -208,6 +232,7 @@ function fmt(n, digits = 3) { return Number.isFinite(n) ? n.toFixed(digits) : "n
 function pct(n) { return Number.isFinite(n) ? `${n >= 0 ? "+" : ""}${n.toFixed(2)}%` : "n/a"; }
 console.log(`  elapsed_s  median=${fmt(r.elapsedSeconds.median)}  p95=${fmt(r.elapsedSeconds.p95)}  min=${fmt(r.elapsedSeconds.min)}  max=${fmt(r.elapsedSeconds.max)}`);
 console.log(`  instr      median=${fmt(r.instructions.median, 0)}  p95=${fmt(r.instructions.p95, 0)}  min=${fmt(r.instructions.min, 0)}  max=${fmt(r.instructions.max, 0)}`);
+console.log(`  jit_regs   median=${fmt(r.jitRegionsCompiled.median, 0)}  p95=${fmt(r.jitRegionsCompiled.p95, 0)}  loaded_runs=${fmt(r.jitCompilerLoadedRuns, 0)}/${fmt(r.elapsedSeconds.runs, 0)}`);
 if (r.baseline) {
   console.log("  vs baseline:");
   console.log(`    elapsed median delta: ${pct(r.baseline.elapsedMedianPctDelta)}`);

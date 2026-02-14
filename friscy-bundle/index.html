@@ -1165,12 +1165,21 @@
                 };
             });
 
+            const params = new URLSearchParams(location.search);
+            const enableJit = !params.has('nojit');
+            const jitHotThresholdRaw = params.get('jithot');
+            const jitHotThreshold = jitHotThresholdRaw !== null
+                ? Number.parseInt(jitHotThresholdRaw, 10)
+                : null;
+
             // Send init message with SABs
             worker.postMessage({
                 type: 'init',
                 controlSab,
                 stdoutSab,
                 netSab,
+                enableJit,
+                jitHotThreshold: Number.isFinite(jitHotThreshold) ? jitHotThreshold : null,
             });
 
             await workerReady;
@@ -1178,7 +1187,6 @@
             // Connect network bridge (optional — needs proxy server)
             // Priority: ?noproxy disables > ?proxy= param > localhost > default public proxy
             const DEFAULT_PROXY = 'https://78.141.219.102:4433/connect';
-            const params = new URLSearchParams(location.search);
             const proxyUrl = params.has('noproxy') ? null
                            : params.get('proxy')
                              || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'

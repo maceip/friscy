@@ -19,6 +19,7 @@ const REQUESTED_PORT = Number.parseInt(process.env.FRISCY_TEST_PORT || '8099', 1
 const NODE_EVAL = process.env.FRISCY_TEST_NODE_EVAL || 'console.log("42")';
 const EXPECTED_OUTPUT = process.env.FRISCY_TEST_EXPECTED_OUTPUT || '42';
 const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './rootfs.tar';
+const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '';
 
 async function canBindPort(port) {
     return new Promise((resolve) => {
@@ -55,7 +56,9 @@ async function main() {
     let server = null;
     let browser = null;
     let originalManifest = null;
+    let instructionCount = null;
     let found = false;
+    let elapsedSeconds = null;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -96,6 +99,7 @@ async function main() {
         console.log(`[test] Rootfs URL: ${ROOTFS_URL}`);
         console.log(`[test] Node eval: ${NODE_EVAL}`);
         console.log(`[test] Expected output: ${EXPECTED_OUTPUT}`);
+        console.log(`[test] Page query: ${PAGE_QUERY || '(none)'}`);
         console.log(`[test] Server on :${port}`);
 
         browser = await puppeteer.launch({
@@ -111,6 +115,10 @@ async function main() {
 
         page.on('console', msg => {
             const text = msg.text();
+            const instMatch = text.match(/Instructions:\s*([0-9]+)/);
+            if (instMatch) {
+                instructionCount = Number.parseInt(instMatch[1], 10);
+            }
             // Log key events
             if (text.includes('error') || text.includes('Error') ||
                 text.includes(EXPECTED_OUTPUT) || text.includes('Instructions') ||
@@ -123,7 +131,7 @@ async function main() {
         });
 
         console.log('[test] Loading page...');
-        await page.goto(`http://127.0.0.1:${port}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(`http://127.0.0.1:${port}${PAGE_QUERY}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
         console.log(`[test] Waiting for output: ${EXPECTED_OUTPUT}`);
         const start = Date.now();
@@ -152,8 +160,8 @@ async function main() {
             }
 
             if (content.includes(EXPECTED_OUTPUT)) {
-                const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-                console.log(`[PASS] Node.js produced output in ${elapsed}s`);
+                elapsedSeconds = Number(((Date.now() - start) / 1000).toFixed(3));
+                console.log(`[PASS] Node.js produced output in ${elapsedSeconds}s`);
                 found = true;
                 break;
             }
@@ -182,7 +190,13 @@ async function main() {
         if (!found) {
             console.log(`[FAIL] Did not find ${EXPECTED_OUTPUT} in terminal output`);
         }
-        return found;
+        if (elapsedSeconds !== null) {
+            console.log(`[METRIC] elapsed_s=${elapsedSeconds}`);
+        }
+        if (instructionCount !== null) {
+            console.log(`[METRIC] instructions=${instructionCount}`);
+        }
+        return { found, elapsedSeconds, instructionCount };
     } finally {
         if (originalManifest) {
             try { writeFileSync(join(BUNDLE_DIR, 'manifest.json'), originalManifest); } catch {}
@@ -193,5 +207,5 @@ async function main() {
 }
 
 main()
-    .then(found => process.exit(found ? 0 : 1))
+    .then(result => process.exit(result.found ? 0 : 1))
     .catch(e => { console.error(e); process.exit(1); });

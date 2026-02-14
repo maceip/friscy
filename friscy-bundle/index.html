@@ -1044,7 +1044,7 @@
 
             // Build args matching main.cpp: --rootfs <tar> <entry> [args...]
             const entrypoint = exampleCfg.entrypoint || manifest.entrypoint;
-            const guestCmd = entrypoint.split(' ').filter(s => s);
+            const guestCmd = Array.isArray(entrypoint) ? entrypoint : entrypoint.split(' ').filter(s => s);
             const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
 
             statusEl.textContent = 'Booting...';

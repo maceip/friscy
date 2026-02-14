@@ -22,6 +22,9 @@ ROOTFS_URL="./nodejs.tar"
 PAGE_QUERY="?noproxy"
 BASELINE_FILE="$PROJECT_DIR/tests/perf/browser_node42.baseline.json"
 OUT_FILE="$PROJECT_DIR/tests/perf/browser_node42.latest.json"
+NODE_EVAL='console.log("42")'
+EXPECTED_OUTPUT='42'
+BENCHMARK_NAME='browser_node42'
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,9 +52,21 @@ while [[ $# -gt 0 ]]; do
             OUT_FILE="${2:-}"
             shift 2
             ;;
+        --eval)
+            NODE_EVAL="${2:-}"
+            shift 2
+            ;;
+        --expected)
+            EXPECTED_OUTPUT="${2:-}"
+            shift 2
+            ;;
+        --benchmark)
+            BENCHMARK_NAME="${2:-}"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--runs N] [--write-baseline] [--rootfs-url URL] [--query QUERY] [--baseline PATH] [--out PATH]"
+            echo "Usage: $0 [--runs N] [--write-baseline] [--rootfs-url URL] [--query QUERY] [--baseline PATH] [--out PATH] [--eval JS] [--expected TEXT] [--benchmark NAME]"
             exit 1
             ;;
     esac
@@ -69,10 +84,12 @@ fi
 
 mkdir -p "$(dirname "$OUT_FILE")" "$(dirname "$BASELINE_FILE")"
 
-echo "[bench] Browser benchmark: node -e 'console.log(\"42\")' via Puppeteer"
+echo "[bench] Browser benchmark via Puppeteer"
 echo "[bench] Runs: $RUNS"
 echo "[bench] Rootfs URL: $ROOTFS_URL"
 echo "[bench] Query: ${PAGE_QUERY:-'(none)'}"
+echo "[bench] Eval: $NODE_EVAL"
+echo "[bench] Expected terminal output: $EXPECTED_OUTPUT"
 echo "[bench] Output JSON: $OUT_FILE"
 echo "[bench] Baseline JSON: $BASELINE_FILE"
 echo
@@ -88,8 +105,8 @@ for i in $(seq 1 "$RUNS"); do
     if ! (
         cd "$PROJECT_DIR" && \
         FRISCY_TEST_ROOTFS_URL="$ROOTFS_URL" \
-        FRISCY_TEST_NODE_EVAL='console.log("42")' \
-        FRISCY_TEST_EXPECTED_OUTPUT='42' \
+        FRISCY_TEST_NODE_EVAL="$NODE_EVAL" \
+        FRISCY_TEST_EXPECTED_OUTPUT="$EXPECTED_OUTPUT" \
         FRISCY_TEST_QUERY="$PAGE_QUERY" \
         FRISCY_TEST_WAIT_FOR_EXIT=1 \
         node --experimental-default-type=module ./tests/test_phase1_nodejs2.js
@@ -180,14 +197,18 @@ const jitRegions = process.argv[3].split(",").map(Number).filter(Number.isFinite
 const jitLoaded = process.argv[4].split(",").map(Number).filter(Number.isFinite);
 const rootfsUrl = process.argv[5];
 const pageQuery = process.argv[6];
-const commit = process.argv[7];
-const timestamp = process.argv[8];
-const outFile = process.argv[9];
-const baselineFile = process.argv[10];
+const nodeEval = process.argv[7];
+const expectedOutput = process.argv[8];
+const benchmarkName = process.argv[9];
+const commit = process.argv[10];
+const timestamp = process.argv[11];
+const outFile = process.argv[12];
+const baselineFile = process.argv[13];
 
 const result = {
-  benchmark: "browser_node42",
-  command: "/usr/bin/node -e console.log(\"42\")",
+  benchmark: benchmarkName,
+  command: `/usr/bin/node -e ${nodeEval}`,
+  expectedOutput,
   harness: "tests/test_phase1_nodejs2.js",
   rootfsUrl,
   pageQuery,
@@ -221,7 +242,7 @@ if (fs.existsSync(baselineFile)) {
 }
 
 fs.writeFileSync(outFile, JSON.stringify(result, null, 2));
-' "$elapsed_csv" "$instructions_csv" "$jit_regions_csv" "$jit_loaded_csv" "$ROOTFS_URL" "$PAGE_QUERY" "$git_commit" "$timestamp_utc" "$OUT_FILE" "$BASELINE_FILE"
+' "$elapsed_csv" "$instructions_csv" "$jit_regions_csv" "$jit_loaded_csv" "$ROOTFS_URL" "$PAGE_QUERY" "$NODE_EVAL" "$EXPECTED_OUTPUT" "$BENCHMARK_NAME" "$git_commit" "$timestamp_utc" "$OUT_FILE" "$BASELINE_FILE"
 
 echo
 echo "[bench] Summary:"

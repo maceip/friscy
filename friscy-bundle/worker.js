@@ -13,7 +13,15 @@
 console.log('[worker] Module loading...');
 
 // JIT manager — loaded lazily inside init
-let jitManager = { jitCompiler: null, init() {}, loadCompiler() { return Promise.resolve(); }, execute() { return null; }, recordExecution() {} };
+let jitManager = {
+    jitCompiler: null,
+    init() {},
+    loadCompiler() { return Promise.resolve(); },
+    execute() { return null; },
+    recordExecution() {},
+    recordTraceTransition() {},
+    configureTrace() {},
+};
 let installInvalidationHook = () => {};
 
 // Control SAB layout (4KB):
@@ -272,6 +280,7 @@ function runResumeLoop() {
                 }
 
                 if (jitResult.regionMiss) {
+                    jitManager.recordTraceTransition(pc, jitResult.nextPC >>> 0);
                     pc = jitResult.nextPC >>> 0;
                     chainCount++;
                     continue;
@@ -319,6 +328,8 @@ self.onmessage = async function(e) {
         const netSab = msg.netSab;
         const enableJit = msg.enableJit !== false;
         const jitHotThreshold = Number.isFinite(msg.jitHotThreshold) ? msg.jitHotThreshold : null;
+        const jitTraceEnabled = msg.jitTraceEnabled !== false;
+        const jitEdgeHotThreshold = Number.isFinite(msg.jitEdgeHotThreshold) ? msg.jitEdgeHotThreshold : null;
 
         controlView = new Int32Array(controlSab);
         controlBytes = new Uint8Array(controlSab);
@@ -394,8 +405,15 @@ self.onmessage = async function(e) {
                 if (jitHotThreshold !== null && jitHotThreshold > 0) {
                     jitManager.hotThreshold = jitHotThreshold;
                 }
+                jitManager.configureTrace({
+                    enabled: jitTraceEnabled,
+                    edgeHotThreshold: jitEdgeHotThreshold,
+                });
                 console.log(
-                    `[worker] JIT manager loaded (hotThreshold=${jitManager.hotThreshold ?? 'default'})`
+                    `[worker] JIT manager loaded ` +
+                    `(hotThreshold=${jitManager.hotThreshold ?? 'default'}, ` +
+                    `trace=${jitManager.traceEnabled ? 'on' : 'off'}, ` +
+                    `edgeHot=${jitManager.traceEdgeHotThreshold ?? 'default'})`
                 );
             } catch (e) {
                 console.warn('[worker] JIT manager not available:', e.message);

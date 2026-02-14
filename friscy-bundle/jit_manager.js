@@ -28,6 +28,11 @@ class JITManager {
 
         // Compilation threshold (execute N times before JIT)
         this.hotThreshold = 50;
+        this.traceEnabled = true;
+        this.traceEdgeHotThreshold = 8;
+        this.traceMaxEdges = 4096;
+        // Map<"from_region:to_region", count>
+        this.traceEdgeHits = new Map();
 
         // Region size for compilation (16KB)
         this.regionSize = 16384;
@@ -50,6 +55,8 @@ class JITManager {
             compilationTimeMs: 0,
             dispatchCalls: 0,
             regionMisses: 0,
+            traceEdgesObserved: 0,
+            traceCompilesTriggered: 0,
         };
 
         // Invalidation bitmap (1 bit per 4KB page)
@@ -62,6 +69,18 @@ class JITManager {
      */
     init(wasmMemory) {
         this.wasmMemory = wasmMemory;
+    }
+
+    /**
+     * Configure trace-based hot-path promotion controls.
+     */
+    configureTrace({ enabled, edgeHotThreshold } = {}) {
+        if (typeof enabled === 'boolean') {
+            this.traceEnabled = enabled;
+        }
+        if (Number.isInteger(edgeHotThreshold) && edgeHotThreshold > 0) {
+            this.traceEdgeHotThreshold = edgeHotThreshold;
+        }
     }
 
     /**
@@ -109,7 +128,7 @@ class JITManager {
             const hotRegionBase = page & ~(this.regionSize - 1);
             // Don't block — compile async and use on next hit
             if (!this.compiledRegions.has(hotRegionBase) && !this.compilingRegions.has(hotRegionBase)) {
-                this.compileRegion(hotRegionBase).catch(e => {
+                this.compileRegion(hotRegionBase, 'page-hot').catch(e => {
                     console.warn(`[JIT] Compile failed for 0x${hotRegionBase.toString(16)}:`, e.message);
                 });
             }
@@ -117,6 +136,42 @@ class JITManager {
 
         this.stats.jitMisses++;
         return false;
+    }
+
+    /**
+     * Record a cross-region transition observed during JIT dispatch.
+     * If an edge becomes hot, proactively compile the target region.
+     */
+    recordTraceTransition(fromPc, toPc) {
+        if (!this.traceEnabled) return;
+        const fromRegion = (fromPc >>> 0) & ~(this.regionSize - 1);
+        const toRegion = (toPc >>> 0) & ~(this.regionSize - 1);
+        if (fromRegion === toRegion) return;
+
+        const key = `${fromRegion.toString(16)}:${toRegion.toString(16)}`;
+        if (!this.traceEdgeHits.has(key) && this.traceEdgeHits.size >= this.traceMaxEdges) {
+            // Drop the oldest edge to keep memory bounded.
+            const oldest = this.traceEdgeHits.keys().next().value;
+            if (oldest !== undefined) {
+                this.traceEdgeHits.delete(oldest);
+            }
+        }
+
+        const count = (this.traceEdgeHits.get(key) || 0) + 1;
+        this.traceEdgeHits.set(key, count);
+        this.stats.traceEdgesObserved++;
+
+        if (count < this.traceEdgeHotThreshold || !this.jitCompiler) return;
+        if (this.compiledRegions.has(toRegion) || this.compilingRegions.has(toRegion)) return;
+
+        this.stats.traceCompilesTriggered++;
+        this.compileRegion(toRegion, 'trace-hot-edge').catch(e => {
+            console.warn(
+                `[JIT] Trace compile failed for 0x${toRegion.toString(16)} ` +
+                `(from 0x${fromRegion.toString(16)}):`,
+                e.message
+            );
+        });
     }
 
     /**
@@ -166,7 +221,7 @@ class JITManager {
     /**
      * Compile a region of RISC-V code starting at the given page address.
      */
-    async compileRegion(pageAddr) {
+    async compileRegion(pageAddr, reason = 'manual') {
         if (!this.jitCompiler || !this.wasmMemory) return;
 
         const regionStart = (pageAddr >>> 0) & ~(this.regionSize - 1);
@@ -215,7 +270,7 @@ class JITManager {
 
             console.log(
                 `[JIT] Compiled region 0x${regionStart.toString(16)} ` +
-                `(${regionEnd - regionStart} bytes, ${elapsed.toFixed(1)}ms)`
+                `(${regionEnd - regionStart} bytes, ${elapsed.toFixed(1)}ms, reason=${reason})`
             );
         } finally {
             this.compilingRegions.delete(regionStart);
@@ -266,6 +321,7 @@ class JITManager {
             compiledRegionCount: this.compiledRegions.size,
             hotPages: this.pageHitCounts.size,
             dirtyPages: this.dirtyPages.size,
+            traceEdgesTracked: this.traceEdgeHits.size,
         };
     }
 
@@ -277,6 +333,7 @@ class JITManager {
         this.compilingRegions.clear();
         this.pageHitCounts.clear();
         this.dirtyPages.clear();
+        this.traceEdgeHits.clear();
         this.stats = {
             regionsCompiled: 0,
             jitHits: 0,
@@ -284,6 +341,8 @@ class JITManager {
             compilationTimeMs: 0,
             dispatchCalls: 0,
             regionMisses: 0,
+            traceEdgesObserved: 0,
+            traceCompilesTriggered: 0,
         };
     }
 }

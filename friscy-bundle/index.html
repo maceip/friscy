@@ -1171,6 +1171,11 @@
             const jitHotThreshold = jitHotThresholdRaw !== null
                 ? Number.parseInt(jitHotThresholdRaw, 10)
                 : null;
+            const jitTraceEnabled = !params.has('nojittrace');
+            const jitEdgeHotThresholdRaw = params.get('jitedgehot');
+            const jitEdgeHotThreshold = jitEdgeHotThresholdRaw !== null
+                ? Number.parseInt(jitEdgeHotThresholdRaw, 10)
+                : null;
 
             // Send init message with SABs
             worker.postMessage({
@@ -1180,6 +1185,8 @@
                 netSab,
                 enableJit,
                 jitHotThreshold: Number.isFinite(jitHotThreshold) ? jitHotThreshold : null,
+                jitTraceEnabled,
+                jitEdgeHotThreshold: Number.isFinite(jitEdgeHotThreshold) ? jitEdgeHotThreshold : null,
             });
 
             await workerReady;

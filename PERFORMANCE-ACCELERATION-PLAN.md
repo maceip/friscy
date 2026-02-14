@@ -16,6 +16,44 @@ wrong results).
 | **1** | Peephole optimization | `aot/src/translate.rs` | 10-20% code size, 5-15% runtime | Very low |
 | **2** | Wasm-internal JIT dispatch | `aot/src/wasm_builder.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js` | 5-50x JIT throughput | Low |
 | **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium |
+| **4** | Trace-driven region prefetch | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Fewer region-miss fallbacks on hot cross-region paths | Low |
+
+---
+
+## Phase 4: Trace-Driven Region Prefetch (Incremental Medium-Phase Work)
+
+### 4.1 Problem Statement
+
+The current JIT compiles regions strictly by page hit count. This misses an
+important signal: during JIT `run()` chaining we already observe cross-region
+transfer edges (`region miss` from one compiled region to another PC). Repeated
+edges indicate a hot path spanning multiple regions.
+
+### 4.2 Implementation Summary
+
+- Added a trace edge table in `jit_manager.js` keyed by
+  `from_region -> to_region`.
+- On repeated hot edges (`traceEdgeHotThreshold`, default `8`), the manager
+  proactively compiles the target region (if not already compiled/in-flight).
+- Worker now records region-miss transitions via
+  `jitManager.recordTraceTransition(fromPc, toPc)`.
+- Browser query controls:
+  - `?nojittrace` disables trace-driven prefetch.
+  - `?jitedgehot=N` sets hot-edge compile threshold.
+
+### 4.3 Required Verification Proof
+
+Keep the Claude proof workload as the phase gate:
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
 
 ---
 

@@ -180,19 +180,21 @@
         if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('./service-worker.js').then(reg => {
                 console.log('Service Worker registered:', reg);
-                // If not yet cross-origin isolated, reload once SW activates
-                if (!crossOriginIsolated) {
-                    if (reg.active) {
-                        location.reload();
-                    } else {
-                        reg.addEventListener('updatefound', () => {
-                            const sw = reg.installing;
-                            sw.addEventListener('statechange', () => {
-                                if (sw.state === 'activated') location.reload();
-                            });
-                        });
-                    }
+                // Reload when not yet isolated (first visit)
+                if (!crossOriginIsolated && reg.active) {
+                    location.reload();
+                    return;
                 }
+                // Reload when a NEW service worker activates (cache update)
+                reg.addEventListener('updatefound', () => {
+                    const sw = reg.installing;
+                    sw.addEventListener('statechange', () => {
+                        if (sw.state === 'activated') {
+                            console.log('New service worker activated, reloading...');
+                            location.reload();
+                        }
+                    });
+                });
             }).catch(e => console.error('Service Worker registration failed:', e));
         }
     </script>

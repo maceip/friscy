@@ -244,6 +244,8 @@
             .tab-icon { width: 13px; height: 13px; }
             .tab-strip-border { margin: 0 0.5rem; }
             #terminal-container { padding: 0.5rem; }
+            #dual-terminal-container.active { flex-direction: column; }
+            .dual-pane.primary, .dual-pane.companion { flex: 1; }
             #reset-btn { width: 24px; height: 24px; font-size: 0.9rem; line-height: 22px; }
             .import-input-wrapper { width: 95%; }
             .import-title { font-size: 0.95rem; }
@@ -315,6 +317,19 @@
             flex-direction: column;
             overflow: hidden;
         }
+        #dual-terminal-container {
+            display: none; flex: 1; gap: 0.5rem;
+        }
+        #dual-terminal-container.active { display: flex; }
+        .dual-pane { display: flex; flex-direction: column; overflow: hidden; border-radius: 8px; }
+        .dual-pane.primary { flex: 2; }
+        .dual-pane.companion { flex: 1; }
+        .pane-label {
+            font-size: 0.7rem; color: #6e7681; padding: 4px 8px;
+            background: #161b22; border-bottom: 1px solid #21262d;
+            text-transform: uppercase; letter-spacing: 0.05em;
+        }
+        .dual-term { flex: 1; display: flex; overflow: hidden; }
         #reset-btn {
             display: none;
             position: absolute;
@@ -388,6 +403,16 @@
         <div id="terminal-wrapper">
             <button id="reset-btn" title="Reset">&#x21bb;</button>
             <div id="terminal" style="display:none;"></div>
+            <div id="dual-terminal-container">
+                <div class="dual-pane primary">
+                    <div class="pane-label">Go Echo Server · port 8080</div>
+                    <div id="terminal-server" class="dual-term"></div>
+                </div>
+                <div class="dual-pane companion">
+                    <div class="pane-label">Alpine Shell · wget client</div>
+                    <div id="terminal-companion" class="dual-term"></div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -450,6 +475,12 @@
         // Pending stdin bytes from terminal input
         const stdinQueue = [];
 
+        // Companion instance (dual terminal for server tab)
+        let term2, fitAddon2, worker2, netBridge2, netRPCHost2;
+        let machineRunning2 = false;
+        let controlSab2, stdoutSab2, netSab2, controlView2, stdoutView2, stdoutBytes2;
+        const stdinQueue2 = [];
+
         // Expose for testing (Puppeteer)
         window._friscyStdinQueue = stdinQueue;
 
@@ -462,9 +493,14 @@
         function updateTerminalSize() {
             if (term && fitAddon) {
                 fitAddon.fit();
-                // Notify worker of new terminal dimensions
                 if (worker) {
                     worker.postMessage({ type: 'resize', rows: term.rows, cols: term.cols });
+                }
+            }
+            if (term2 && fitAddon2) {
+                fitAddon2.fit();
+                if (worker2) {
+                    worker2.postMessage({ type: 'resize', rows: term2.rows, cols: term2.cols });
                 }
             }
         }
@@ -540,6 +576,54 @@
                 term.writeln(`\r\n\x1b[33mProcess exited (code ${exitCode})\x1b[0m`);
                 statusEl.textContent = `Exited (${exitCode})`;
                 Atomics.store(controlView, 0, CMD_IDLE);
+                return true;
+            }
+            return false;
+        }
+
+        // --- Parameterized helpers for dual terminal ---
+        function drainStdoutFor(sv, sb, t) {
+            if (!sv || !sb || !t) return;
+            const writeHead = Atomics.load(sv, 0);
+            const readTail = Atomics.load(sv, 1);
+            if (writeHead === readTail) return;
+            let available;
+            if (writeHead >= readTail) available = writeHead - readTail;
+            else available = RING_SIZE - readTail + writeHead;
+            if (available <= 0) return;
+            const buf = new Uint8Array(available);
+            let pos = readTail;
+            for (let i = 0; i < available; i++) {
+                buf[i] = sb[RING_HEADER + pos];
+                pos = (pos + 1) % RING_SIZE;
+            }
+            Atomics.store(sv, 1, pos);
+            t.write(new TextDecoder().decode(buf));
+        }
+
+        function checkStdinRequestFor(cv, cs, queue) {
+            if (!cv) return;
+            const cmd = Atomics.load(cv, 0);
+            if (cmd !== CMD_STDIN_REQUEST) return;
+            if (queue.length === 0) return;
+            const maxLen = Atomics.load(cv, 2);
+            const controlBytes = new Uint8Array(cs);
+            const toSend = Math.min(queue.length, maxLen, 3968);
+            for (let i = 0; i < toSend; i++) {
+                controlBytes[64 + i] = queue.shift();
+            }
+            Atomics.store(cv, 2, toSend);
+            Atomics.store(cv, 0, CMD_STDIN_READY);
+            Atomics.notify(cv, 0);
+        }
+
+        function checkExitFor(cv, t, statusText) {
+            if (!cv) return false;
+            const cmd = Atomics.load(cv, 0);
+            if (cmd === CMD_EXIT) {
+                const exitCode = Atomics.load(cv, 5);
+                t.writeln(`\r\n\x1b[33mProcess exited (code ${exitCode})\x1b[0m`);
+                Atomics.store(cv, 0, CMD_IDLE);
                 return true;
             }
             return false;
@@ -1084,12 +1168,29 @@
             const rootfsUrl = exampleCfg.rootfs || manifest.rootfs || './rootfs.tar';
             statusEl.textContent = `Loading ${imageName}...`;
 
-            // Download rootfs with progress
+            // Download rootfs with progress (+ companion rootfs for server tab)
             setProgress(0, `Loading ${imageName}...`, 'Starting download...');
-            const rootfs = await fetchWithProgress(rootfsUrl);
+            let companionRootfs = null;
+            let rootfs;
+            if (activeExample === 'server') {
+                const [serverRootfs, alpineRootfs] = await Promise.all([
+                    fetchWithProgress(rootfsUrl),
+                    fetch('./rootfs.tar').then(r => r.arrayBuffer()),
+                ]);
+                rootfs = serverRootfs;
+                companionRootfs = alpineRootfs;
+            } else {
+                rootfs = await fetchWithProgress(rootfsUrl);
+            }
 
             // Initialize runtime (indeterminate)
             setProgress(-1, 'Initializing runtime...');
+
+            // For server tab, open primary terminal in #terminal-server (dual pane)
+            const isDual = activeExample === 'server';
+            const primaryTermEl = isDual
+                ? document.getElementById('terminal-server')
+                : terminalEl;
 
             // Initialize xterm.js (hidden behind overlay)
             term = new Terminal({
@@ -1122,7 +1223,7 @@
             });
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
-            term.open(terminalEl);
+            term.open(primaryTermEl);
 
             function debounce(fn, ms) {
                 let id;
@@ -1131,7 +1232,7 @@
             const debouncedFit = debounce(updateTerminalSize, 150);
 
             window.addEventListener('resize', debouncedFit);
-            terminalEl.addEventListener('click', () => term.focus());
+            primaryTermEl.addEventListener('click', () => term.focus());
 
             // Create SharedArrayBuffers for Worker communication
             controlSab = new SharedArrayBuffer(4096);   // Control channel
@@ -1206,7 +1307,11 @@
 
             // Transition: hide progress overlay, show terminal + reset button
             overlayEl.classList.add('hidden');
-            terminalEl.style.display = 'flex';
+            if (isDual) {
+                document.getElementById('dual-terminal-container').classList.add('active');
+            } else {
+                terminalEl.style.display = 'flex';
+            }
             document.getElementById('reset-btn').style.display = 'block';
             term.focus();
             updateTerminalSize();
@@ -1303,6 +1408,11 @@
             }, [rootfsArray.buffer]);
 
             statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + document.getElementById('net-status').outerHTML;
+
+            // Server tab: boot companion Alpine shell + auto wget
+            if (activeExample === 'server' && companionRootfs) {
+                bootCompanion(companionRootfs, proxyUrl).then(() => runAutoWget());
+            }
 
             // Auto-run uname -a on Alpine boot — wait until shell is ready (requesting stdin)
             if (activeExample === 'alpine') {
@@ -1558,6 +1668,180 @@
                     input.disabled = false;
                 }
             }
+        }
+
+        // --- Dual terminal: companion boot + auto wget ---
+        async function bootCompanion(rootfsBuffer, proxyUrl) {
+            const termEl2 = document.getElementById('terminal-companion');
+            term2 = new Terminal({
+                cursorBlink: true, convertEol: true, fontSize: 13,
+                fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                theme: {
+                    background: '#0d1117', foreground: '#c9d1d9',
+                    selectionBackground: '#00507a', cursor: '#c9d1d9',
+                    black: '#000000', red: '#e06c75', green: '#98c379',
+                    yellow: '#e5c07b', blue: '#61afef', magenta: '#c678dd',
+                    cyan: '#56b6c2', white: '#ffffff',
+                    brightBlack: '#5c6370', brightRed: '#e06c75', brightGreen: '#98c379',
+                    brightYellow: '#e5c07b', brightBlue: '#61afef', brightMagenta: '#c678dd',
+                    brightCyan: '#56b6c2', brightWhite: '#ffffff',
+                }
+            });
+            fitAddon2 = new FitAddon();
+            term2.loadAddon(fitAddon2);
+            term2.open(termEl2);
+            termEl2.addEventListener('click', () => term2.focus());
+
+            controlSab2 = new SharedArrayBuffer(4096);
+            stdoutSab2 = new SharedArrayBuffer(65536);
+            netSab2 = new SharedArrayBuffer(65536);
+            controlView2 = new Int32Array(controlSab2);
+            stdoutView2 = new Int32Array(stdoutSab2);
+            stdoutBytes2 = new Uint8Array(stdoutSab2);
+
+            fitAddon2.fit();
+            Atomics.store(controlView2, 6, term2.cols);
+            Atomics.store(controlView2, 7, term2.rows);
+
+            worker2 = new Worker('./worker.js', { type: 'module' });
+            const ready2 = new Promise((resolve, reject) => {
+                const onMsg = (e) => {
+                    if (e.data.type === 'ready') { resolve(); worker2.onmessage = null; }
+                    if (e.data.type === 'error') reject(new Error(`Worker2: ${e.data.message}`));
+                };
+                worker2.onmessage = onMsg;
+                worker2.onerror = (e) => reject(new Error(`Worker2 failed: ${e.message || 'unknown'}`));
+            });
+            worker2.postMessage({ type: 'init', controlSab: controlSab2, stdoutSab: stdoutSab2, netSab: netSab2 });
+            await ready2;
+
+            // Connect companion network bridge to same proxy
+            if (proxyUrl) {
+                try {
+                    netBridge2 = new FriscyNetworkBridge(proxyUrl);
+                    await netBridge2.connect();
+                } catch (e) {
+                    console.warn('[friscy] Companion network bridge not available:', e.message);
+                }
+            }
+            if (netBridge2) {
+                netRPCHost2 = new NetworkRPCHost(netSab2, netBridge2);
+                netRPCHost2.start();
+            }
+
+            // Clipboard + Tab
+            term2.attachCustomKeyEventHandler((ev) => {
+                if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'c' && term2.hasSelection()) {
+                    navigator.clipboard.writeText(term2.getSelection()); return false;
+                }
+                if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'v') {
+                    navigator.clipboard.readText().then(t => { if (t) term2.paste(t); }).catch(() => {});
+                    return false;
+                }
+                if (ev.key === 'Tab') { ev.preventDefault(); return true; }
+                return true;
+            });
+
+            // stdin handler for companion
+            term2.onData((data) => {
+                if (!machineRunning2) return;
+                for (let i = 0; i < data.length; i++) {
+                    const code = data.charCodeAt(i);
+                    if (code === 3) stdinQueue2.push(0x03);
+                    else if (code === 26) stdinQueue2.push(0x1a);
+                    else if (code === 12) { term2.clear(); stdinQueue2.push(0x0c); }
+                    else if (code === 4) stdinQueue2.push(0x04);
+                    else if (data[i] === '\r') stdinQueue2.push(0x0a);
+                    else if (code === 127) stdinQueue2.push(0x7f);
+                    else if (code === 27) { stdinQueue2.push(...new TextEncoder().encode(data.slice(i))); break; }
+                    else stdinQueue2.push(...new TextEncoder().encode(data[i]));
+                }
+                checkStdinRequestFor(controlView2, controlSab2, stdinQueue2);
+            });
+
+            // Poll loop for companion
+            const pollTimer2 = setInterval(() => {
+                drainStdoutFor(stdoutView2, stdoutBytes2, term2);
+                checkStdinRequestFor(controlView2, controlSab2, stdinQueue2);
+                if (checkExitFor(controlView2, term2)) {
+                    machineRunning2 = false;
+                    clearInterval(pollTimer2);
+                    if (netRPCHost2) netRPCHost2.stop();
+                }
+            }, 4);
+
+            // Boot Alpine shell
+            machineRunning2 = true;
+            const rootfsArray2 = new Uint8Array(rootfsBuffer);
+            worker2.postMessage({
+                type: 'run',
+                args: ['--rootfs', '/rootfs.tar', '/bin/sh'],
+                rootfsData: rootfsArray2.buffer,
+            }, [rootfsArray2.buffer]);
+
+            // Wait for shell to be ready (requesting stdin)
+            return new Promise((resolve) => {
+                const check = () => {
+                    if (controlView2 && Atomics.load(controlView2, 0) === CMD_STDIN_REQUEST) {
+                        resolve();
+                    } else {
+                        setTimeout(check, 200);
+                    }
+                };
+                setTimeout(check, 500);
+            });
+        }
+
+        // Captured stdout for server banner detection
+        let serverStdoutCapture = '';
+
+        function runAutoWget() {
+            const commands = [
+                'wget -qO- http://127.0.0.1:8080/',
+                'wget -qO- http://127.0.0.1:8080/health',
+                'wget -qO- http://127.0.0.1:8080/echo',
+            ];
+
+            // Wait for server banner in primary terminal stdout
+            const waitForBanner = () => {
+                // Check primary terminal buffer for the Echo server startup banner
+                if (term) {
+                    const buffer = term.buffer.active;
+                    for (let i = 0; i < buffer.cursorY + buffer.baseY + 1; i++) {
+                        const line = buffer.getLine(i);
+                        if (line) {
+                            const text = line.translateToString(true);
+                            if (text.includes('http server started on')) {
+                                injectCommands(0);
+                                return;
+                            }
+                        }
+                    }
+                }
+                setTimeout(waitForBanner, 500);
+            };
+
+            function injectCommands(idx) {
+                if (idx >= commands.length) return;
+
+                // Wait for companion to be requesting stdin
+                const waitStdin = () => {
+                    if (controlView2 && Atomics.load(controlView2, 0) === CMD_STDIN_REQUEST) {
+                        const cmd = commands[idx] + '\n';
+                        for (let i = 0; i < cmd.length; i++) {
+                            stdinQueue2.push(cmd.charCodeAt(i));
+                        }
+                        checkStdinRequestFor(controlView2, controlSab2, stdinQueue2);
+                        // Wait a bit then inject next
+                        setTimeout(() => injectCommands(idx + 1), 2000);
+                    } else {
+                        setTimeout(waitStdin, 200);
+                    }
+                };
+                waitStdin();
+            }
+
+            setTimeout(waitForBanner, 1000);
         }
 
         // Boot an imported Docker image (reuses the normal boot flow)

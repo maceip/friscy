@@ -1,10 +1,9 @@
-const CACHE_NAME = 'friscy-cache-v9';
+const CACHE_NAME = 'friscy-cache-v10';
 const CACHE_ASSETS = [
   './',
   './index.html',
   './friscy.js',
   './friscy.wasm',
-  './rootfs.tar',
   './manifest.json',
   './network_bridge.js',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
@@ -45,12 +44,15 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Fetch: network-first for small dev files, cache-first for large assets (rootfs.tar)
+// Fetch: network-first for small dev files, cache-first for large assets
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // Only intercept same-origin or CDN assets
+  // Only intercept same-origin or known CDN assets — let everything else pass through
   const isSameOrigin = url.origin === self.location.origin;
+  const isCDN = url.hostname === 'cdn.jsdelivr.net';
+  if (!isSameOrigin && !isCDN) return;
+
   const useNetworkFirst = isSameOrigin && NETWORK_FIRST.has(url.pathname);
 
   if (useNetworkFirst) {

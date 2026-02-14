@@ -1,4 +1,4 @@
-const CACHE_NAME = 'friscy-cache-v11';
+const CACHE_NAME = 'friscy-cache-v12';
 const CACHE_ASSETS = [
   './',
   './index.html',
@@ -6,19 +6,23 @@ const CACHE_ASSETS = [
   './friscy.wasm',
   './manifest.json',
   './network_bridge.js',
+  './worker.js',
+  './jit_manager.js',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm',
   'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm',
 ];
 
-// Small files that change often during development — always fetch fresh
-const NETWORK_FIRST = new Set([
-  '/friscy.js',
-  '/friscy.wasm',
-  '/index.html',
-  '/manifest.json',
-  '/network_bridge.js',
-  '/',
+// Files that change often — always fetch fresh (matched by filename, not full path)
+const NETWORK_FIRST_FILES = new Set([
+  'friscy.js',
+  'friscy.wasm',
+  'index.html',
+  'manifest.json',
+  'network_bridge.js',
+  'worker.js',
+  'jit_manager.js',
+  'service-worker.js',
 ]);
 
 // Install: cache assets, activate immediately
@@ -113,7 +117,9 @@ self.addEventListener('fetch', (event) => {
   }
 
   // Same-origin subresources
-  const useNetworkFirst = NETWORK_FIRST.has(url.pathname);
+  // Match by filename (works on both localhost and GH Pages subpath)
+  const filename = url.pathname.split('/').pop() || '';
+  const useNetworkFirst = NETWORK_FIRST_FILES.has(filename) || url.pathname.endsWith('/');
 
   if (useNetworkFirst) {
     event.respondWith(

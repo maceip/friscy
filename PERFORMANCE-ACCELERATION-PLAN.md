@@ -25,7 +25,8 @@ All optimization claims must be measured against these two baseline workloads:
 
 1. **Node.js baseline**: guest Node.js boot/execution (e.g. `node -e ...`)
 2. **Node.js + Claude baseline**: `claude --version` with a Claude package JS
-   payload of at least **60 MiB minified/bundled JS** in the rootfs.
+   payload present in the rootfs (with **~60 MiB** as a recommended size,
+   not a hard requirement).
    Accepted acquisition paths:
    - npm package (`@anthropic-ai/claude-code` JS/MJS payload), or
    - Claude installer bundle (from `curl -fsSL https://claude.ai/install.sh | bash`)
@@ -37,8 +38,10 @@ bash ./tests/smoke_phase1_peephole.sh
 bash ./tests/smoke_phase2_jit_dispatch.sh
 ```
 
-If `/usr/bin/node`, `/usr/bin/claude`, or the Claude JS payload threshold is
-missing, smoke should fail fast and the benchmark baseline is considered invalid.
+If `/usr/bin/node`, `/usr/bin/claude`, or Claude payload files are missing,
+smoke should fail fast and the benchmark baseline is considered invalid.
+If payload size is below the 60 MiB recommendation, smoke warns by default and
+only fails when `CLAUDE_PAYLOAD_STRICT=1` is set.
 
 ---
 

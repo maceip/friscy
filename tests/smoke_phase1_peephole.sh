@@ -4,7 +4,7 @@
 #
 # Verifies that fRISCy still boots:
 #   1) Node.js guest workload
-#   2) Claude Code guest workload (`claude --version`)
+#   2) Claude Code guest workload (`claude -p "write me a haiku"`)
 #
 # Usage:
 #   ./tests/smoke_phase1_peephole.sh
@@ -70,12 +70,12 @@ node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_phase1_nodejs2.js"
 echo "[smoke] PASS: Node.js boot"
 
 if $RUN_CLAUDE; then
-    echo "[smoke] Phase 1 peephole smoke: Claude version"
+    echo "[smoke] Phase 1 peephole smoke: Claude prompt (haiku)"
     FRISCY_TEST_ROOTFS_URL="$TEST_ROOTFS_URL" \
-    node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_claude_version.js"
-    echo "[smoke] PASS: Claude version"
+    node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_claude_haiku.js"
+    echo "[smoke] PASS: Claude prompt (haiku)"
 else
-    echo "[smoke] SKIP: Claude version (--skip-claude)"
+    echo "[smoke] SKIP: Claude prompt (haiku) (--skip-claude)"
 fi
 
 echo "[smoke] Phase 1 peephole smoke completed successfully"

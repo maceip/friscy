@@ -4,7 +4,7 @@
 #
 # Validates browser execution for:
 #   1) Node.js workload
-#   2) Claude workload
+#   2) Claude workload (`claude -p "write me a haiku"`)
 # and checks for JIT compilation evidence in browser logs.
 #
 # Usage:
@@ -71,11 +71,11 @@ node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_phase1_nodejs2.js"
 echo "[smoke] PASS: Node.js workload"
 
 if $RUN_CLAUDE; then
-    echo "[smoke] Phase 2 JIT-dispatch smoke: Claude workload"
+    echo "[smoke] Phase 2 JIT-dispatch smoke: Claude prompt (haiku)"
     CLAUDE_LOG="$(mktemp)"
     trap 'rm -f "$CLAUDE_LOG"' EXIT
     FRISCY_TEST_ROOTFS_URL="$TEST_ROOTFS_URL" \
-    node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_claude_version.js" 2>&1 | tee "$CLAUDE_LOG"
+    node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_claude_haiku.js" 2>&1 | tee "$CLAUDE_LOG"
 
     if ! rg -q '\[JIT\] Compiled region|\[METRIC\] jit_compiler_loaded=1' "$CLAUDE_LOG"; then
         echo "[smoke] ERROR: did not observe JIT availability in Claude run logs"
@@ -84,9 +84,9 @@ if $RUN_CLAUDE; then
     if ! rg -q '\[JIT\] Compiled region|\[METRIC\] jit_regions_compiled=[1-9][0-9]*' "$CLAUDE_LOG"; then
         echo "[smoke] WARN: Claude run did not compile any JIT regions (workload may be non-hot/short in this path)"
     fi
-    echo "[smoke] PASS: Claude workload with JIT compilation evidence"
+    echo "[smoke] PASS: Claude prompt (haiku) with JIT availability evidence"
 else
-    echo "[smoke] SKIP: Claude workload (--skip-claude)"
+    echo "[smoke] SKIP: Claude prompt (haiku) (--skip-claude)"
 fi
 
 echo "[smoke] Phase 2 JIT-dispatch smoke completed successfully"

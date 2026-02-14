@@ -1,0 +1,28 @@
+{
+  "name": "friscy-standalone",
+  "version": "1.0.0",
+  "description": "<div align=\"center\"> <table border=\"0\" style=\"border-collapse: collapse; border-style: hidden;\">   <tr>     <td align=\"left\" valign=\"bottom\" style=\"border: none; padding-right: 30px;\"> <pre> ▐▀▀▀▀▀▀▀▌ ▐ fRISCy ⸎&nbsp;&nbsp; <strong>fast risc-v runtime for the browser</strong> ▐▄▄▄▄▄▄▄▌ </pre>       <br>       <strong>        friscy runs docker containers in WebAssembly by:</strong>       <br><br>       <div style=\"font-weight: 600; margin-bottom: 8px;\">       </div>       <ul align=\"left\" style=\"margin-top: 0;\">         <li>Cross-compiling containers to RISC-V 64-bit</li>         <li>Running them in a userland RISC-V emulator (libriscv)</li>       </ul>     </td>     <td valign=\"bottom\" style=\"border: none;\">       <img width=\"238\" height=\"313\" alt=\"fh\" src=\"https://github.com/user-attachments/assets/aa87c5bc-18ec-470e-8ee8-8a013609bb18\" />     </td>   </tr> </table> </div> <br>",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maceip/friscy.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/maceip/friscy/issues"
+  },
+  "homepage": "https://github.com/maceip/friscy#readme",
+  "dependencies": {
+    "puppeteer": "^24.37.2"
+  }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "rv2wasm-jit"
+version = "0.1.0"
+edition = "2021"
+description = "RISC-V to WebAssembly JIT compiler (wasm-bindgen wrapper)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rv2wasm = { path = "../aot" }
+wasm-bindgen = "0.2"
+anyhow = "1.0"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

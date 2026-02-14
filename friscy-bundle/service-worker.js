@@ -1,93 +1,88 @@
-const CACHE_NAME = 'friscy-cache-v3'; // Tagged cache for versioning
+const CACHE_NAME = 'friscy-cache-v9';
 const CACHE_ASSETS = [
-  './', // Cache index.html
+  './',
   './index.html',
   './friscy.js',
   './friscy.wasm',
   './rootfs.tar',
   './manifest.json',
+  './network_bridge.js',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm',
   'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm',
 ];
 
-// Install event: cache assets
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then((cache) => {
-        console.log('[Service Worker] Caching all assets');
-        return cache.addAll(CACHE_ASSETS);
-      })
-      .catch(error => {
-        console.error('[Service Worker] Caching failed:', error);
-      })
-  );
-});
+// Small files that change often during development — always fetch fresh
+const NETWORK_FIRST = new Set([
+  '/friscy.js',
+  '/friscy.wasm',
+  '/index.html',
+  '/manifest.json',
+  '/network_bridge.js',
+  '/',
+]);
 
-// Activate event: clean up old caches
-self.addEventListener('activate', (event) => {
+// Install: cache assets, activate immediately
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames.map((cacheName) => {
-          if (cacheName !== CACHE_NAME) {
-            console.log('[Service Worker] Deleting old cache:', cacheName);
-            return caches.delete(cacheName);
-          }
-        })
+    caches.open(CACHE_NAME).then((cache) => {
+      return Promise.allSettled(
+        CACHE_ASSETS.map(url =>
+          cache.add(url).catch(e => console.warn('[SW] Failed to cache:', url, e.message))
+        )
       );
     })
   );
 });
 
-// Fetch event: serve from cache if available, otherwise fetch from network
-self.addEventListener('fetch', (event) => {
-  // Always go to network for friscy.js and friscy.wasm if they are not yet in cache
-  // This is because friscy.js might be re-generated often during development
-  // We want to serve friscy.js and friscy.wasm from cache only if they are already present
-  // For other assets, use a cache-first strategy.
-  const url = new URL(event.request.url);
-  const isLocalAsset = url.origin === self.location.origin && ( // Use self.location.origin in SW
-    url.pathname.endsWith('/friscy.js') ||
-    url.pathname.endsWith('/friscy.wasm') ||
-    url.pathname.endsWith('/rootfs.tar') ||
-    url.pathname.endsWith('/manifest.json')
+// Activate: purge old caches, claim clients
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((names) =>
+      Promise.all(names.map(n => n !== CACHE_NAME ? caches.delete(n) : undefined))
+    ).then(() => self.clients.claim())
   );
+});
 
-  if (isLocalAsset) {
+// Fetch: network-first for small dev files, cache-first for large assets (rootfs.tar)
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+
+  // Only intercept same-origin or CDN assets
+  const isSameOrigin = url.origin === self.location.origin;
+  const useNetworkFirst = isSameOrigin && NETWORK_FIRST.has(url.pathname);
+
+  if (useNetworkFirst) {
+    // Network-first: always get latest, fall back to cache
     event.respondWith(
-      caches.match(event.request).then((cachedResponse) => {
-        // Cache-first, but update cache from network in background
-        const fetchAndCache = fetch(event.request).then((networkResponse) => {
-          if (networkResponse.ok) {
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, networkResponse.clone());
-            });
-          }
-          return networkResponse;
-        }).catch(() => {
-            // Network failed, return cached response if available
-            return cachedResponse || new Response('Network request failed and no cache available', { status: 408, headers: { 'Content-Type': 'text/plain' } });
-        });
-
-        return cachedResponse || fetchAndCache;
-      })
+      fetch(event.request).then((resp) => {
+        if (resp.ok) {
+          const clone = resp.clone();
+          caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
+        }
+        return resp;
+      }).catch(() =>
+        caches.match(event.request).then(r =>
+          r || new Response('Offline', { status: 503 })
+        )
+      )
     );
   } else {
-    // For all other requests (like CDN assets), use a cache-first strategy
+    // Cache-first: serve instantly from cache (rootfs.tar, CDN libs, etc.)
     event.respondWith(
-      caches.match(event.request).then((cachedResponse) => {
-        return cachedResponse || fetch(event.request).then((networkResponse) => {
-          // Cache successful responses
-          if (networkResponse.ok) {
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, networkResponse.clone());
-            });
+      caches.match(event.request).then((cached) => {
+        if (cached) return cached;
+        return fetch(event.request).then((resp) => {
+          if (resp.ok) {
+            const clone = resp.clone();
+            caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
           }
-          return networkResponse;
+          return resp;
         });
-      })
+      }).catch(() =>
+        new Response('Offline', { status: 503 })
+      )
     );
   }
 });

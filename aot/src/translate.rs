@@ -250,9 +250,12 @@ pub fn translate(
         .unwrap_or(0);
     let memory_pages = ((max_addr + 0xFFFF) / 0x10000) as u32;
 
+    // Collect all block addresses for inline caching
+    let block_addrs: Vec<u64> = cfg.blocks.keys().copied().collect();
+
     // Translate each basic block to a function
     for (idx, (addr, block)) in cfg.blocks.iter().enumerate() {
-        let func = translate_block(block, idx, debug)?;
+        let func = translate_block(block, idx, debug, if opt_level >= 2 { &block_addrs } else { &[] })?;
         block_to_func.insert(*addr, functions.len());
         functions.push(func);
     }
@@ -272,8 +275,9 @@ pub fn translate(
     })
 }
 
-/// Translate a single basic block to a Wasm function
-fn translate_block(block: &BasicBlock, func_idx: usize, debug: bool) -> Result<WasmFunction> {
+/// Translate a single basic block to a Wasm function.
+/// `ic_targets` contains known block addresses for inline caching of JALR.
+fn translate_block(block: &BasicBlock, _func_idx: usize, debug: bool, ic_targets: &[u64]) -> Result<WasmFunction> {
     let mut body = Vec::new();
 
     // Function signature: (param $m i32) (result i32)
@@ -299,7 +303,7 @@ fn translate_block(block: &BasicBlock, func_idx: usize, debug: bool) -> Result<W
 
     // Add return for next PC
     if let Some(term) = block.terminator() {
-        add_terminator_return(term, block, &mut body)?;
+        add_terminator_return(term, block, &mut body, ic_targets)?;
     } else {
         // Fall through to next instruction
         body.push(WasmInst::I32Const {
@@ -2210,11 +2214,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
     Ok(())
 }
 
-/// Add return instruction based on terminator
+/// Add return instruction based on terminator.
+/// `ic_targets` contains known block addresses for inline caching of JALR.
 fn add_terminator_return(
     inst: &Instruction,
     block: &BasicBlock,
     body: &mut Vec<WasmInst>,
+    ic_targets: &[u64],
 ) -> Result<()> {
     let rd = inst.rd.unwrap_or(0) as u32;
     let rs1 = inst.rs1.unwrap_or(0) as u32;
@@ -2279,7 +2285,7 @@ fn add_terminator_return(
         }
 
         Opcode::JALR | Opcode::C_JALR => {
-            // rd = PC + len
+            // rd = PC + len (link address for function call)
             if rd != 0 {
                 let link_addr = inst.addr + inst.len as u64;
                 body.push(WasmInst::LocalGet { idx: 0 });
@@ -2288,14 +2294,54 @@ fn add_terminator_return(
                 });
                 body.push(WasmInst::I64Store { offset: rd * 8 });
             }
-            // Jump to (x[rs1] + imm) & ~1
+
+            // Compute target = (x[rs1] + imm) & ~1
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::I64Load { offset: rs1 * 8 });
-            body.push(WasmInst::I64Const { value: imm });
-            body.push(WasmInst::I64Add);
+            if imm != 0 {
+                body.push(WasmInst::I64Const { value: imm });
+                body.push(WasmInst::I64Add);
+            }
             body.push(WasmInst::I64Const { value: !1i64 });
             body.push(WasmInst::I64And);
             body.push(WasmInst::I32WrapI64);
+
+            // Inline caching for call-like JALR (rd != 0):
+            // If this block has known successors in the CFG, emit guarded
+            // direct returns. The Wasm engine can constant-fold these checks,
+            // and the dispatch loop's br_table becomes trivially predictable
+            // when the same target PC returns repeatedly.
+            let successors: Vec<u64> = if rd != 0 {
+                block.successors.iter()
+                    .filter(|&&s| ic_targets.contains(&s))
+                    .copied()
+                    .take(2) // max 2 IC guards to limit code bloat (<10%)
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            if !successors.is_empty() {
+                // Store computed target in local for IC checks
+                body.push(WasmInst::LocalSet { idx: 1 });
+
+                for &target_pc in &successors {
+                    // if (target == expected_pc) return expected_pc_const
+                    // Using: block { br_if(cond, skip) ; return const ; } end
+                    body.push(WasmInst::Block { label: 0 });
+                    body.push(WasmInst::LocalGet { idx: 1 });
+                    body.push(WasmInst::I32Const { value: target_pc as i32 });
+                    body.push(WasmInst::I32Ne); // skip if NOT equal
+                    body.push(WasmInst::BrIf { label: 0 }); // break out of block
+                    body.push(WasmInst::I32Const { value: target_pc as i32 });
+                    body.push(WasmInst::Return);
+                    body.push(WasmInst::End);
+                }
+
+                // Fallback: return computed target from local
+                body.push(WasmInst::LocalGet { idx: 1 });
+            }
+
             body.push(WasmInst::Return);
         }
 
@@ -2393,6 +2439,39 @@ fn emit_branch_zero(body: &mut Vec<WasmInst>, rs1: u32, imm: i64, pc: u64, fallt
     }
     body.push(WasmInst::Select);
     body.push(WasmInst::Return);
+}
+
+/// Translate CFG to Wasm module for JIT mode.
+///
+/// Differences from AOT `translate()`:
+/// - Memory pages fixed (not derived from ELF segments)
+/// - No ElfInfo dependency — caller provides base address
+/// - Block functions identical to AOT (same register layout)
+pub fn translate_jit(
+    cfg: &ControlFlowGraph,
+    base_addr: u64,
+) -> Result<WasmModule> {
+    let mut functions = Vec::new();
+    let mut block_to_func = std::collections::HashMap::new();
+    let block_addrs: Vec<u64> = cfg.blocks.keys().copied().collect();
+
+    for (_addr, block) in cfg.blocks.iter() {
+        let func = translate_block(block, functions.len(), false, &block_addrs)?;
+        block_to_func.insert(block.start_addr, functions.len());
+        functions.push(func);
+    }
+
+    // Optimize
+    for func in &mut functions {
+        optimize_function(func);
+    }
+
+    Ok(WasmModule {
+        functions,
+        memory_pages: 0, // JIT modules import memory; pages set by host
+        entry: base_addr,
+        block_to_func,
+    })
 }
 
 /// Basic peephole optimizations

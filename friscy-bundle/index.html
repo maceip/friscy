@@ -25,43 +25,83 @@
         }
         h1 { font-size: 1.2rem; font-weight: 500; }
         .status { font-size: 0.85rem; color: #888; margin-top: 0.25rem; }
+        .net-status {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            margin-left: 0.5rem;
+        }
+        .net-status.connected { background: #1a4d2e; color: #98c379; }
+        .net-status.disconnected { background: #4d1a1a; color: #e06c75; }
+        .net-status.connecting { background: #4d3d1a; color: #e5c07b; }
         #terminal-container {
             flex: 1;
             padding: 1rem;
             display: flex;
             flex-direction: column;
-            overflow: hidden; /* Prevent scrollbars from container itself */
+            overflow: hidden;
         }
         #terminal {
             flex: 1;
             border-radius: 8px;
             overflow: hidden;
-            display: flex; /* Ensure terminal content fills space */
+            display: flex;
         }
         .xterm-viewport {
-             overflow-y: auto; /* Enable scroll for terminal content */
+             overflow-y: auto;
         }
-        .loading {
+        /* Progress overlay */
+        #progress-overlay {
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
             height: 100%;
-            font-size: 1.1rem;
-            text-align: center;
+            gap: 1.5rem;
+            background: #0d1117;
+            border-radius: 8px;
         }
-        .loading::after {
-            content: '';
-            width: 20px;
-            height: 20px;
-            border: 2px solid #fff;
-            border-top-color: transparent;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-left: 1rem;
-            flex-shrink: 0;
+        #progress-overlay.hidden { display: none; }
+        .progress-title {
+            font-size: 1.4rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
         }
-        @keyframes spin { to { transform: rotate(360deg); } }
+        .progress-stage {
+            font-size: 0.9rem;
+            color: #8b949e;
+        }
+        .progress-wave {
+            width: min(400px, 80%);
+            height: 24px;
+        }
+        .progress-detail {
+            font-size: 0.8rem;
+            color: #484f58;
+            font-variant-numeric: tabular-nums;
+        }
 
+        /* Test wave strips: always visible top-left and top-right */
+        .test-waves {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex: 1;
+            margin: 0 1rem;
+            gap: 0.5rem;
+        }
+        .test-wave-label {
+            font-size: 0.6rem;
+            color: #586069;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            white-space: nowrap;
+        }
+        .test-wave-canvas {
+            height: 18px;
+            flex: 1;
+            max-width: 200px;
+        }
         .terminal-actions button {
             background-color: #0f3460;
             color: #eee;
@@ -81,7 +121,13 @@
     <header>
         <div>
             <h1>friscy container</h1>
-            <div class="status" id="status">Loading...</div>
+            <div class="status" id="status">Loading...<span id="net-status" class="net-status disconnected">net: off</span></div>
+        </div>
+        <div class="test-waves">
+            <span class="test-wave-label">sine</span>
+            <canvas id="test-sine-canvas" class="test-wave-canvas"></canvas>
+            <canvas id="test-squiggly-canvas" class="test-wave-canvas"></canvas>
+            <span class="test-wave-label">squiggly</span>
         </div>
         <div class="terminal-actions">
             <button id="fit-button">Fit Terminal</button>
@@ -89,7 +135,13 @@
         </div>
     </header>
     <div id="terminal-container">
-        <div id="terminal" class="loading">Initializing container...</div>
+        <div id="progress-overlay">
+            <div class="progress-title">friscy</div>
+            <div class="progress-stage" id="progress-stage">Preparing...</div>
+            <canvas id="progress-canvas" class="progress-wave" width="800" height="48"></canvas>
+            <div class="progress-detail" id="progress-detail">&nbsp;</div>
+        </div>
+        <div id="terminal" style="display:none;"></div>
     </div>
 
     <!-- Register service worker -->
@@ -111,64 +163,710 @@
     <script type="module">
         import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm';
         import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm';
-        import createFriscy from './friscy.js';
+        import { FriscyNetworkBridge } from './network_bridge.js';
+        import { NetworkRPCHost } from './network_rpc_host.js';
 
         const statusEl = document.getElementById('status');
+        const netStatusEl = document.getElementById('net-status');
         const terminalEl = document.getElementById('terminal');
 
-        let term, fitAddon, friscyModule;
-        const inputBuffer = [];
+        let term, fitAddon;
+        let worker = null;
+        let netBridge = null;
+        let netRPCHost = null;
         let machineRunning = false;
-        let resumeScheduled = false;
+
+        // SharedArrayBuffers for Worker communication
+        let controlSab = null;
+        let stdoutSab = null;
+        let netSab = null;
+        let controlView = null;
+        let stdoutView = null;
+        let stdoutBytes = null;
+
+        const RING_HEADER = 8;
+        const RING_SIZE = 65528;
+        const CMD_IDLE = 0;
+        const CMD_STDIN_REQUEST = 2;
+        const CMD_STDIN_READY = 3;
+        const CMD_EXIT = 4;
+
+        // Pending stdin bytes from terminal input
+        const stdinQueue = [];
+
+        // Expose for testing (Puppeteer)
+        window._friscyStdinQueue = stdinQueue;
+
+        function updateNetStatus(state) {
+            netStatusEl.className = 'net-status ' + state;
+            const labels = { connected: 'net: on', disconnected: 'net: off', connecting: 'net: ...' };
+            netStatusEl.textContent = labels[state] || state;
+        }
 
         function updateTerminalSize() {
-            if (friscyModule && term && fitAddon) {
+            if (term && fitAddon) {
                 fitAddon.fit();
-                friscyModule._termRows = term.rows;
-                friscyModule._termCols = term.cols;
+                // Notify worker of new terminal dimensions
+                if (worker) {
+                    worker.postMessage({ type: 'resize', rows: term.rows, cols: term.cols });
+                }
             }
         }
 
-        // Resume the RISC-V machine when it's waiting for stdin.
-        // Called on keyboard input and after callMain returns.
-        function scheduleResume() {
-            if (!machineRunning || resumeScheduled) return;
-            const stopped = friscyModule._friscy_stopped;
-            if (!stopped || !stopped()) return;
+        /**
+         * Read stdout ring buffer and write to terminal.
+         * Called on a polling interval from the main thread.
+         */
+        function drainStdout() {
+            if (!stdoutView || !stdoutBytes || !term) return;
 
-            resumeScheduled = true;
-            setTimeout(() => {
-                resumeScheduled = false;
-                if (!machineRunning) return;
+            const writeHead = Atomics.load(stdoutView, 0);
+            const readTail = Atomics.load(stdoutView, 1);
+            if (writeHead === readTail) return; // empty
 
-                friscyModule._friscy_resume();
+            let available;
+            if (writeHead >= readTail) {
+                available = writeHead - readTail;
+            } else {
+                available = RING_SIZE - readTail + writeHead;
+            }
+            if (available <= 0) return;
 
-                if (friscyModule._friscy_stopped()) {
-                    // Still waiting for more stdin — resume again if buffer has data
-                    if (inputBuffer.length > 0) {
-                        scheduleResume();
-                    } else {
-                        // Machine idle, waiting for input — show prompt
-                        term.write('\x1b[32m/ # \x1b[0m');
-                    }
-                } else {
-                    // Machine finished (guest called exit)
-                    machineRunning = false;
-                    term.writeln('\r\n\x1b[33mProcess exited\x1b[0m');
-                    statusEl.textContent = 'Exited';
+            const buf = new Uint8Array(available);
+            let pos = readTail;
+            for (let i = 0; i < available; i++) {
+                buf[i] = stdoutBytes[RING_HEADER + pos];
+                pos = (pos + 1) % RING_SIZE;
+            }
+
+            // Update read tail
+            Atomics.store(stdoutView, 1, pos);
+
+            // Decode and write to terminal
+            const text = new TextDecoder().decode(buf);
+            term.write(text);
+        }
+
+        /**
+         * Check if worker is requesting stdin. If so, provide data from stdinQueue.
+         * Called on a polling interval from the main thread.
+         */
+        function checkStdinRequest() {
+            if (!controlView) return;
+            const cmd = Atomics.load(controlView, 0);
+            if (cmd !== CMD_STDIN_REQUEST) return;
+
+            // Worker wants stdin — wait until we have data
+            if (stdinQueue.length === 0) return;
+
+            const maxLen = Atomics.load(controlView, 2);
+            const controlBytes = new Uint8Array(controlSab);
+            const toSend = Math.min(stdinQueue.length, maxLen, 3968);
+
+            for (let i = 0; i < toSend; i++) {
+                controlBytes[64 + i] = stdinQueue.shift();
+            }
+
+            Atomics.store(controlView, 2, toSend);
+            Atomics.store(controlView, 0, CMD_STDIN_READY);
+            Atomics.notify(controlView, 0);
+        }
+
+        /**
+         * Check for exit signal from worker.
+         */
+        function checkExit() {
+            if (!controlView) return false;
+            const cmd = Atomics.load(controlView, 0);
+            if (cmd === CMD_EXIT) {
+                machineRunning = false;
+                const exitCode = Atomics.load(controlView, 5);
+                term.writeln(`\r\n\x1b[33mProcess exited (code ${exitCode})\x1b[0m`);
+                statusEl.textContent = `Exited (${exitCode})`;
+                Atomics.store(controlView, 0, CMD_IDLE);
+                return true;
+            }
+            return false;
+        }
+
+        const overlayEl = document.getElementById('progress-overlay');
+        const stageEl = document.getElementById('progress-stage');
+        const detailEl = document.getElementById('progress-detail');
+
+        // Wavy progress bar — main (squiggly for page load)
+        const waveCanvas = document.getElementById('progress-canvas');
+        const waveCtx = waveCanvas.getContext('2d');
+        let wavePct = 0;          // 0-100, or -1 for indeterminate
+        let waveTarget = 0;       // smooth interpolation target
+        let waveIndeterminate = false;
+        let wavePhase = 0;
+        let waveAnimId = null;
+
+        // Main progress bar uses squiggly for page load
+        let waveMode = 'squiggly';
+
+        // Test wave canvases (always visible in header)
+        const testSineCanvas = document.getElementById('test-sine-canvas');
+        const testSineCtx = testSineCanvas.getContext('2d');
+        const testSquigglyCanvas = document.getElementById('test-squiggly-canvas');
+        const testSquigglyCtx = testSquigglyCanvas.getContext('2d');
+
+        // SquigglyProgress — ported from Android SystemUI SquigglyProgress.kt
+        // All measurements in CSS pixels (DPI-scaled automatically on canvas)
+        const SQ_WAVE_LENGTH = 32;     // CSS px, one full wave period
+        const SQ_LINE_AMP = 3;         // CSS px, peak amplitude (half of original)
+        const SQ_PHASE_SPEED = 8;      // CSS px/sec, gentle scroll speed
+        const SQ_STROKE_W = 6;         // CSS px, stroke width (2x original)
+        const SQ_TRANSITION_PERIODS = 1.5;  // wavelengths over which amplitude fades (indeterminate mode)
+        const SQ_DISABLED_ALPHA = 0.25; // alpha multiplier for unplayed flat line (~64/255)
+        const SQ_TWO_PI = Math.PI * 2;
+
+        // Sinusoidal wave parameters
+        const SINE_WAVE_LENGTH = 40;   // CSS px, one full sine period
+        const SINE_AMP = 4;            // CSS px, peak amplitude
+        const SINE_PHASE_SPEED = 60;   // CSS px/sec, scrolling speed
+        const SINE_STROKE_W = 3;       // CSS px, stroke width
+        const SINE_STEP = 2;           // CSS px per lineTo segment (resolution)
+
+        const FILL_COLOR = '#2ea043';
+        const WARN_COLOR = '#d29922';
+        const ERR_COLOR = '#e06c75';
+        let waveColor = null;  // null = use FILL_COLOR
+
+        let heightFraction = 1;  // amplitude scale (0=flat, 1=full wave)
+        let sqPhaseOffset = 0;
+        let sqLastTime = -1;
+
+        // Demo mode state (computed inside drawWave — single rAF loop, no racing)
+        let demoActive = true;
+        let demoStartTime = -1;
+        let demoDuration = 60000 + Math.random() * 60000; // 1-2 minutes
+
+        // DPI-aware canvas setup (crisp on retina/high-DPI displays)
+        function setupCanvasDPI(canvas, ctx) {
+            const dpr = window.devicePixelRatio || 1;
+            const cssW = canvas.clientWidth;
+            const cssH = canvas.clientHeight;
+            if (cssW > 0 && cssH > 0) {
+                canvas.width = Math.round(cssW * dpr);
+                canvas.height = Math.round(cssH * dpr);
+                ctx.scale(dpr, dpr);
+            }
+        }
+        setupCanvasDPI(waveCanvas, waveCtx);
+        setupCanvasDPI(testSineCanvas, testSineCtx);
+        setupCanvasDPI(testSquigglyCanvas, testSquigglyCtx);
+
+        // Helper: clamp-lerp inverse (lerpInvSat)
+        function lerpInvSat(a, b, v) {
+            return Math.max(0, Math.min(1, (v - a) / (b - a)));
+        }
+
+        // Build the cubic-bezier wave path as an array of bezier segments.
+        // Each half-wavelength is one cubic bezier curve.
+        // Returns a Path2D spanning from waveStart to waveEnd.
+        function buildWavePath(waveStart, waveEnd, waveProgressPx, transitionEnabled) {
+            const path = new Path2D();
+            path.moveTo(waveStart, 0);
+
+            let currentX = waveStart;
+            let waveSign = 1;
+            const dist = SQ_WAVE_LENGTH / 2;
+
+            function computeAmp(x, sign) {
+                if (transitionEnabled) {
+                    const length = SQ_TRANSITION_PERIODS * SQ_WAVE_LENGTH;
+                    const coeff = lerpInvSat(
+                        waveProgressPx + length / 2,
+                        waveProgressPx - length / 2, x);
+                    return sign * heightFraction * SQ_LINE_AMP * coeff;
                 }
-            }, 5);
+                return sign * heightFraction * SQ_LINE_AMP;
+            }
+
+            let currentAmp = computeAmp(currentX, waveSign);
+            while (currentX < waveEnd) {
+                waveSign = -waveSign;
+                const nextX = currentX + dist;
+                const midX = currentX + dist / 2;
+                const nextAmp = computeAmp(nextX, waveSign);
+                path.bezierCurveTo(midX, currentAmp, midX, nextAmp, nextX, nextAmp);
+                currentAmp = nextAmp;
+                currentX = nextX;
+            }
+            return path;
+        }
+
+        // --- Sinusoidal wave renderer ---
+        // Draws a true Math.sin() wave with lineTo segments.
+        // Smooth, continuous, no bezier discretization artifacts.
+        function drawSineProgress(ctx, W, H, now, progress, color) {
+            const midY = H / 2;
+            const amp = SINE_AMP;
+            const wl = SINE_WAVE_LENGTH;
+            const sw = SINE_STROKE_W;
+            const step = SINE_STEP;
+
+            // Phase scrolls rightward continuously
+            const phase = (now / 1000) * SINE_PHASE_SPEED;
+            const totalProgressPx = W * progress;
+
+            ctx.save();
+            ctx.translate(0, midY);
+
+            // Unplayed portion: dimmed flat line
+            if (totalProgressPx < W) {
+                ctx.save();
+                ctx.strokeStyle = color;
+                ctx.globalAlpha = SQ_DISABLED_ALPHA;
+                ctx.lineWidth = sw;
+                ctx.lineCap = 'round';
+                ctx.beginPath();
+                ctx.moveTo(totalProgressPx, 0);
+                ctx.lineTo(W, 0);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // Played portion: sine wave (full alpha, clipped to progress)
+            if (totalProgressPx > 0) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(0, -(amp + sw), totalProgressPx, (amp + sw) * 2);
+                ctx.clip();
+                ctx.strokeStyle = color;
+                ctx.globalAlpha = 1;
+                ctx.lineWidth = sw;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+                for (let x = 0; x <= W; x += step) {
+                    const y = Math.sin(SQ_TWO_PI * (x - phase) / wl) * amp;
+                    if (x === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            ctx.restore();
+        }
+
+        // --- Sinusoidal wave: indeterminate mode ---
+        function drawSineIndeterminate(ctx, W, H, now, color) {
+            const midY = H / 2;
+            const amp = SINE_AMP;
+            const wl = SINE_WAVE_LENGTH;
+            const sw = SINE_STROKE_W;
+            const step = SINE_STEP;
+            const phase = (now / 1000) * SINE_PHASE_SPEED;
+
+            // Bouncing highlight region
+            const cycle = now * 0.001;
+            const pos = Math.sin(cycle * 1.3) * 0.5 + 0.5;
+            const fakeProgress = 0.15 + pos * 0.7;
+            const totalProgressPx = W * fakeProgress;
+
+            ctx.save();
+            ctx.translate(0, midY);
+
+            // Full wave, dimmed
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(totalProgressPx, -(amp + sw), W - totalProgressPx, (amp + sw) * 2);
+            ctx.clip();
+            ctx.strokeStyle = color;
+            ctx.globalAlpha = SQ_DISABLED_ALPHA;
+            ctx.lineWidth = sw;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            for (let x = 0; x <= W; x += step) {
+                const y = Math.sin(SQ_TWO_PI * (x - phase) / wl) * amp;
+                if (x === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            ctx.restore();
+
+            // Played portion, bright
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(0, -(amp + sw), totalProgressPx, (amp + sw) * 2);
+            ctx.clip();
+            ctx.strokeStyle = color;
+            ctx.globalAlpha = 1;
+            ctx.lineWidth = sw;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            for (let x = 0; x <= W; x += step) {
+                const y = Math.sin(SQ_TWO_PI * (x - phase) / wl) * amp;
+                if (x === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            ctx.restore();
+
+            ctx.restore();
+        }
+
+        // --- Squiggly (bezier) wave: determinate mode ---
+        function drawSquigglyProgress(ctx, W, H, now, progress, color) {
+            const midY = H / 2;
+            const totalProgressPx = W * progress;
+            const waveStart = -sqPhaseOffset - SQ_WAVE_LENGTH / 2;
+            const path = buildWavePath(waveStart, totalProgressPx + SQ_WAVE_LENGTH, totalProgressPx, false);
+
+            ctx.save();
+            ctx.translate(0, midY);
+
+            // Unplayed: flat line
+            if (totalProgressPx < W) {
+                ctx.save();
+                ctx.strokeStyle = color;
+                ctx.globalAlpha = SQ_DISABLED_ALPHA;
+                ctx.lineWidth = SQ_STROKE_W;
+                ctx.lineCap = 'round';
+                ctx.beginPath();
+                ctx.moveTo(totalProgressPx, 0);
+                ctx.lineTo(W, 0);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // Played: squiggly wave clipped to progress
+            if (totalProgressPx > 0) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(0, -(SQ_LINE_AMP + SQ_STROKE_W),
+                    totalProgressPx, (SQ_LINE_AMP + SQ_STROKE_W) * 2);
+                ctx.clip();
+                ctx.strokeStyle = color;
+                ctx.globalAlpha = 1;
+                ctx.lineWidth = SQ_STROKE_W;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.stroke(path);
+                ctx.restore();
+            }
+
+            // Round cap at x=0
+            const startAmp = Math.cos(Math.abs(waveStart) / SQ_WAVE_LENGTH * SQ_TWO_PI);
+            ctx.beginPath();
+            ctx.arc(0, startAmp * SQ_LINE_AMP * heightFraction,
+                SQ_STROKE_W / 2, 0, SQ_TWO_PI);
+            ctx.fillStyle = color;
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        // --- Squiggly (bezier) wave: indeterminate mode ---
+        function drawSquigglyIndeterminate(ctx, W, H, now, color) {
+            const midY = H / 2;
+            const cycle = now * 0.001;
+            const pos = Math.sin(cycle * 1.3) * 0.5 + 0.5;
+            const fakeProgress = 0.15 + pos * 0.7;
+            const totalProgressPx = W * fakeProgress;
+            const waveStart = -sqPhaseOffset - SQ_WAVE_LENGTH / 2;
+            const path = buildWavePath(waveStart, W, totalProgressPx, true);
+
+            ctx.save();
+            ctx.translate(0, midY);
+
+            // Unplayed (dimmed)
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(totalProgressPx, -(SQ_LINE_AMP + SQ_STROKE_W),
+                W - totalProgressPx, (SQ_LINE_AMP + SQ_STROKE_W) * 2);
+            ctx.clip();
+            ctx.strokeStyle = color;
+            ctx.globalAlpha = SQ_DISABLED_ALPHA;
+            ctx.lineWidth = SQ_STROKE_W;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.stroke(path);
+            ctx.restore();
+
+            // Played (full alpha)
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(0, -(SQ_LINE_AMP + SQ_STROKE_W),
+                totalProgressPx, (SQ_LINE_AMP + SQ_STROKE_W) * 2);
+            ctx.clip();
+            ctx.strokeStyle = color;
+            ctx.globalAlpha = 1;
+            ctx.lineWidth = SQ_STROKE_W;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.stroke(path);
+            ctx.restore();
+
+            // Round cap at x=0
+            const startAmp = Math.cos(Math.abs(waveStart) / SQ_WAVE_LENGTH * SQ_TWO_PI);
+            ctx.beginPath();
+            ctx.arc(0, startAmp * SQ_LINE_AMP * heightFraction,
+                SQ_STROKE_W / 2, 0, SQ_TWO_PI);
+            ctx.fillStyle = color;
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        // Ensure canvas pixel buffer matches CSS size (call each frame)
+        function ensureCanvasDPI(canvas, ctx) {
+            const dpr = window.devicePixelRatio || 1;
+            const cssW = canvas.clientWidth;
+            const cssH = canvas.clientHeight;
+            const pixW = Math.round(cssW * dpr);
+            const pixH = Math.round(cssH * dpr);
+            if (pixW > 0 && pixH > 0 && (canvas.width !== pixW || canvas.height !== pixH)) {
+                canvas.width = pixW;
+                canvas.height = pixH;
+                ctx.scale(dpr, dpr);
+            }
+            return { W: cssW, H: cssH };
+        }
+
+        // --- Single unified animation loop (no racing rAF callbacks) ---
+        function drawWave(timestamp) {
+            const now = timestamp || performance.now();
+
+            // Demo mode: compute progress directly here (same rAF frame, zero lag)
+            if (demoActive) {
+                if (demoStartTime < 0) demoStartTime = now;
+                const elapsed = now - demoStartTime;
+                const pct = Math.min(100, (elapsed / demoDuration) * 100);
+                wavePct = pct;
+                waveTarget = pct;
+                waveIndeterminate = false;
+                if (pct >= 100) {
+                    demoStartTime = now + 2000;
+                    demoDuration = 60000 + Math.random() * 60000;
+                    wavePct = 0;
+                    waveTarget = 0;
+                }
+            } else if (!waveIndeterminate) {
+                wavePct += (waveTarget - wavePct) * 0.12;
+            }
+
+            // Squiggly phase animation (time-based)
+            if (sqLastTime < 0) sqLastTime = now;
+            sqPhaseOffset += (now - sqLastTime) / 1000 * SQ_PHASE_SPEED;
+            sqPhaseOffset %= SQ_WAVE_LENGTH;
+            sqLastTime = now;
+
+            const color = waveColor || FILL_COLOR;
+            const progress = wavePct / 100;
+
+            // --- Main progress canvas (squiggly for page load) ---
+            {
+                const { W, H } = ensureCanvasDPI(waveCanvas, waveCtx);
+                waveCtx.clearRect(0, 0, W, H);
+                if (waveIndeterminate) {
+                    if (waveMode === 'sine') drawSineIndeterminate(waveCtx, W, H, now, color);
+                    else drawSquigglyIndeterminate(waveCtx, W, H, now, color);
+                } else {
+                    if (waveMode === 'sine') drawSineProgress(waveCtx, W, H, now, progress, color);
+                    else drawSquigglyProgress(waveCtx, W, H, now, progress, color);
+                }
+            }
+
+            // --- Test sine canvas (top-left in header) ---
+            {
+                const { W, H } = ensureCanvasDPI(testSineCanvas, testSineCtx);
+                testSineCtx.clearRect(0, 0, W, H);
+                drawSineProgress(testSineCtx, W, H, now, progress, color);
+            }
+
+            // --- Test squiggly canvas (top-right in header) ---
+            {
+                const { W, H } = ensureCanvasDPI(testSquigglyCanvas, testSquigglyCtx);
+                testSquigglyCtx.clearRect(0, 0, W, H);
+                drawSquigglyProgress(testSquigglyCtx, W, H, now, progress, color);
+            }
+
+            waveAnimId = requestAnimationFrame(drawWave);
+        }
+
+        // Start single animation loop
+        waveAnimId = requestAnimationFrame(drawWave);
+
+        function setProgress(pct, stage, detail) {
+            demoActive = false; // real progress overrides demo
+            if (stage) stageEl.textContent = stage;
+            if (pct < 0) {
+                waveIndeterminate = true;
+            } else {
+                waveIndeterminate = false;
+                waveTarget = pct;
+            }
+            detailEl.textContent = detail || '\u00a0';
+        }
+
+        function formatBytes(bytes) {
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+            return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+        }
+
+        const STALL_TIMEOUT_MS = 10000;  // 10s with no data = stalled
+        const MAX_RETRIES = 5;
+        const RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000]; // backoff
+
+        async function fetchWithProgress(url) {
+            // First request to get total size
+            let total = 0;
+            const chunks = [];
+            let loaded = 0;
+            let retries = 0;
+            const startTime = performance.now();
+
+            while (true) {
+                try {
+                    const headers = {};
+                    if (loaded > 0) {
+                        headers['Range'] = `bytes=${loaded}-`;
+                    }
+
+                    waveColor = null; // reset to green
+                    const resp = await fetch(url, { headers });
+
+                    if (!resp.ok && resp.status !== 206) {
+                        throw new Error(`HTTP ${resp.status}`);
+                    }
+
+                    // Get total size from first request or Content-Range on resume
+                    if (total === 0) {
+                        if (resp.status === 206) {
+                            const range = resp.headers.get('Content-Range');
+                            if (range) total = parseInt(range.split('/')[1], 10) || 0;
+                        } else {
+                            total = parseInt(resp.headers.get('Content-Length'), 10) || 0;
+                        }
+                    }
+
+                    if (!resp.body) {
+                        // No streaming support — fallback
+                        const buf = await resp.arrayBuffer();
+                        setProgress(100, null, formatBytes(buf.byteLength) + ' downloaded');
+                        return buf;
+                    }
+
+                    const reader = resp.body.getReader();
+                    retries = 0; // reset on successful connection
+
+                    if (loaded > 0) {
+                        waveColor = null;
+                        setProgress(
+                            total ? Math.round((loaded / total) * 100) : -1,
+                            `Downloading (resumed)...`
+                        );
+                    }
+
+                    while (true) {
+                        // Race read against stall timeout
+                        const readPromise = reader.read();
+                        const timeoutPromise = new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('stall')), STALL_TIMEOUT_MS)
+                        );
+
+                        let result;
+                        try {
+                            result = await Promise.race([readPromise, timeoutPromise]);
+                        } catch (e) {
+                            // Stall detected — abort this reader and retry
+                            try { reader.cancel(); } catch (_) {}
+                            waveColor = WARN_COLOR;
+                            setProgress(
+                                total ? Math.round((loaded / total) * 100) : -1,
+                                null,
+                                'Download stalled, retrying...'
+                            );
+                            throw e;
+                        }
+
+                        const { done, value } = result;
+                        if (done) break;
+
+                        chunks.push(value);
+                        loaded += value.length;
+                        const pct = total ? Math.min(99, Math.round((loaded / total) * 100)) : -1;
+                        const elapsed = (performance.now() - startTime) / 1000;
+                        const speed = elapsed > 0 ? loaded / elapsed : 0;
+                        setProgress(pct, null,
+                            `${formatBytes(loaded)} / ${total ? formatBytes(total) : '?'}  \u2022  ${formatBytes(speed)}/s`);
+                    }
+
+                    // Download complete
+                    break;
+
+                } catch (err) {
+                    retries++;
+                    if (retries > MAX_RETRIES) {
+                        waveColor = ERR_COLOR;
+                        setProgress(
+                            total ? Math.round((loaded / total) * 100) : 0,
+                            'Download failed',
+                            `${err.message} \u2014 reload to retry`
+                        );
+                        throw new Error(`Download failed after ${MAX_RETRIES} retries: ${err.message}`);
+                    }
+
+                    const delay = RETRY_DELAYS[Math.min(retries - 1, RETRY_DELAYS.length - 1)];
+                    waveColor = WARN_COLOR;
+
+                    // Countdown retry timer
+                    for (let remaining = Math.ceil(delay / 1000); remaining > 0; remaining--) {
+                        setProgress(
+                            total ? Math.round((loaded / total) * 100) : 0,
+                            null,
+                            `Connection lost \u2014 retrying in ${remaining}s (attempt ${retries}/${MAX_RETRIES})`
+                        );
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+
+                    setProgress(
+                        total ? Math.round((loaded / total) * 100) : 0,
+                        null,
+                        `Reconnecting... (attempt ${retries}/${MAX_RETRIES})`
+                    );
+                }
+            }
+
+            // Combine chunks
+            const result = new Uint8Array(loaded);
+            let offset = 0;
+            for (const chunk of chunks) {
+                result.set(chunk, offset);
+                offset += chunk.length;
+            }
+            waveColor = null;
+            setProgress(100, null, formatBytes(loaded) + ' downloaded');
+            return result.buffer;
         }
 
         async function main() {
-            statusEl.textContent = 'Loading manifest...';
+            // Check for SharedArrayBuffer support (requires COOP/COEP headers)
+            if (typeof SharedArrayBuffer === 'undefined') {
+                statusEl.textContent = 'Error: SharedArrayBuffer not available';
+                stageEl.textContent = 'Cross-origin isolation required';
+                detailEl.textContent = 'Serve with COOP/COEP headers (use serve.js)';
+                return;
+            }
+
+            setProgress(-1, 'Loading manifest...');
             const manifest = await fetch('./manifest.json').then(r => r.json());
             statusEl.textContent = `Image: ${manifest.image}`;
 
-            // Initialize xterm.js
-            terminalEl.innerHTML = '';
-            terminalEl.classList.remove('loading');
+            // Download rootfs with progress
+            setProgress(0, `Downloading ${manifest.image}...`, 'Starting download...');
+            const rootfs = await fetchWithProgress('./rootfs.tar');
 
+            // Initialize runtime (indeterminate)
+            setProgress(-1, 'Initializing runtime...');
+
+            // Initialize xterm.js (hidden behind overlay)
             term = new Terminal({
                 cursorBlink: true,
                 convertEol: true,
@@ -200,112 +898,158 @@
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
             term.open(terminalEl);
-            term.focus();
-            updateTerminalSize();
 
             window.addEventListener('resize', updateTerminalSize);
             document.getElementById('fit-button').addEventListener('click', updateTerminalSize);
-            // Re-focus terminal when user clicks on it
             terminalEl.addEventListener('click', () => term.focus());
 
-            term.writeln('\x1b[1;32mfriscy\x1b[0m - Container runtime in WebAssembly');
-            term.writeln(`Loading ${manifest.image}...`);
-            term.writeln('');
+            // Create SharedArrayBuffers for Worker communication
+            controlSab = new SharedArrayBuffer(4096);   // Control channel
+            stdoutSab = new SharedArrayBuffer(65536);    // 64KB stdout ring buffer
+            netSab = new SharedArrayBuffer(65536);       // 64KB network RPC
 
-            // Load rootfs
-            statusEl.textContent = 'Loading rootfs...';
-            const rootfs = await fetch('./rootfs.tar').then(r => r.arrayBuffer());
-            term.writeln(`Loaded rootfs: ${(rootfs.byteLength / 1024 / 1024).toFixed(1)} MB`);
+            controlView = new Int32Array(controlSab);
+            stdoutView = new Int32Array(stdoutSab);
+            stdoutBytes = new Uint8Array(stdoutSab);
 
-            // Initialize friscy Wasm module
-            statusEl.textContent = 'Initializing runtime...';
-            friscyModule = await createFriscy({
-                noInitialRun: true,
-                print: (text) => term.writeln(text),
-                printErr: (text) => term.writeln('\x1b[31m' + text + '\x1b[0m'),
-                _stdinBuffer: inputBuffer,
-                _stdinEOF: false,
-                _termRows: term.rows,
-                _termCols: term.cols,
-                _termWrite: (text) => term.write(text),
+            // Write initial terminal dimensions into control SAB
+            fitAddon.fit();
+            Atomics.store(controlView, 6, term.cols);  // offset 24
+            Atomics.store(controlView, 7, term.rows);  // offset 28
+
+            // Spawn Worker
+            setProgress(-1, 'Starting worker...');
+            worker = new Worker('./worker.js', { type: 'module' });
+
+            // Wait for Worker to be ready
+            const workerReady = new Promise((resolve, reject) => {
+                worker.onmessage = (e) => {
+                    if (e.data.type === 'ready') resolve();
+                    if (e.data.type === 'error') reject(new Error(`Worker init failed: ${e.data.message}`));
+                };
+                worker.onerror = (e) => reject(new Error(e.message));
             });
 
-            // Load rootfs into Emscripten virtual FS
-            friscyModule.FS.writeFile('/rootfs.tar', new Uint8Array(rootfs));
+            // Send init message with SABs
+            worker.postMessage({
+                type: 'init',
+                controlSab,
+                stdoutSab,
+                netSab,
+            });
 
-            // Wire keyboard → stdin buffer → machine resume
-            // Shell runs in batch mode (no TTY echo), so we provide:
-            //   - Local echo for visual feedback
-            //   - Line buffering with backspace support
-            //   - \r → \n translation (xterm sends \r, Unix needs \n)
-            let lineBuffer = '';
+            await workerReady;
 
+            // Connect network bridge (optional — needs proxy server)
+            setProgress(-1, 'Connecting network...');
+            const proxyUrl = new URLSearchParams(location.search).get('proxy')
+                             || `https://${location.hostname}:4433/connect`;
+            try {
+                updateNetStatus('connecting');
+                netBridge = new FriscyNetworkBridge(proxyUrl);
+                await netBridge.connect();
+                updateNetStatus('connected');
+            } catch (e) {
+                updateNetStatus('disconnected');
+                console.warn('[friscy] Network bridge not available:', e.message);
+            }
+
+            // Start network RPC host (polls netSab for worker requests)
+            if (netBridge) {
+                netRPCHost = new NetworkRPCHost(netSab, netBridge);
+                netRPCHost.start();
+            }
+
+            // Transition: hide progress overlay, show terminal
+            overlayEl.classList.add('hidden');
+            terminalEl.style.display = 'flex';
+            term.focus();
+            updateTerminalSize();
+
+            const rootfsMB = (rootfs.byteLength / 1024 / 1024).toFixed(1);
+            term.writeln('\x1b[1;32mfriscy\x1b[0m container runtime');
+            term.writeln(`Image: ${manifest.image} (${rootfsMB} MB)`);
+            term.writeln(netBridge && netBridge.isAvailable()
+                ? '\x1b[32mNetwork: connected\x1b[0m'
+                : '\x1b[33mNetwork: offline (no proxy)\x1b[0m');
+            term.writeln('');
+
+            // --- Clipboard support (Ctrl+C copy / Ctrl+V paste) ---
+            term.attachCustomKeyEventHandler((ev) => {
+                if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
+                    navigator.clipboard.writeText(term.getSelection());
+                    return false;
+                }
+                if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'v') {
+                    navigator.clipboard.readText().then(text => {
+                        if (text) term.paste(text);
+                    }).catch(() => {});
+                    return false;
+                }
+                return true;
+            });
+
+            // --- Input handler: raw passthrough to guest stdin via SAB ---
             term.onData((data) => {
                 if (!machineRunning) return;
 
-                for (const ch of data) {
-                    const code = ch.charCodeAt(0);
+                for (let i = 0; i < data.length; i++) {
+                    const code = data.charCodeAt(i);
 
-                    if (ch === '\r') {
-                        // Enter → send buffered line + \n to shell
-                        term.write('\r\n');
-                        const line = lineBuffer + '\n';
-                        const bytes = new TextEncoder().encode(line);
-                        inputBuffer.push(...bytes);
-                        lineBuffer = '';
-                        scheduleResume();
-                    } else if (code === 127 || code === 8) {
-                        // Backspace
-                        if (lineBuffer.length > 0) {
-                            lineBuffer = lineBuffer.slice(0, -1);
-                            term.write('\b \b');
-                        }
-                    } else if (code === 3) {
-                        // Ctrl+C
-                        term.write('^C\r\n');
-                        lineBuffer = '';
+                    if (code === 3) {
+                        stdinQueue.push(0x03);
+                    } else if (code === 26) {
+                        stdinQueue.push(0x1a);
+                    } else if (code === 12) {
+                        term.clear();
+                        stdinQueue.push(0x0c);
                     } else if (code === 4) {
-                        // Ctrl+D → EOF when line is empty
-                        if (lineBuffer.length === 0) {
-                            friscyModule._stdinEOF = true;
-                            scheduleResume();
-                        }
-                    } else if (code >= 32) {
-                        // Printable character → echo and buffer
-                        term.write(ch);
-                        lineBuffer += ch;
+                        stdinQueue.push(0x04);
+                    } else if (data[i] === '\r') {
+                        stdinQueue.push(0x0a);
+                    } else if (code === 127) {
+                        stdinQueue.push(0x7f);
+                    } else if (code === 27) {
+                        const bytes = new TextEncoder().encode(data.slice(i));
+                        stdinQueue.push(...bytes);
+                        break;
+                    } else {
+                        const bytes = new TextEncoder().encode(data[i]);
+                        stdinQueue.push(...bytes);
                     }
                 }
+
+                // If worker is currently requesting stdin, fulfill it immediately
+                checkStdinRequest();
             });
+
+            // Start main polling loop: stdout drain, stdin check, exit check
+            const pollTimer = setInterval(() => {
+                drainStdout();
+                checkStdinRequest();
+                if (checkExit()) {
+                    clearInterval(pollTimer);
+                    if (netRPCHost) netRPCHost.stop();
+                }
+            }, 4); // ~4ms polling for responsive I/O
 
             // Build args matching main.cpp: --rootfs <tar> <entry> [args...]
             const guestCmd = manifest.entrypoint.split(' ').filter(s => s);
             const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
 
-            statusEl.textContent = 'Running...';
-            term.writeln('Starting: ' + manifest.entrypoint);
-            term.writeln('\u2500'.repeat(40));
+            statusEl.textContent = 'Booting...';
+            machineRunning = true;
 
-            // Run the container
-            try {
-                machineRunning = true;
-                friscyModule.callMain(args);
+            // Send rootfs data + run command to worker
+            // Transfer the ArrayBuffer to avoid copying 100+ MB
+            const rootfsArray = new Uint8Array(rootfs);
+            worker.postMessage({
+                type: 'run',
+                args,
+                rootfsData: rootfsArray.buffer,
+            }, [rootfsArray.buffer]);
 
-                // If machine stopped for stdin, enter interactive mode
-                if (friscyModule._friscy_stopped && friscyModule._friscy_stopped()) {
-                    statusEl.textContent = 'Interactive';
-                    scheduleResume();
-                } else {
-                    machineRunning = false;
-                    term.writeln('\r\n\x1b[33mProcess exited\x1b[0m');
-                    statusEl.textContent = 'Exited';
-                }
-            } catch (e) {
-                machineRunning = false;
-                term.writeln('\x1b[31mError: ' + e.message + '\x1b[0m');
-                statusEl.textContent = 'Error';
-                console.error(e);
-            }
+            statusEl.textContent = 'Interactive';
         }
 
         document.getElementById('reset-button').addEventListener('click', () => location.reload());

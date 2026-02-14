@@ -1,0 +1,18 @@
+# Dockerfile.claude - Build riscv64 Alpine rootfs with Node.js + Claude Code
+#
+# Usage:
+#   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.claude -t friscy-claude . --load
+#   docker create --name tmp friscy-claude
+#   docker export tmp > friscy-bundle/rootfs.tar
+#   docker rm tmp
+
+FROM --platform=linux/riscv64 alpine:edge
+
+# Install Node.js, npm, and essential tools
+RUN apk add --no-cache nodejs npm curl bash
+
+# Install Claude Code globally via npm (pure JS, no native addons)
+RUN npm install -g @anthropic-ai/claude-code
+
+# Default shell
+CMD ["/bin/sh"]

@@ -346,6 +346,12 @@ inline void sys_listen(Machine& m) {
     int result = ::listen(sock->native_fd, backlog);
     if (result == 0) {
         sock->listening = true;
+        // Set O_NONBLOCK so accept returns EAGAIN when no connections pending
+        // (guest uses epoll to wait for readiness)
+        int cur_flags = ::fcntl(sock->native_fd, F_GETFL, 0);
+        if (cur_flags >= 0) {
+            ::fcntl(sock->native_fd, F_SETFL, cur_flags | O_NONBLOCK);
+        }
         m.set_result(0);
     } else {
         m.set_result(-errno);
@@ -475,6 +481,127 @@ inline void sys_accept(Machine& m) {
 #endif
 }
 
+// syscall 242: accept4(sockfd, addr, addrlen, flags)
+inline void sys_accept4(Machine& m) {
+    int sockfd = m.template sysarg<int>(0);
+    uint64_t addr_ptr = m.template sysarg<uint64_t>(1);
+    uint64_t addrlen_ptr = m.template sysarg<uint64_t>(2);
+    int flags = m.template sysarg<int>(3);
+
+    // SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000
+    bool nonblock = (flags & 0x800) != 0;
+    (void)(flags & 0x80000);  // CLOEXEC is a no-op in our environment
+
+    auto* sock = get_network_ctx().get_socket(sockfd);
+    if (!sock) {
+        m.set_result(err::NOTSOCK);
+        return;
+    }
+
+    if (!sock->listening) {
+        m.set_result(-22);  // EINVAL
+        return;
+    }
+
+#ifdef __EMSCRIPTEN__
+    int has_pending = EM_ASM_INT({
+        if (typeof Module.hasPendingAccept === 'function') {
+            return Module.hasPendingAccept($0) ? 1 : 0;
+        }
+        return 0;
+    }, sockfd);
+
+    if (!has_pending) {
+        m.set_result(-11);  // EAGAIN
+        return;
+    }
+
+    int new_fd = EM_ASM_INT({
+        if (typeof Module.onSocketAccept === 'function') {
+            var result = Module.onSocketAccept($0);
+            if (result && result.fd >= 0) return result.fd;
+            return -11;
+        }
+        return -38;
+    }, sockfd);
+
+    if (new_fd < 0) {
+        m.set_result(new_fd);
+        return;
+    }
+
+    int result_fd = get_network_ctx().create_socket(sock->domain, sock->type, sock->protocol);
+    if (result_fd < 0) {
+        m.set_result(result_fd);
+        return;
+    }
+
+    auto* new_sock = get_network_ctx().get_socket(result_fd);
+    if (new_sock) {
+        new_sock->connected = true;
+        if (nonblock) new_sock->nonblocking = true;
+    }
+
+    if (addr_ptr && addrlen_ptr) {
+        sockaddr_in peer_addr;
+        memset(&peer_addr, 0, sizeof(peer_addr));
+        peer_addr.sin_family = af::INET;
+        peer_addr.sin_port = 0;
+        peer_addr.sin_addr = 0x0100007f;
+
+        uint32_t addrlen;
+        m.memory.memcpy_out(&addrlen, addrlen_ptr, sizeof(addrlen));
+        uint32_t copy_len = std::min(addrlen, (uint32_t)sizeof(peer_addr));
+        m.memory.memcpy(addr_ptr, &peer_addr, copy_len);
+        m.memory.memcpy(addrlen_ptr, &copy_len, sizeof(copy_len));
+    }
+
+    m.set_result(result_fd);
+#else
+    // Native: use real accept
+    struct ::sockaddr_in peer_addr;
+    socklen_t peer_len = sizeof(peer_addr);
+
+    int new_native_fd = ::accept(sock->native_fd, (struct sockaddr*)&peer_addr, &peer_len);
+    if (new_native_fd < 0) {
+        m.set_result(-errno);
+        return;
+    }
+
+    // Apply SOCK_NONBLOCK to the accepted socket
+    if (nonblock) {
+        int cur_flags = ::fcntl(new_native_fd, F_GETFL, 0);
+        if (cur_flags >= 0) {
+            ::fcntl(new_native_fd, F_SETFL, cur_flags | O_NONBLOCK);
+        }
+    }
+
+    int result_fd = get_network_ctx().create_socket(sock->domain, sock->type, sock->protocol);
+    if (result_fd < 0) {
+        ::close(new_native_fd);
+        m.set_result(result_fd);
+        return;
+    }
+
+    auto* new_sock = get_network_ctx().get_socket(result_fd);
+    if (new_sock) {
+        new_sock->native_fd = new_native_fd;
+        new_sock->connected = true;
+        if (nonblock) new_sock->nonblocking = true;
+    }
+
+    if (addr_ptr && addrlen_ptr) {
+        uint32_t addrlen;
+        m.memory.memcpy_out(&addrlen, addrlen_ptr, sizeof(addrlen));
+        uint32_t copy_len = std::min(addrlen, (uint32_t)peer_len);
+        m.memory.memcpy(addr_ptr, &peer_addr, copy_len);
+        m.memory.memcpy(addrlen_ptr, &copy_len, sizeof(copy_len));
+    }
+
+    m.set_result(result_fd);
+#endif
+}
+
 // syscall 203: connect(sockfd, addr, addrlen)
 inline void sys_connect(Machine& m) {
     int sockfd = m.template sysarg<int>(0);
@@ -497,7 +624,7 @@ inline void sys_connect(Machine& m) {
     m.memory.memcpy_out(addr_data.data(), addr_ptr, addrlen);
 
 #ifdef __EMSCRIPTEN__
-    // Pass to JavaScript for WebSocket connection
+    // Send connect request to JS bridge
     int result = EM_ASM_INT({
         if (typeof Module.onSocketConnect === 'function') {
             const addr = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
@@ -506,8 +633,18 @@ inline void sys_connect(Machine& m) {
         return -38;  // ENOSYS
     }, sockfd, addr_data.data(), addrlen);
 
-    if (result == 0) {
+    if (result == 0 || result == -115) {
+        // EINPROGRESS (-115) is expected for async connect.
+        // Mark as connected optimistically — the JS bridge sends the request,
+        // and if it fails we'll get an error on send/recv later.
+        // This avoids the guest getting stuck in an epoll loop waiting for
+        // connect completion that never gets reported.
         sock->connected = true;
+    }
+    // Return 0 (success) instead of EINPROGRESS for blocking sockets,
+    // since the WebTransport proxy handles the actual TCP connect async.
+    if (result == -115 && !sock->nonblocking) {
+        result = 0;
     }
     m.set_result(result);
 #else
@@ -589,7 +726,7 @@ inline void sys_recvfrom(Machine& m) {
     }
 
 #ifdef __EMSCRIPTEN__
-    // Check if we have buffered data
+    // First check C++ side buffer (may have been filled by previous JS drain)
     if (!sock->recv_buffer.empty()) {
         size_t to_copy = std::min(len, sock->recv_buffer.size());
         m.memory.memcpy(buf_ptr, sock->recv_buffer.data(), to_copy);
@@ -599,13 +736,27 @@ inline void sys_recvfrom(Machine& m) {
         return;
     }
 
-    // No buffered data - would need async handling
-    if (sock->nonblocking) {
-        m.set_result(-11);  // EAGAIN
-    } else {
-        // Blocking recv not supported in Wasm main thread
-        m.set_result(-11);
+    // Drain data from JS network bridge buffer via Module.readSocketData.
+    // readSocketData returns an array of bytes or null if no data.
+    // We write directly into guest memory using the arena pointer.
+    auto view = m.memory.memview(buf_ptr, len);
+    int bytes_read = EM_ASM_INT({
+        if (typeof Module.readSocketData !== 'function') return 0;
+        var result = Module.readSocketData($0, $1);
+        if (!result || result.length === 0) return 0;
+        for (var i = 0; i < result.length; i++) {
+            Module.HEAPU8[$2 + i] = result[i];
+        }
+        return result.length;
+    }, sockfd, (int)len, (int)(uintptr_t)view.data());
+
+    if (bytes_read > 0) {
+        m.set_result(bytes_read);
+        return;
     }
+
+    // No data available
+    m.set_result(-11);  // EAGAIN
 #else
     // Native: use real recv
     std::vector<uint8_t> buf(len);
@@ -702,7 +853,26 @@ inline void sys_getsockname(Machine& m) {
         return;
     }
 
-    // Return a default address
+#ifndef __EMSCRIPTEN__
+    // Native: query the real socket for the OS-assigned address/port
+    if (sock->native_fd >= 0) {
+        struct ::sockaddr_in native_addr;
+        socklen_t native_len = sizeof(native_addr);
+        if (::getsockname(sock->native_fd, (struct sockaddr*)&native_addr, &native_len) == 0) {
+            uint32_t addrlen;
+            m.memory.memcpy_out(&addrlen, addrlen_ptr, sizeof(addrlen));
+            uint32_t copy_len = std::min(addrlen, (uint32_t)native_len);
+            m.memory.memcpy(addr_ptr, &native_addr, copy_len);
+            m.memory.memcpy(addrlen_ptr, &copy_len, sizeof(copy_len));
+            m.set_result(0);
+            return;
+        }
+        m.set_result(-errno);
+        return;
+    }
+#endif
+
+    // Fallback: return a default address
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = af::INET;
@@ -754,6 +924,7 @@ inline void install_network_syscalls(Machine& machine) {
     machine.install_syscall_handler(200, sys_bind);
     machine.install_syscall_handler(201, sys_listen);
     machine.install_syscall_handler(202, sys_accept);
+    machine.install_syscall_handler(242, sys_accept4);
     machine.install_syscall_handler(203, sys_connect);
     machine.install_syscall_handler(204, sys_getsockname);
     machine.install_syscall_handler(205, sys_getpeername);
@@ -763,7 +934,8 @@ inline void install_network_syscalls(Machine& machine) {
     machine.install_syscall_handler(209, sys_getsockopt);
     machine.install_syscall_handler(210, sys_shutdown);
     machine.install_syscall_handler(72, sys_pselect6);
-    machine.install_syscall_handler(73, sys_ppoll);
+    // Note: ppoll (73) is NOT installed here — it's handled by
+    // syscalls::sys_ppoll which has proper timeout/revents handling.
 }
 
 }  // namespace net

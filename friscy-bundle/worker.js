@@ -317,6 +317,8 @@ self.onmessage = async function(e) {
         const controlSab = msg.controlSab;
         const stdoutSab = msg.stdoutSab;
         const netSab = msg.netSab;
+        const enableJit = msg.enableJit !== false;
+        const jitHotThreshold = Number.isFinite(msg.jitHotThreshold) ? msg.jitHotThreshold : null;
 
         controlView = new Int32Array(controlSab);
         controlBytes = new Uint8Array(controlSab);
@@ -383,27 +385,36 @@ self.onmessage = async function(e) {
             },
         });
 
-        // Load JIT manager (non-critical)
-        try {
-            const jitMod = await import('./jit_manager.js');
-            jitManager = jitMod.default;
-            installInvalidationHook = jitMod.installInvalidationHook;
-            console.log('[worker] JIT manager loaded');
-        } catch (e) {
-            console.warn('[worker] JIT manager not available:', e.message);
-        }
+        if (enableJit) {
+            // Load JIT manager (non-critical)
+            try {
+                const jitMod = await import('./jit_manager.js');
+                jitManager = jitMod.default;
+                installInvalidationHook = jitMod.installInvalidationHook;
+                if (jitHotThreshold !== null && jitHotThreshold > 0) {
+                    jitManager.hotThreshold = jitHotThreshold;
+                }
+                console.log(
+                    `[worker] JIT manager loaded (hotThreshold=${jitManager.hotThreshold ?? 'default'})`
+                );
+            } catch (e) {
+                console.warn('[worker] JIT manager not available:', e.message);
+            }
 
-        // Install JIT invalidation hook on Module
-        installInvalidationHook(emModule);
+            // Install JIT invalidation hook on Module
+            installInvalidationHook(emModule);
 
-        // Initialize JIT manager with the Wasm memory
-        const wasmMemory = emModule.wasmMemory || (emModule.asm && emModule.asm.memory);
-        if (wasmMemory) {
-            jitManager.init(wasmMemory);
-            // Load JIT compiler (async, non-blocking)
-            jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
-                console.warn('[worker] JIT compiler not available:', e.message);
-            });
+            // Initialize JIT manager with the Wasm memory
+            const wasmMemory = emModule.wasmMemory || (emModule.asm && emModule.asm.memory);
+            if (wasmMemory) {
+                jitManager.init(wasmMemory);
+                // Load JIT compiler (async, non-blocking)
+                jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
+                    console.warn('[worker] JIT compiler not available:', e.message);
+                });
+            }
+        } else {
+            console.log('[worker] JIT disabled via configuration');
         }
 
         // Install network callbacks that route through SAB RPC

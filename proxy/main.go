@@ -659,7 +659,7 @@ func isPrivateAddr(host string) bool {
 	return false
 }
 
-// --- Docker Pull API (HTTPS on :4434) ---
+// --- Docker Pull API (HTTP on :4434, behind Caddy reverse proxy) ---
 
 func (s *Server) RunAPIServer(apiListen string) error {
 	mux := http.NewServeMux()
@@ -673,23 +673,15 @@ func (s *Server) RunAPIServer(apiListen string) error {
 		w.Write([]byte("ok"))
 	})
 
-	tlsCert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
-	if err != nil {
-		return fmt.Errorf("API server TLS: %w", err)
-	}
-
 	srv := &http.Server{
-		Addr:    apiListen,
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{tlsCert},
-		},
+		Addr:         apiListen,
+		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 10 * time.Minute, // large images take time to stream
 	}
 
-	log.Printf("API server listening on https://0.0.0.0%s", apiListen)
-	return srv.ListenAndServeTLS("", "")
+	log.Printf("API server listening on http://0.0.0.0%s (behind reverse proxy)", apiListen)
+	return srv.ListenAndServe()
 }
 
 func (s *Server) corsHeaders(w http.ResponseWriter) {

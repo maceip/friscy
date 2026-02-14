@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$PROJECT_DIR/tests/baseline_rootfs_checks.sh"
 
 RUN_CLAUDE=true
 while [[ $# -gt 0 ]]; do
@@ -37,20 +38,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 ROOTFS="$PROJECT_DIR/friscy-bundle/rootfs.tar"
-if [[ ! -f "$ROOTFS" ]]; then
-    echo "[smoke] ERROR: missing rootfs: $ROOTFS"
-    exit 1
-fi
-
-if ! tar -tf "$ROOTFS" 2>/dev/null | rg -q '(^|/)(usr/bin/node)$'; then
-    echo "[smoke] ERROR: rootfs does not contain /usr/bin/node (Node.js smoke prerequisite)"
-    exit 1
-fi
-
-if $RUN_CLAUDE && ! tar -tf "$ROOTFS" 2>/dev/null | rg -q '(^|/)(usr/bin/claude)$'; then
-    echo "[smoke] ERROR: rootfs does not contain /usr/bin/claude (Claude smoke prerequisite)"
-    exit 1
-fi
+check_baseline_rootfs "$ROOTFS" "$RUN_CLAUDE" 62914560
 
 NODE_OPTS=(--experimental-default-type=module)
 

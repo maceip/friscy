@@ -19,6 +19,29 @@ wrong results).
 
 ---
 
+## Baseline Definition (Required for all phases)
+
+All optimization claims must be measured against these two baseline workloads:
+
+1. **Node.js baseline**: guest Node.js boot/execution (e.g. `node -e ...`)
+2. **Node.js + Claude baseline**: `claude --version` with a Claude package JS
+   payload of at least **60 MiB minified/bundled JS** in the rootfs.
+   Accepted acquisition paths:
+   - npm package (`@anthropic-ai/claude-code` JS/MJS payload), or
+   - Claude installer bundle (from `curl -fsSL https://claude.ai/install.sh | bash`)
+
+The smoke scripts enforce this with rootfs preflight checks:
+
+```bash
+bash ./tests/smoke_phase1_peephole.sh
+bash ./tests/smoke_phase2_jit_dispatch.sh
+```
+
+If `/usr/bin/node`, `/usr/bin/claude`, or the Claude JS payload threshold is
+missing, smoke should fail fast and the benchmark baseline is considered invalid.
+
+---
+
 ## Phase 1: Peephole Optimization
 
 ### 1.1 Problem Statement

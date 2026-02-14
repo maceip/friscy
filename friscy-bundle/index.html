@@ -1193,12 +1193,7 @@
                 ? document.getElementById('terminal-server')
                 : terminalEl;
 
-            // Dual container must be visible before xterm.open() so it can measure
-            if (isDual) {
-                document.getElementById('dual-terminal-container').classList.add('active');
-            }
-
-            // Initialize xterm.js (hidden behind overlay)
+            // Initialize xterm.js (created now, opened after overlay hides)
             term = new Terminal({
                 cursorBlink: true,
                 convertEol: true,
@@ -1229,16 +1224,13 @@
             });
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
-            term.open(primaryTermEl);
 
             function debounce(fn, ms) {
                 let id;
                 return (...args) => { clearTimeout(id); id = setTimeout(() => fn(...args), ms); };
             }
             const debouncedFit = debounce(updateTerminalSize, 150);
-
             window.addEventListener('resize', debouncedFit);
-            primaryTermEl.addEventListener('click', () => term.focus());
 
             // Create SharedArrayBuffers for Worker communication
             controlSab = new SharedArrayBuffer(4096);   // Control channel
@@ -1248,11 +1240,6 @@
             controlView = new Int32Array(controlSab);
             stdoutView = new Int32Array(stdoutSab);
             stdoutBytes = new Uint8Array(stdoutSab);
-
-            // Write initial terminal dimensions into control SAB
-            fitAddon.fit();
-            Atomics.store(controlView, 6, term.cols);  // offset 24
-            Atomics.store(controlView, 7, term.rows);  // offset 28
 
             // Spawn Worker
             setProgress(-1, 'Starting worker...');
@@ -1311,15 +1298,23 @@
                 netRPCHost.start();
             }
 
-            // Transition: hide progress overlay, show terminal + reset button
+            // Transition: hide overlay FIRST, then show + open terminals
             overlayEl.classList.add('hidden');
-            if (!isDual) {
+            if (isDual) {
+                document.getElementById('dual-terminal-container').classList.add('active');
+            } else {
                 terminalEl.style.display = 'flex';
             }
             document.getElementById('reset-btn').style.display = 'block';
+
+            // Now open xterm into the visible, measurable container
+            term.open(primaryTermEl);
+            primaryTermEl.addEventListener('click', () => term.focus());
+            fitAddon.fit();
+            Atomics.store(controlView, 6, term.cols);  // offset 24
+            Atomics.store(controlView, 7, term.rows);  // offset 28
             term.focus();
-            updateTerminalSize();
-            // Re-fit after layout settles (overlay hidden, flex recalculated)
+            // Re-fit after one frame to catch any layout reflow
             requestAnimationFrame(() => updateTerminalSize());
 
             const rootfsMB = (rootfs.byteLength / 1024 / 1024).toFixed(1);

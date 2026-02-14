@@ -79,7 +79,7 @@ export class FriscyNetworkBridge {
     try {
       // Use serverCertificateHashes for self-signed certs (WebTransport requirement).
       // The hash is the SHA-256 of the DER-encoded certificate.
-      const certHash = 'qxfoT65JJQ8jy56JGMkKT1bWKecMSwvHTEkvO2D8PA0=';
+      const certHash = '5B7pqn+Adpph4cKEidlzVG58dhaY1nZ8Dp4M0f4Wic4=';
       this.transport = new WebTransport(this.proxyUrl, {
         serverCertificateHashes: [{
           algorithm: 'sha-256',

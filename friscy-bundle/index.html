@@ -100,6 +100,16 @@
         .terminal-actions button:hover {
             background-color: #16213e;
         }
+        .terminal-actions button.active {
+            background-color: #1a4d2e;
+            color: #98c379;
+        }
+        .action-sep {
+            width: 1px;
+            height: 1.2rem;
+            background: #0f3460;
+            margin: 0 0.25rem;
+        }
     </style>
 </head>
 <body>
@@ -109,6 +119,9 @@
             <div class="status" id="status">Loading...<span id="net-status" class="net-status disconnected">net: off</span></div>
         </div>
         <div class="terminal-actions">
+            <button id="example-shell" title="Interactive BusyBox shell">Shell</button>
+            <button id="example-server" title="TCP echo server on port 8080">Server</button>
+            <span class="action-sep"></span>
             <button id="fit-button">Fit Terminal</button>
             <button id="reset-button">Reset</button>
         </div>
@@ -879,8 +892,14 @@
             term.loadAddon(fitAddon);
             term.open(terminalEl);
 
-            window.addEventListener('resize', updateTerminalSize);
-            document.getElementById('fit-button').addEventListener('click', updateTerminalSize);
+            function debounce(fn, ms) {
+                let id;
+                return (...args) => { clearTimeout(id); id = setTimeout(() => fn(...args), ms); };
+            }
+            const debouncedFit = debounce(updateTerminalSize, 150);
+
+            window.addEventListener('resize', debouncedFit);
+            document.getElementById('fit-button').addEventListener('click', debouncedFit);
             terminalEl.addEventListener('click', () => term.focus());
 
             // Create SharedArrayBuffers for Worker communication
@@ -1014,7 +1033,8 @@
             }, 4); // ~4ms polling for responsive I/O
 
             // Build args matching main.cpp: --rootfs <tar> <entry> [args...]
-            const guestCmd = manifest.entrypoint.split(' ').filter(s => s);
+            const entrypoint = (activeExample && EXAMPLES[activeExample]) || manifest.entrypoint;
+            const guestCmd = entrypoint.split(' ').filter(s => s);
             const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
 
             statusEl.textContent = 'Booting...';
@@ -1032,6 +1052,26 @@
             statusEl.textContent = 'Interactive';
         }
 
+        // --- Example preset buttons ---
+        const EXAMPLES = {
+            shell: '/bin/sh',
+            server: '/bin/sh -c while true; do echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello from friscy!" | busybox nc -l -p 8080; done',
+        };
+
+        const params = new URLSearchParams(location.search);
+        const activeExample = params.get('example');
+
+        // Highlight active example button
+        if (activeExample && document.getElementById('example-' + activeExample)) {
+            document.getElementById('example-' + activeExample).classList.add('active');
+        }
+
+        document.getElementById('example-shell').addEventListener('click', () => {
+            const u = new URL(location); u.searchParams.set('example', 'shell'); location.href = u;
+        });
+        document.getElementById('example-server').addEventListener('click', () => {
+            const u = new URL(location); u.searchParams.set('example', 'server'); location.href = u;
+        });
         document.getElementById('reset-button').addEventListener('click', () => location.reload());
 
         main().catch(e => {

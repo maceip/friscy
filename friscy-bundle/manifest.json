@@ -9,5 +9,6 @@
     "HOME=/root",
     "TERM=xterm-256color"
   ],
-  "aot": []
+  "aot": [],
+  "rootfs_url": "https://github.com/anthropics/friscy-standalone/releases/download/v1/rootfs.tar"
 }

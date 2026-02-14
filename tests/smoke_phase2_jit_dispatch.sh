@@ -13,6 +13,7 @@
 # Environment overrides:
 #   FRISCY_PHASE_ROOTFS=/abs/path/to/rootfs.tar
 #   FRISCY_TEST_ROOTFS_URL=./nodejs.tar
+#   CLAUDE_NPM_PACKAGE=@anthropic-ai/claude-code
 # ============================================================================
 set -euo pipefail
 
@@ -40,12 +41,19 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
-ROOTFS="$PROJECT_DIR/friscy-bundle/rootfs.tar"
-TEST_ROOTFS_URL="./rootfs.tar"
-if ! $RUN_CLAUDE; then
-    ROOTFS="$PROJECT_DIR/friscy-bundle/nodejs.tar"
-    TEST_ROOTFS_URL="./nodejs.tar"
+ROOTFS="$PROJECT_DIR/friscy-bundle/nodejs.tar"
+TEST_ROOTFS_URL="./nodejs.tar"
+
+if $RUN_CLAUDE && [[ -z "${FRISCY_PHASE_ROOTFS:-}" ]]; then
+    CLAUDE_ROOTFS="$PROJECT_DIR/friscy-bundle/nodejs-claude.tar"
+    if [[ ! -f "$CLAUDE_ROOTFS" ]] || ! tar -tf "$CLAUDE_ROOTFS" 2>/dev/null | rg -q '(^|/)(usr/bin/claude)$'; then
+        echo "[smoke] Preparing Claude-enabled rootfs (this may take a minute)..."
+        bash "$PROJECT_DIR/tests/build_nodejs_claude_rootfs.sh" "$ROOTFS" "$CLAUDE_ROOTFS"
+    fi
+    ROOTFS="$CLAUDE_ROOTFS"
+    TEST_ROOTFS_URL="./$(basename "$CLAUDE_ROOTFS")"
 fi
+
 ROOTFS="${FRISCY_PHASE_ROOTFS:-$ROOTFS}"
 TEST_ROOTFS_URL="${FRISCY_TEST_ROOTFS_URL:-$TEST_ROOTFS_URL}"
 

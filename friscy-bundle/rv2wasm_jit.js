@@ -7,7 +7,8 @@
  * binary that can be instantiated with `WebAssembly.instantiate()`.
  *
  * The returned Wasm module imports shared memory from "env"/"memory" and
- * exports block functions that read/write registers via linear memory.
+ * exports a `run(m, pc)` dispatch function that chains compiled blocks
+ * internally and returns only on syscall/halt/cache miss.
  * @param {Uint8Array} code
  * @param {number} base_addr
  * @returns {Uint8Array}
@@ -16,6 +17,42 @@ export function compile_region(code, base_addr) {
     const ptr0 = passArray8ToWasm0(code, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.compile_region(ptr0, len0, base_addr);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Compile a region with fast baseline translation (minimal optimization).
+ * @param {Uint8Array} code
+ * @param {number} base_addr
+ * @returns {Uint8Array}
+ */
+export function compile_region_fast(code, base_addr) {
+    const ptr0 = passArray8ToWasm0(code, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.compile_region_fast(ptr0, len0, base_addr);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Compile a region with full JIT optimization passes enabled.
+ * @param {Uint8Array} code
+ * @param {number} base_addr
+ * @returns {Uint8Array}
+ */
+export function compile_region_optimized(code, base_addr) {
+    const ptr0 = passArray8ToWasm0(code, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.compile_region_optimized(ptr0, len0, base_addr);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

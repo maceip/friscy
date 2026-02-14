@@ -7,6 +7,12 @@
 
 use wasm_bindgen::prelude::*;
 
+#[derive(Clone, Copy)]
+enum JitCompileTier {
+    Fast,
+    Optimized,
+}
+
 /// Compile a region of RISC-V machine code to a WebAssembly module.
 ///
 /// Takes raw RISC-V bytes and their virtual address, returns a Wasm module
@@ -17,11 +23,29 @@ use wasm_bindgen::prelude::*;
 /// internally and returns only on syscall/halt/cache miss.
 #[wasm_bindgen]
 pub fn compile_region(code: &[u8], base_addr: u32) -> Result<Vec<u8>, JsValue> {
-    compile_region_inner(code, base_addr)
+    compile_region_inner(code, base_addr, JitCompileTier::Optimized)
         .map_err(|e| JsValue::from_str(&format!("{:#}", e)))
 }
 
-fn compile_region_inner(code: &[u8], base_addr: u32) -> anyhow::Result<Vec<u8>> {
+/// Compile a region with fast baseline translation (minimal optimization).
+#[wasm_bindgen]
+pub fn compile_region_fast(code: &[u8], base_addr: u32) -> Result<Vec<u8>, JsValue> {
+    compile_region_inner(code, base_addr, JitCompileTier::Fast)
+        .map_err(|e| JsValue::from_str(&format!("{:#}", e)))
+}
+
+/// Compile a region with full JIT optimization passes enabled.
+#[wasm_bindgen]
+pub fn compile_region_optimized(code: &[u8], base_addr: u32) -> Result<Vec<u8>, JsValue> {
+    compile_region_inner(code, base_addr, JitCompileTier::Optimized)
+        .map_err(|e| JsValue::from_str(&format!("{:#}", e)))
+}
+
+fn compile_region_inner(
+    code: &[u8],
+    base_addr: u32,
+    tier: JitCompileTier,
+) -> anyhow::Result<Vec<u8>> {
     use rv2wasm::{disasm, cfg, translate, wasm_builder};
 
     // Create a CodeSection from the raw bytes
@@ -42,7 +66,10 @@ fn compile_region_inner(code: &[u8], base_addr: u32) -> anyhow::Result<Vec<u8>> 
     let cfg = cfg::build(&instructions, entry)?;
 
     // Translate to Wasm IR (JIT mode: shared memory import)
-    let wasm_module = translate::translate_jit(&cfg, base_addr as u64)?;
+    let wasm_module = match tier {
+        JitCompileTier::Fast => translate::translate_jit_fast(&cfg, base_addr as u64)?,
+        JitCompileTier::Optimized => translate::translate_jit(&cfg, base_addr as u64)?,
+    };
 
     // Generate Wasm binary
     wasm_builder::build_jit(&wasm_module)

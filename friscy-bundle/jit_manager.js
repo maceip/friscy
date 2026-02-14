@@ -18,16 +18,21 @@
 
 class JITManager {
     constructor() {
-        // Map<region_base, { run, instance, regionStart, regionEnd }>
+        // Map<region_base, { run, instance, regionStart, regionEnd, tier }>
         this.compiledRegions = new Map();
         this.compilingRegions = new Set();
 
         // Execution counters for hot-region detection
         // Map<page_address, count>
         this.pageHitCounts = new Map();
+        // Map<region_base, execution_count> used for baseline->optimized promotion
+        this.regionHitCounts = new Map();
 
         // Compilation threshold (execute N times before JIT)
         this.hotThreshold = 50;
+        // Region hit threshold for promoting baseline JIT regions to optimized tier
+        this.optimizeThreshold = 200;
+        this.tieringEnabled = true;
         this.traceEnabled = true;
         this.traceEdgeHotThreshold = 8;
         this.traceMaxEdges = 4096;
@@ -50,6 +55,9 @@ class JITManager {
         // Stats
         this.stats = {
             regionsCompiled: 0,
+            baselineCompiles: 0,
+            optimizedCompiles: 0,
+            promotedRegions: 0,
             jitHits: 0,
             jitMisses: 0,
             compilationTimeMs: 0,
@@ -69,6 +77,18 @@ class JITManager {
      */
     init(wasmMemory) {
         this.wasmMemory = wasmMemory;
+    }
+
+    /**
+     * Configure two-tier JIT promotion controls.
+     */
+    configureTiering({ enabled, optimizeThreshold } = {}) {
+        if (typeof enabled === 'boolean') {
+            this.tieringEnabled = enabled;
+        }
+        if (Number.isInteger(optimizeThreshold) && optimizeThreshold > 0) {
+            this.optimizeThreshold = optimizeThreshold;
+        }
     }
 
     /**
@@ -92,10 +112,27 @@ class JITManager {
 
         this.jitCompilerLoading = (async () => {
             try {
-                const { default: init, compile_region, version } = await import('./rv2wasm_jit.js');
+                const {
+                    default: init,
+                    compile_region,
+                    compile_region_fast,
+                    compile_region_optimized,
+                    version,
+                } = await import('./rv2wasm_jit.js');
                 await init(url);
-                this.jitCompiler = { compile_region, version };
-                console.log(`[JIT] Compiler loaded: ${version()}`);
+                const hasFast = typeof compile_region_fast === 'function';
+                const hasOptimized = typeof compile_region_optimized === 'function';
+                this.jitCompiler = {
+                    compile_region,
+                    compile_region_fast: hasFast ? compile_region_fast : null,
+                    compile_region_optimized: hasOptimized ? compile_region_optimized : null,
+                    supportsTiering: hasFast && hasOptimized,
+                    version,
+                };
+                console.log(
+                    `[JIT] Compiler loaded: ${version()} ` +
+                    `(tiering=${this.jitCompiler.supportsTiering ? 'on' : 'compat'})`
+                );
             } catch (e) {
                 console.warn('[JIT] Failed to load compiler:', e.message);
                 this.jitCompiler = null;
@@ -115,8 +152,27 @@ class JITManager {
         const regionBase = upc & ~(this.regionSize - 1);
 
         // Already compiled?
-        if (this.compiledRegions.has(regionBase)) {
+        const existing = this.compiledRegions.get(regionBase);
+        if (existing) {
             this.stats.jitHits++;
+            // Track region heat and promote baseline regions to optimized tier.
+            const regionHits = (this.regionHitCounts.get(regionBase) || 0) + 1;
+            this.regionHitCounts.set(regionBase, regionHits);
+            if (
+                this.tieringEnabled &&
+                this.jitCompiler &&
+                this.jitCompiler.supportsTiering &&
+                existing.tier !== 'optimized' &&
+                regionHits >= this.optimizeThreshold &&
+                !this.compilingRegions.has(regionBase)
+            ) {
+                this.compileRegion(regionBase, 'region-hot-promote', 'optimized').catch(e => {
+                    console.warn(
+                        `[JIT] Promotion compile failed for 0x${regionBase.toString(16)}:`,
+                        e.message
+                    );
+                });
+            }
             return true;
         }
 
@@ -128,7 +184,7 @@ class JITManager {
             const hotRegionBase = page & ~(this.regionSize - 1);
             // Don't block — compile async and use on next hit
             if (!this.compiledRegions.has(hotRegionBase) && !this.compilingRegions.has(hotRegionBase)) {
-                this.compileRegion(hotRegionBase, 'page-hot').catch(e => {
+                this.compileRegion(hotRegionBase, 'page-hot', 'baseline').catch(e => {
                     console.warn(`[JIT] Compile failed for 0x${hotRegionBase.toString(16)}:`, e.message);
                 });
             }
@@ -165,7 +221,7 @@ class JITManager {
         if (this.compiledRegions.has(toRegion) || this.compilingRegions.has(toRegion)) return;
 
         this.stats.traceCompilesTriggered++;
-        this.compileRegion(toRegion, 'trace-hot-edge').catch(e => {
+        this.compileRegion(toRegion, 'trace-hot-edge', 'baseline').catch(e => {
             console.warn(
                 `[JIT] Trace compile failed for 0x${toRegion.toString(16)} ` +
                 `(from 0x${fromRegion.toString(16)}):`,
@@ -221,11 +277,18 @@ class JITManager {
     /**
      * Compile a region of RISC-V code starting at the given page address.
      */
-    async compileRegion(pageAddr, reason = 'manual') {
+    async compileRegion(pageAddr, reason = 'manual', requestedTier = 'baseline') {
         if (!this.jitCompiler || !this.wasmMemory) return;
 
         const regionStart = (pageAddr >>> 0) & ~(this.regionSize - 1);
-        if (this.compiledRegions.has(regionStart) || this.compilingRegions.has(regionStart)) {
+        const existing = this.compiledRegions.get(regionStart);
+        if (existing && existing.tier === 'optimized') {
+            return;
+        }
+        if (existing && requestedTier !== 'optimized') {
+            return;
+        }
+        if (this.compilingRegions.has(regionStart)) {
             return;
         }
         this.compilingRegions.add(regionStart);
@@ -238,9 +301,27 @@ class JITManager {
             const codeBytes = memBuffer.slice(regionStart, regionEnd);
 
             // Compile to Wasm via rv2wasm
+            let compileFn = null;
+            let tier = requestedTier;
+            if (
+                tier === 'optimized' &&
+                this.jitCompiler.compile_region_optimized &&
+                this.tieringEnabled
+            ) {
+                compileFn = this.jitCompiler.compile_region_optimized;
+            } else if (tier === 'baseline' && this.jitCompiler.compile_region_fast) {
+                compileFn = this.jitCompiler.compile_region_fast;
+            } else if (this.jitCompiler.compile_region) {
+                compileFn = this.jitCompiler.compile_region;
+                // Compatibility path for older compilers with single export.
+                tier = 'compat';
+            } else {
+                return;
+            }
+
             let wasmBytes;
             try {
-                wasmBytes = this.jitCompiler.compile_region(codeBytes, regionStart);
+                wasmBytes = compileFn(codeBytes, regionStart);
             } catch (e) {
                 // Compilation can fail for regions with unsupported instructions.
                 return;
@@ -257,20 +338,30 @@ class JITManager {
                 throw new Error('compiled JIT module missing run export');
             }
 
+            const previousTier = existing ? existing.tier : null;
             this.compiledRegions.set(regionStart, {
                 run: instance.exports.run,
                 instance,
                 regionStart,
                 regionEnd,
+                tier,
             });
 
             const elapsed = performance.now() - start;
             this.stats.regionsCompiled++;
             this.stats.compilationTimeMs += elapsed;
+            if (tier === 'optimized') {
+                this.stats.optimizedCompiles++;
+                if (previousTier && previousTier !== 'optimized') {
+                    this.stats.promotedRegions++;
+                }
+            } else {
+                this.stats.baselineCompiles++;
+            }
 
             console.log(
                 `[JIT] Compiled region 0x${regionStart.toString(16)} ` +
-                `(${regionEnd - regionStart} bytes, ${elapsed.toFixed(1)}ms, reason=${reason})`
+                `(${regionEnd - regionStart} bytes, ${elapsed.toFixed(1)}ms, reason=${reason}, tier=${tier})`
             );
         } finally {
             this.compilingRegions.delete(regionStart);
@@ -304,6 +395,7 @@ class JITManager {
 
         this.dirtyPages.delete(page);
         this.pageHitCounts.delete(page);
+        this.regionHitCounts.delete(page & ~(this.regionSize - 1));
 
         if (toDelete.length > 0) {
             console.log(
@@ -332,10 +424,14 @@ class JITManager {
         this.compiledRegions.clear();
         this.compilingRegions.clear();
         this.pageHitCounts.clear();
+        this.regionHitCounts.clear();
         this.dirtyPages.clear();
         this.traceEdgeHits.clear();
         this.stats = {
             regionsCompiled: 0,
+            baselineCompiles: 0,
+            optimizedCompiles: 0,
+            promotedRegions: 0,
             jitHits: 0,
             jitMisses: 0,
             compilationTimeMs: 0,

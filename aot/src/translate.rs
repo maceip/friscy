@@ -2452,6 +2452,15 @@ pub fn translate_jit(
     cfg: &ControlFlowGraph,
     base_addr: u64,
 ) -> Result<WasmModule> {
+    translate_jit_with_options(cfg, base_addr, true)
+}
+
+/// Translate CFG to Wasm module for JIT mode with optional optimization pass.
+pub fn translate_jit_with_options(
+    cfg: &ControlFlowGraph,
+    base_addr: u64,
+    optimize: bool,
+) -> Result<WasmModule> {
     let mut functions = Vec::new();
     let mut block_to_func = std::collections::HashMap::new();
     let block_addrs: Vec<u64> = cfg.blocks.keys().copied().collect();
@@ -2462,9 +2471,10 @@ pub fn translate_jit(
         functions.push(func);
     }
 
-    // Optimize
-    for func in &mut functions {
-        optimize_function(func);
+    if optimize {
+        for func in &mut functions {
+            optimize_function(func);
+        }
     }
 
     Ok(WasmModule {
@@ -2473,6 +2483,15 @@ pub fn translate_jit(
         entry: base_addr,
         block_to_func,
     })
+}
+
+/// Fast baseline JIT translation:
+/// skips peephole/register-caching optimization for lower compile latency.
+pub fn translate_jit_fast(
+    cfg: &ControlFlowGraph,
+    base_addr: u64,
+) -> Result<WasmModule> {
+    translate_jit_with_options(cfg, base_addr, false)
 }
 
 /// Basic peephole optimizations

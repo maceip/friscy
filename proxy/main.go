@@ -667,9 +667,8 @@ func (s *Server) RunAPIServer(apiListen string) error {
 	mux.HandleFunc("/pull", s.handleDockerPull)
 	mux.HandleFunc("/search", s.handleDockerSearch)
 
-	// Health check
+	// Health check (CORS handled by Caddy reverse proxy)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Write([]byte("ok"))
 	})
 
@@ -685,9 +684,7 @@ func (s *Server) RunAPIServer(apiListen string) error {
 }
 
 func (s *Server) corsHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	// CORS allow-origin/methods/headers handled by Caddy; only expose-headers needed here
 	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, X-Image-Name")
 }
 

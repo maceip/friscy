@@ -122,6 +122,7 @@ async function main() {
         page.on('console', msg => {
             const text = msg.text();
             if (text.includes('error') || text.includes('Error') ||
+                text.includes('[JIT]') ||
                 text.includes(EXPECTED_OUTPUT) || text.includes('Instructions') ||
                 text.includes('Exit code') || text.includes('Execution complete'))
                 console.log(`[chrome] [${msg.type()}] ${text}`);

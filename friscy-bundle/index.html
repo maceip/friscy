@@ -81,12 +81,23 @@
             font-variant-numeric: tabular-nums;
         }
 
+        .header-link {
+            color: inherit;
+            text-decoration: none;
+        }
+        .header-link:hover { text-decoration: underline; }
         .header-logo {
             height: 24px;
             opacity: 0.7;
             margin-left: 1rem;
         }
         .header-logo:hover { opacity: 1; }
+        .description {
+            padding: 0.5rem 1rem;
+            font-size: 0.85rem;
+            color: #8b949e;
+            line-height: 1.4;
+        }
         .example-bar {
             display: flex;
             gap: 0.5rem;
@@ -138,15 +149,13 @@
 <body>
     <header>
         <div>
-            <h1>friscy container</h1>
+            <h1><a href="https://github.com/maceip/friscy" class="header-link">friscy container</a></h1>
             <div class="status" id="status">Loading...<span id="net-status" class="net-status disconnected">net: off</span></div>
         </div>
         <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
     </header>
-    <div class="example-bar">
-        <button id="example-alpine" title="Alpine Linux shell">Load Alpine</button>
-        <button id="example-nodejs" title="Interactive Node.js REPL">Load Node.js</button>
-        <button id="example-server" title="HTTP echo server on port 8080">Load Server</button>
+    <div class="description">
+        Run Docker containers in the browser. friscy cross-compiles Linux containers to RISC-V and executes them in a userland emulator compiled to WebAssembly.
     </div>
     <div id="terminal-container">
         <div id="progress-overlay">
@@ -159,6 +168,11 @@
             <button id="reset-btn" title="Reset">&#x21bb;</button>
             <div id="terminal" style="display:none;"></div>
         </div>
+    </div>
+    <div class="example-bar">
+        <button id="example-alpine" title="Alpine Linux shell">Load Alpine</button>
+        <button id="example-nodejs" title="Interactive Node.js REPL">Load Node.js</button>
+        <button id="example-server" title="HTTP echo server on port 8080">Load Server</button>
     </div>
 
     <!-- Service worker: caching + COOP/COEP for cross-origin isolation -->

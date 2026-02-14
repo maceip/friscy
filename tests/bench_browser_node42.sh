@@ -97,8 +97,8 @@ for i in $(seq 1 "$RUNS"); do
         exit 1
     fi
 
-    elapsed="$(awk 'match($0, /\[METRIC\] elapsed_s=([0-9.]+)/, a) { print a[1]; exit }' "$LOG_FILE")"
-    instructions="$(awk 'match($0, /\[METRIC\] instructions=([0-9]+)/, a) { print a[1]; exit }' "$LOG_FILE")"
+    elapsed="$(awk -F= '/\[METRIC\] elapsed_s=/{print $2; exit}' "$LOG_FILE")"
+    instructions="$(awk -F= '/\[METRIC\] instructions=/{print $2; exit}' "$LOG_FILE")"
 
     if [[ -z "$elapsed" ]]; then
         echo "[bench] ERROR: run ${i} missing elapsed metric. Full log:"

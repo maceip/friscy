@@ -122,80 +122,91 @@
             color: #6e7681;
             margin-top: -0.8rem;
         }
+        .import-chip {
+            display: inline-block;
+            background: transparent;
+            color: #8b949e;
+            padding: 4px 12px;
+            border-radius: 999px;
+            border: 1px solid #52525b;
+            font-size: 0.8rem;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            cursor: pointer;
+            transition: opacity 0.15s, border-color 0.15s;
+            margin-bottom: 0.5rem;
+        }
+        .import-chip:hover { border-color: #a1a1aa; color: #c9d1d9; }
+        .import-chip.hidden { opacity: 0; pointer-events: none; height: 0; margin: 0; padding: 0; border: none; overflow: hidden; }
         .import-input-wrapper {
             position: relative;
-            width: min(460px, 90%);
-        }
-        .import-input {
-            width: 100%;
-            padding: 10px 14px;
+            width: min(720px, 90%);
+            display: flex;
+            align-items: stretch;
             background: #161b22;
             border: 1px solid #30363d;
-            border-radius: 8px;
+            border-radius: 999px;
+            overflow: hidden;
+            transition: border-color 0.15s;
+        }
+        .import-input-wrapper:focus-within { border-color: #58a6ff; }
+        .import-input {
+            flex: 1;
+            padding: 12px 20px;
+            background: transparent;
+            border: none;
             color: #e6edf3;
             font-size: 0.95rem;
             font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
             outline: none;
-            transition: border-color 0.15s;
+            min-width: 0;
         }
-        .import-input:focus { border-color: #58a6ff; }
-        .import-input::placeholder { color: transparent; }
-        .import-chip {
-            position: absolute;
-            top: 50%;
-            left: 14px;
-            transform: translateY(-50%);
-            background: #21262d;
-            color: #8b949e;
-            padding: 3px 10px;
-            border-radius: 4px;
+        .import-input::placeholder { color: #484f58; }
+        .import-go-btn {
+            padding: 0 24px;
+            background: #238636;
+            color: #fff;
+            border: none;
+            border-left: 1px solid #30363d;
+            border-radius: 0;
             font-size: 0.85rem;
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
-            pointer-events: none;
-            transition: opacity 0.15s;
+            font-family: inherit;
+            cursor: pointer;
+            transition: background 0.15s;
+            white-space: nowrap;
+            flex-shrink: 0;
         }
-        .import-chip.hidden { opacity: 0; pointer-events: none; }
+        .import-go-btn:hover { background: #2ea043; }
+        .import-go-btn:disabled { background: #21262d; color: #484f58; cursor: default; }
         .import-autocomplete {
             position: absolute;
-            top: 100%;
+            top: calc(100% + 4px);
             left: 0;
             right: 0;
             max-height: 240px;
             overflow-y: auto;
             background: #161b22;
             border: 1px solid #30363d;
-            border-top: none;
-            border-radius: 0 0 8px 8px;
+            border-radius: 12px;
             z-index: 50;
             display: none;
         }
         .import-autocomplete.open { display: block; }
         .import-ac-item {
-            padding: 8px 14px;
+            padding: 8px 20px;
             cursor: pointer;
             font-size: 0.85rem;
             font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
             color: #c9d1d9;
             border-bottom: 1px solid #21262d;
         }
-        .import-ac-item:last-child { border-bottom: none; }
+        .import-ac-item:first-child { border-radius: 12px 12px 0 0; }
+        .import-ac-item:last-child { border-bottom: none; border-radius: 0 0 12px 12px; }
+        .import-ac-item:only-child { border-radius: 12px; }
         .import-ac-item:hover, .import-ac-item.selected {
             background: #1f6feb22;
             color: #58a6ff;
         }
         .import-ac-item .match { color: #58a6ff; font-weight: 600; }
-        .import-go-btn {
-            padding: 8px 24px;
-            background: #238636;
-            color: #fff;
-            border: none;
-            border-radius: 6px;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: background 0.15s;
-        }
-        .import-go-btn:hover { background: #2ea043; }
-        .import-go-btn:disabled { background: #21262d; color: #484f58; cursor: default; }
         .import-status {
             font-size: 0.8rem;
             color: #8b949e;
@@ -371,13 +382,13 @@
         <div id="import-panel">
             <div class="import-title">Import a Docker image</div>
             <div class="import-subtitle">Pull any public image from Docker Hub and run it in friscy</div>
+            <div class="import-chip" id="import-chip">ubuntu:latest</div>
             <form id="import-form" toolname="import_docker_image" tooldescription="Pull a Docker image from Docker Hub and run it in a RISC-V emulator in the browser">
             <div class="import-input-wrapper">
-                <input type="text" class="import-input" id="import-input" name="image" autocomplete="off" spellcheck="false" toolparamdescription="Docker image reference, e.g. ubuntu:latest or python:3.12">
-                <div class="import-chip" id="import-chip">ubuntu:latest</div>
+                <input type="text" class="import-input" id="import-input" name="image" placeholder="nginx:alpine" autocomplete="off" spellcheck="false" toolparamdescription="Docker image reference, e.g. ubuntu:latest or python:3.12">
+                <button type="submit" class="import-go-btn" id="import-go-btn">Pull &amp; Run</button>
                 <div class="import-autocomplete" id="import-ac"></div>
             </div>
-            <button type="submit" class="import-go-btn" id="import-go-btn">Pull &amp; Run</button>
             </form>
             <div class="import-progress-bar" id="import-progress-bar"><div class="import-progress-fill" id="import-progress-fill"></div></div>
             <div class="import-status" id="import-status">&nbsp;</div>
@@ -1387,11 +1398,8 @@
                 updateAutocomplete();
             });
 
-            // Click on chip fills input
-            chip.style.pointerEvents = 'auto';
-            chip.style.cursor = 'pointer';
-            chip.addEventListener('click', (e) => {
-                e.stopPropagation();
+            // Click on chip fills input and focuses
+            chip.addEventListener('click', () => {
                 input.value = 'ubuntu:latest';
                 chip.classList.add('hidden');
                 input.focus();

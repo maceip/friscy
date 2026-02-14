@@ -10,16 +10,11 @@
 // This eliminates JSPI and setTimeout polling -- the worker can block freely
 // on Atomics.wait() without freezing the browser UI.
 
-// Lazy-load JIT manager (non-critical — Worker must not fail if unavailable)
+console.log('[worker] Module loading...');
+
+// JIT manager — loaded lazily inside init
 let jitManager = { jitCompiler: null, init() {}, loadCompiler() { return Promise.resolve(); }, execute() { return null; }, recordExecution() {} };
 let installInvalidationHook = () => {};
-try {
-    const jitMod = await import('./jit_manager.js');
-    jitManager = jitMod.default;
-    installInvalidationHook = jitMod.installInvalidationHook;
-} catch (e) {
-    console.warn('[worker] JIT manager not available:', e.message);
-}
 
 // Control SAB layout (4KB):
 //   [0]   i32: command   (0=idle, 1=stdout, 2=stdin_request, 3=stdin_ready,
@@ -360,6 +355,16 @@ self.onmessage = async function(e) {
                 signalExit(code);
             },
         });
+
+        // Load JIT manager (non-critical)
+        try {
+            const jitMod = await import('./jit_manager.js');
+            jitManager = jitMod.default;
+            installInvalidationHook = jitMod.installInvalidationHook;
+            console.log('[worker] JIT manager loaded');
+        } catch (e) {
+            console.warn('[worker] JIT manager not available:', e.message);
+        }
 
         // Install JIT invalidation hook on Module
         installInvalidationHook(emModule);

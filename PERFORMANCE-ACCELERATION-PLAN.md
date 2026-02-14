@@ -452,6 +452,22 @@ time busybox sha256sum /dev/urandom | head -c 1048576
 # Compare wall-clock time before/after optimization
 ```
 
+For repeatable Puppeteer-based tracking (same command every run), use:
+
+```bash
+# 5 browser runs, writes tests/perf/browser_node42.latest.json
+bash ./tests/bench_browser_node42.sh --runs 5
+
+# Capture a baseline snapshot for future regression deltas
+bash ./tests/bench_browser_node42.sh --runs 7 --write-baseline
+```
+
+This benchmark runs inside the browser emulator and records:
+- wall-clock elapsed time (`median`, `p95`, `min`, `max`)
+- emulator instruction counts (`median`, `p95`, `min`, `max`)
+
+`latest.json` includes % deltas vs the saved baseline file to show gains/losses.
+
 ---
 
 ## Phase 2: Wasm-Internal JIT Dispatch

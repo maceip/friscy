@@ -1,4 +1,4 @@
-const CACHE_NAME = 'friscy-cache-v10';
+const CACHE_NAME = 'friscy-cache-v11';
 const CACHE_ASSETS = [
   './',
   './index.html',
@@ -44,41 +44,100 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Fetch: network-first for small dev files, cache-first for large assets
-self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
+// Helper: add COOP/COEP headers for cross-origin isolation (SharedArrayBuffer)
+function addCOIHeaders(response) {
+  const headers = new Headers(response.headers);
+  headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+  headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
-  // Only intercept same-origin or known CDN assets — let everything else pass through
+// Helper: add CORP header for cross-origin resources under COEP
+function addCORPHeader(response) {
+  const headers = new Headers(response.headers);
+  headers.set('Cross-Origin-Resource-Policy', 'cross-origin');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+// Fetch handler: caching + COOP/COEP header injection
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  const url = new URL(request.url);
   const isSameOrigin = url.origin === self.location.origin;
   const isCDN = url.hostname === 'cdn.jsdelivr.net';
-  if (!isSameOrigin && !isCDN) return;
 
-  const useNetworkFirst = isSameOrigin && NETWORK_FIRST.has(url.pathname);
-
-  if (useNetworkFirst) {
-    // Network-first: always get latest, fall back to cache
+  // Navigation: inject COOP/COEP + use network-first caching
+  if (request.mode === 'navigate') {
     event.respondWith(
-      fetch(event.request).then((resp) => {
+      fetch(request).then((resp) => {
         if (resp.ok) {
           const clone = resp.clone();
-          caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
+          caches.open(CACHE_NAME).then(c => c.put(request, clone));
+        }
+        return addCOIHeaders(resp);
+      }).catch(() =>
+        caches.match(request).then(r =>
+          r ? addCOIHeaders(r) : new Response('Offline', { status: 503 })
+        )
+      )
+    );
+    return;
+  }
+
+  // Cross-origin (CDN): fetch with CORS, add CORP header for COEP compatibility
+  if (!isSameOrigin) {
+    if (isCDN) {
+      event.respondWith(
+        caches.match(request).then((cached) => {
+          if (cached) return addCORPHeader(cached);
+          return fetch(request.url, { mode: 'cors', credentials: 'omit' }).then((resp) => {
+            if (resp.ok) {
+              const clone = resp.clone();
+              caches.open(CACHE_NAME).then(c => c.put(request, clone));
+            }
+            return addCORPHeader(resp);
+          });
+        }).catch(() => fetch(request))
+      );
+    }
+    // Non-CDN cross-origin: let pass through
+    return;
+  }
+
+  // Same-origin subresources
+  const useNetworkFirst = NETWORK_FIRST.has(url.pathname);
+
+  if (useNetworkFirst) {
+    event.respondWith(
+      fetch(request).then((resp) => {
+        if (resp.ok) {
+          const clone = resp.clone();
+          caches.open(CACHE_NAME).then(c => c.put(request, clone));
         }
         return resp;
       }).catch(() =>
-        caches.match(event.request).then(r =>
+        caches.match(request).then(r =>
           r || new Response('Offline', { status: 503 })
         )
       )
     );
   } else {
-    // Cache-first: serve instantly from cache (rootfs.tar, CDN libs, etc.)
+    // Cache-first for large assets (rootfs.tar, .wasm, etc.)
     event.respondWith(
-      caches.match(event.request).then((cached) => {
+      caches.match(request).then((cached) => {
         if (cached) return cached;
-        return fetch(event.request).then((resp) => {
+        return fetch(request).then((resp) => {
           if (resp.ok) {
             const clone = resp.clone();
-            caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
+            caches.open(CACHE_NAME).then(c => c.put(request, clone));
           }
           return resp;
         });

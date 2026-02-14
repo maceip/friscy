@@ -2325,6 +2325,9 @@ static void sys_fcntl(Machine& m) {
         case F_DUPFD:
         case F_DUPFD_CLOEXEC: {
             int newfd = fs.dup(fd);
+            // Propagate tty status to new fd
+            if (newfd >= 0 && g_tty_fds.count(fd))
+                g_tty_fds.insert(newfd);
             m.set_result(newfd);
             return;
         }
@@ -2410,6 +2413,11 @@ static void sys_readv(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto iov_addr = m.sysarg(1);
     int iovcnt = m.template sysarg<int>(2);
+
+    // /dev/tty fds (other than 0/1/2) redirect reads to stdin
+    if (fd > 2 && g_tty_fds.count(fd)) {
+        fd = 0;  // treat as stdin read
+    }
 
     // If fd 0 has been redirected (e.g. dup2'd to a pipe), use VFS
     if (fd == 0 && fs.is_open(fd)) {

@@ -2582,15 +2582,17 @@ fn fold_local_set_get(body: Vec<WasmInst>) -> (Vec<WasmInst>, usize) {
     let mut changes = 0usize;
 
     while i < body.len() {
-        if i + 1 < body.len()
-            && let WasmInst::LocalSet { idx: set_idx } = body[i]
-            && let WasmInst::LocalGet { idx: get_idx } = body[i + 1]
-            && set_idx == get_idx
-        {
-            out.push(WasmInst::LocalTee { idx: set_idx });
-            i += 2;
-            changes += 1;
-            continue;
+        if i + 1 < body.len() {
+            if let (WasmInst::LocalSet { idx: set_idx }, WasmInst::LocalGet { idx: get_idx }) =
+                (&body[i], &body[i + 1])
+            {
+                if set_idx == get_idx {
+                    out.push(WasmInst::LocalTee { idx: *set_idx });
+                    i += 2;
+                    changes += 1;
+                    continue;
+                }
+            }
         }
 
         out.push(body[i].clone());
@@ -2607,22 +2609,26 @@ fn fold_integer_constants(body: Vec<WasmInst>) -> (Vec<WasmInst>, usize) {
 
     while i < body.len() {
         if i + 2 < body.len() {
-            if let (WasmInst::I64Const { value: a }, WasmInst::I64Const { value: b }) = (&body[i], &body[i + 1])
-                && let Some(value) = fold_i64_binop(&body[i + 2], *a, *b)
+            if let (WasmInst::I64Const { value: a }, WasmInst::I64Const { value: b }) =
+                (&body[i], &body[i + 1])
             {
-                out.push(WasmInst::I64Const { value });
-                i += 3;
-                changes += 1;
-                continue;
+                if let Some(value) = fold_i64_binop(&body[i + 2], *a, *b) {
+                    out.push(WasmInst::I64Const { value });
+                    i += 3;
+                    changes += 1;
+                    continue;
+                }
             }
 
-            if let (WasmInst::I32Const { value: a }, WasmInst::I32Const { value: b }) = (&body[i], &body[i + 1])
-                && let Some(value) = fold_i32_binop(&body[i + 2], *a, *b)
+            if let (WasmInst::I32Const { value: a }, WasmInst::I32Const { value: b }) =
+                (&body[i], &body[i + 1])
             {
-                out.push(WasmInst::I32Const { value });
-                i += 3;
-                changes += 1;
-                continue;
+                if let Some(value) = fold_i32_binop(&body[i + 2], *a, *b) {
+                    out.push(WasmInst::I32Const { value });
+                    i += 3;
+                    changes += 1;
+                    continue;
+                }
             }
         }
 

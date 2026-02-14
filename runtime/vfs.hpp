@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <memory>
 #include <algorithm>
+#include <set>
 
 namespace vfs {
 
@@ -345,13 +346,13 @@ public:
         open_dirs_.erase(fd);
     }
 
-    // Read from file
+    // Read from file or pipe
     ssize_t read(int fd, void* buf, size_t count) {
         auto it = open_files_.find(fd);
         if (it == open_files_.end()) return -9;  // EBADF
 
         auto& fh = it->second;
-        if (!fh->entry->is_file()) return -21;  // EISDIR
+        if (fh->entry->is_dir()) return -21;  // EISDIR
 
         size_t available = fh->entry->content.size() - fh->offset;
         size_t to_read = std::min(count, available);
@@ -362,13 +363,13 @@ public:
         return static_cast<ssize_t>(to_read);
     }
 
-    // Write to file (in-memory only, for writable mounts)
+    // Write to file or pipe (in-memory only, for writable mounts)
     ssize_t write(int fd, const void* buf, size_t count) {
         auto it = open_files_.find(fd);
         if (it == open_files_.end()) return -9;  // EBADF
 
         auto& fh = it->second;
-        if (!fh->entry->is_file()) return -21;
+        if (fh->entry->is_dir()) return -21;  // EISDIR
 
         // Extend if needed
         size_t end_pos = fh->offset + count;
@@ -749,6 +750,14 @@ public:
         auto dit = open_dirs_.find(fd);
         if (dit != open_dirs_.end()) return dit->second->entry;
         return nullptr;
+    }
+
+    // Get set of all open file descriptor numbers
+    std::set<int> get_open_fds() const {
+        std::set<int> fds;
+        for (const auto& p : open_files_) fds.insert(p.first);
+        for (const auto& p : open_dirs_) fds.insert(p.first);
+        return fds;
     }
 
     // Get the path of an open fd

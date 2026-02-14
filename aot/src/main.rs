@@ -7,16 +7,23 @@
 //   rv2wasm input.elf -o output.wasm
 //   rv2wasm --rootfs rootfs.tar --entry /bin/busybox -o bundle.wasm
 
+#[cfg(not(feature = "cli"))]
+fn main() {
+    eprintln!("rv2wasm CLI requires the 'cli' feature. Build with: cargo build --features cli");
+    std::process::exit(1);
+}
+
+#[cfg(feature = "cli")]
 use anyhow::{Context, Result};
+#[cfg(feature = "cli")]
 use clap::Parser;
+#[cfg(feature = "cli")]
 use std::path::PathBuf;
 
-mod cfg;
-mod disasm;
-mod elf;
-mod translate;
-mod wasm_builder;
+#[cfg(feature = "cli")]
+use rv2wasm::{cfg, disasm, elf, translate, wasm_builder};
 
+#[cfg(feature = "cli")]
 #[derive(Parser, Debug)]
 #[command(name = "rv2wasm")]
 #[command(about = "RISC-V to WebAssembly AOT compiler")]
@@ -51,6 +58,7 @@ struct Args {
     verbose: bool,
 }
 
+#[cfg(feature = "cli")]
 fn main() -> Result<()> {
     let args = Args::parse();
 

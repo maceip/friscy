@@ -5,8 +5,9 @@ edition = "2021"
 description = "RISC-V to WebAssembly AOT compiler"
 
 [dependencies]
-# ELF parsing
-goblin = "0.8"
+# ELF parsing (no default features — avoids std::fs dependency on wasm32)
+# Need std for Error trait, elf32/64 for parsing, endian_fd for byte order
+goblin = { version = "0.8", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
 
 # RISC-V decoding
 riscv-decode = "0.2"
@@ -14,12 +15,16 @@ riscv-decode = "0.2"
 # Wasm generation
 wasm-encoder = "0.201"
 
-# CLI
-clap = { version = "4", features = ["derive"] }
+# CLI (optional — not needed for wasm32 JIT usage)
+clap = { version = "4", features = ["derive"], optional = true }
 
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
+
+[features]
+default = ["cli"]
+cli = ["clap"]
 
 [dev-dependencies]
 wasmparser = "0.201"

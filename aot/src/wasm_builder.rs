@@ -151,6 +151,59 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     Ok(wasm.finish())
 }
 
+/// Build a JIT Wasm module — simpler than AOT:
+/// - Imports shared memory from "env"/"memory"
+/// - No dispatch function — JS manages block dispatch
+/// - Each block function exported by name (block_XXXXXXXX)
+/// - No table or element sections needed
+/// - Syscalls returned via high-bit convention (same as AOT)
+pub fn build_jit(module: &WasmModule) -> Result<Vec<u8>> {
+    let mut wasm = Module::new();
+
+    // Type section: block function (param $m i32) (result i32)
+    let mut types = TypeSection::new();
+    types.function(vec![ValType::I32], vec![ValType::I32]);
+    wasm.section(&types);
+
+    // Import section: shared memory
+    let mut imports = ImportSection::new();
+    imports.import(
+        "env",
+        "memory",
+        MemoryType {
+            minimum: 256, // negotiated with runtime (16MB min)
+            maximum: Some(65536), // 4GB max
+            memory64: false,
+            shared: true,
+        },
+    );
+    wasm.section(&imports);
+
+    // Function section
+    let mut functions = FunctionSection::new();
+    for _ in &module.functions {
+        functions.function(0); // type 0 = block function
+    }
+    wasm.section(&functions);
+
+    // Export section: each block function exported by name
+    let mut exports = ExportSection::new();
+    for (idx, func) in module.functions.iter().enumerate() {
+        exports.export(&func.name, ExportKind::Func, idx as u32);
+    }
+    wasm.section(&exports);
+
+    // Code section
+    let mut codes = CodeSection::new();
+    for func in &module.functions {
+        let wasm_func = build_block_function(func)?;
+        codes.function(&wasm_func);
+    }
+    wasm.section(&codes);
+
+    Ok(wasm.finish())
+}
+
 /// Build the main dispatch function with O(1) block lookup via call_indirect
 fn build_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) -> Function {
     // Locals: param 0 = $m (i32), param 1 = $start_pc (i32), local 2 = $pc (i32)

@@ -17,9 +17,9 @@
       "image": "friscy-nodejs"
     },
     "server": {
-      "rootfs": "./nodejs.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "-e", "const http=require('http');const s=http.createServer((q,r)=>{let b='';q.on('data',c=>b+=c);q.on('end',()=>{r.writeHead(200,{'Content-Type':'application/json'});r.end(JSON.stringify({method:q.method,url:q.url,headers:q.headers,body:b}))})});s.listen(8080,()=>console.log('Echo server listening on :8080'))"],
-      "image": "friscy-nodejs"
+      "rootfs": "./goserver.tar",
+      "entrypoint": ["/bin/echo_server"],
+      "image": "friscy-goserver"
     }
   }
 }

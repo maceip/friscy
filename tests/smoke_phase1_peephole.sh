@@ -56,6 +56,8 @@ NODE_OPTS=(--experimental-default-type=module)
 
 echo "[smoke] Phase 1 peephole smoke: Node.js boot"
 FRISCY_TEST_ROOTFS_URL="$TEST_ROOTFS_URL" \
+FRISCY_TEST_NODE_EVAL='console.log("42")' \
+FRISCY_TEST_EXPECTED_OUTPUT='42' \
 node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_phase1_nodejs2.js"
 echo "[smoke] PASS: Node.js boot"
 

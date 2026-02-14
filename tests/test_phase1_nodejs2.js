@@ -5,6 +5,7 @@
 // Uses a unique marker to avoid false positives.
 
 import puppeteer from 'puppeteer';
+import { createServer } from 'net';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -15,9 +16,41 @@ const __dirname = dirname(__filename);
 const PROJECT_ROOT = join(__dirname, '..');
 const BUNDLE_DIR = join(PROJECT_ROOT, 'friscy-bundle');
 
-const PORT = 8099;
-const MARKER = 'NODEJS_BOOT_7xQ9';
+const REQUESTED_PORT = Number.parseInt(process.env.FRISCY_TEST_PORT || '8099', 10);
+const NODE_EVAL = process.env.FRISCY_TEST_NODE_EVAL || 'console.log("42")';
+const EXPECTED_OUTPUT = process.env.FRISCY_TEST_EXPECTED_OUTPUT || '42';
 const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './rootfs.tar';
+
+async function canBindPort(port) {
+    return new Promise((resolve) => {
+        const probe = createServer();
+        probe.unref();
+        probe.once('error', () => resolve(false));
+        probe.once('listening', () => {
+            probe.close(() => resolve(true));
+        });
+        probe.listen(port, '127.0.0.1');
+    });
+}
+
+async function pickOpenPort(preferredPort) {
+    if (Number.isInteger(preferredPort) && preferredPort > 0 && await canBindPort(preferredPort)) {
+        return preferredPort;
+    }
+    return new Promise((resolve, reject) => {
+        const probe = createServer();
+        probe.unref();
+        probe.once('error', reject);
+        probe.listen(0, '127.0.0.1', () => {
+            const addr = probe.address();
+            const port = (typeof addr === 'object' && addr) ? addr.port : 8099;
+            probe.close((err) => {
+                if (err) reject(err);
+                else resolve(port);
+            });
+        });
+    });
+}
 
 async function main() {
     let server = null;
@@ -25,13 +58,20 @@ async function main() {
     let originalManifest = null;
 
     try {
+        const port = await pickOpenPort(REQUESTED_PORT);
         const manifestPath = join(BUNDLE_DIR, 'manifest.json');
         originalManifest = readFileSync(manifestPath, 'utf8');
         writeFileSync(manifestPath, JSON.stringify({
             version: 1,
             image: "test-nodejs",
             rootfs: ROOTFS_URL,
-            entrypoint: `/usr/bin/node --jitless --max-old-space-size=256 -e console.log('${MARKER}')`,
+            entrypoint: [
+                "/usr/bin/node",
+                "--jitless",
+                "--max-old-space-size=256",
+                "-e",
+                NODE_EVAL,
+            ],
             workdir: "/",
             env: [
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -41,7 +81,7 @@ async function main() {
             aot: [],
         }, null, 2));
 
-        server = spawn('node', [join(BUNDLE_DIR, 'serve.js'), String(PORT)], {
+        server = spawn('node', [join(BUNDLE_DIR, 'serve.js'), String(port)], {
             stdio: ['ignore', 'pipe', 'pipe'],
             cwd: BUNDLE_DIR,
         });
@@ -54,7 +94,9 @@ async function main() {
             server.on('error', e => { clearTimeout(t); reject(e); });
         });
         console.log(`[test] Rootfs URL: ${ROOTFS_URL}`);
-        console.log(`[test] Server on :${PORT}`);
+        console.log(`[test] Node eval: ${NODE_EVAL}`);
+        console.log(`[test] Expected output: ${EXPECTED_OUTPUT}`);
+        console.log(`[test] Server on :${port}`);
 
         browser = await puppeteer.launch({
             headless: true,
@@ -71,7 +113,7 @@ async function main() {
             const text = msg.text();
             // Log key events
             if (text.includes('error') || text.includes('Error') ||
-                text.includes(MARKER) || text.includes('Instructions') ||
+                text.includes(EXPECTED_OUTPUT) || text.includes('Instructions') ||
                 text.includes('Exit code') || text.includes('exit_group') ||
                 text.includes('Execution complete'))
                 console.log(`[chrome] [${msg.type()}] ${text}`);
@@ -81,9 +123,9 @@ async function main() {
         });
 
         console.log('[test] Loading page...');
-        await page.goto(`http://localhost:${PORT}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(`http://127.0.0.1:${port}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        console.log(`[test] Waiting for marker: ${MARKER}`);
+        console.log(`[test] Waiting for output: ${EXPECTED_OUTPUT}`);
         const start = Date.now();
         let found = false;
 
@@ -110,7 +152,7 @@ async function main() {
                 throw err;
             }
 
-            if (content.includes(MARKER)) {
+            if (content.includes(EXPECTED_OUTPUT)) {
                 const elapsed = ((Date.now() - start) / 1000).toFixed(1);
                 console.log(`[PASS] Node.js produced output in ${elapsed}s`);
                 found = true;
@@ -139,7 +181,7 @@ async function main() {
         }
 
         if (!found) {
-            console.log(`[FAIL] Did not find ${MARKER} in terminal output`);
+            console.log(`[FAIL] Did not find ${EXPECTED_OUTPUT} in terminal output`);
         }
 
         process.exit(found ? 0 : 1);

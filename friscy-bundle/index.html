@@ -119,8 +119,8 @@
             <div class="status" id="status">Loading...<span id="net-status" class="net-status disconnected">net: off</span></div>
         </div>
         <div class="terminal-actions">
-            <button id="example-shell" title="Interactive BusyBox shell">Shell</button>
-            <button id="example-server" title="TCP echo server on port 8080">Server</button>
+            <button id="example-nodejs" title="Interactive Node.js REPL">Node.js</button>
+            <button id="example-server" title="HTTP echo server on port 8080">Server</button>
             <span class="action-sep"></span>
             <button id="fit-button">Fit Terminal</button>
             <button id="reset-button">Reset</button>
@@ -843,15 +843,20 @@
 
             setProgress(-1, 'Loading manifest...');
             const manifest = await fetch('./manifest.json').then(r => r.json());
-            statusEl.textContent = `Image: ${manifest.image}`;
 
-            // Download rootfs with progress
-            setProgress(0, `Downloading ${manifest.image}...`, 'Starting download...');
+            // Resolve example-specific config (rootfs, entrypoint, image name)
+            const exampleCfg = (activeExample && manifest.examples && manifest.examples[activeExample]) || {};
+            const imageName = exampleCfg.image || manifest.image;
+            const fallbackUrl = exampleCfg.rootfs_url || manifest.rootfs_url;
+            statusEl.textContent = `Image: ${imageName}`;
+
+            // Download rootfs with progress (local first, then fallback URL)
+            setProgress(0, `Downloading ${imageName}...`, 'Starting download...');
             let rootfsUrl = './rootfs.tar';
             {
                 const probe = await fetch(rootfsUrl, { method: 'HEAD' });
-                if (!probe.ok && manifest.rootfs_url) {
-                    rootfsUrl = manifest.rootfs_url;
+                if (!probe.ok && fallbackUrl) {
+                    rootfsUrl = fallbackUrl;
                 }
             }
             const rootfs = await fetchWithProgress(rootfsUrl);
@@ -1033,7 +1038,7 @@
             }, 4); // ~4ms polling for responsive I/O
 
             // Build args matching main.cpp: --rootfs <tar> <entry> [args...]
-            const entrypoint = (activeExample && EXAMPLES[activeExample]) || manifest.entrypoint;
+            const entrypoint = exampleCfg.entrypoint || manifest.entrypoint;
             const guestCmd = entrypoint.split(' ').filter(s => s);
             const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
 
@@ -1053,11 +1058,6 @@
         }
 
         // --- Example preset buttons ---
-        const EXAMPLES = {
-            shell: '/bin/sh',
-            server: '/bin/sh -c while true; do echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello from friscy!" | busybox nc -l -p 8080; done',
-        };
-
         const params = new URLSearchParams(location.search);
         const activeExample = params.get('example');
 
@@ -1066,8 +1066,8 @@
             document.getElementById('example-' + activeExample).classList.add('active');
         }
 
-        document.getElementById('example-shell').addEventListener('click', () => {
-            const u = new URL(location); u.searchParams.set('example', 'shell'); location.href = u;
+        document.getElementById('example-nodejs').addEventListener('click', () => {
+            const u = new URL(location); u.searchParams.set('example', 'nodejs'); location.href = u;
         });
         document.getElementById('example-server').addEventListener('click', () => {
             const u = new URL(location); u.searchParams.set('example', 'server'); location.href = u;

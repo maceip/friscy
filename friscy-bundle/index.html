@@ -137,34 +137,25 @@
         <div id="terminal" style="display:none;"></div>
     </div>
 
-    <!-- Cross-origin isolation service worker (for GitHub Pages / hosts without COOP/COEP headers) -->
-    <script>
-        if (!crossOriginIsolated && 'serviceWorker' in navigator) {
-            navigator.serviceWorker.register('./coi-serviceworker.js').then(reg => {
-                console.log('COI service worker registered, reloading for isolation...');
-                reg.addEventListener('updatefound', () => {
-                    const sw = reg.installing;
-                    sw.addEventListener('statechange', () => {
-                        if (sw.state === 'activated') location.reload();
-                    });
-                });
-                if (reg.active) location.reload();
-            });
-        }
-    </script>
-
-    <!-- Register cache service worker -->
+    <!-- Service worker: caching + COOP/COEP for cross-origin isolation -->
     <script>
         if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('./service-worker.js')
-                    .then(registration => {
-                        console.log('Service Worker registered: ', registration);
-                    })
-                    .catch(registrationError => {
-                        console.log('Service Worker registration failed: ', registrationError);
-                    });
-            });
+            navigator.serviceWorker.register('./service-worker.js').then(reg => {
+                console.log('Service Worker registered:', reg);
+                // If not yet cross-origin isolated, reload once SW activates
+                if (!crossOriginIsolated) {
+                    if (reg.active) {
+                        location.reload();
+                    } else {
+                        reg.addEventListener('updatefound', () => {
+                            const sw = reg.installing;
+                            sw.addEventListener('statechange', () => {
+                                if (sw.state === 'activated') location.reload();
+                            });
+                        });
+                    }
+                }
+            }).catch(e => console.error('Service Worker registration failed:', e));
         }
     </script>
 

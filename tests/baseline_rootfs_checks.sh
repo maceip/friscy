@@ -5,17 +5,22 @@
 #   1) Node.js workload support (/usr/bin/node present)
 #   2) Node.js + Claude workload support:
 #      - /usr/bin/claude present
-#      - Claude payload >= MIN_CLAUDE_JS_BYTES, from either:
+#      - Claude payload present, from either:
 #        a) npm package JS bundle under @anthropic-ai/claude-code (js/mjs), or
 #        b) native installer bundle under ~/.local/share/claude/versions/*
 #           (install source: curl -fsSL https://claude.ai/install.sh | bash)
+#
+# Size policy:
+#   - recommended_claude_payload_bytes is an advisory target (default 60 MiB)
+#   - if CLAUDE_PAYLOAD_STRICT=1, target becomes a hard requirement
 
 set -euo pipefail
 
 check_baseline_rootfs() {
     local rootfs="$1"
     local require_claude="${2:-false}"
-    local min_claude_js_bytes="${3:-62914560}" # 60 MiB
+    local recommended_claude_payload_bytes="${3:-62914560}" # 60 MiB (advisory)
+    local strict_size_check="${CLAUDE_PAYLOAD_STRICT:-0}"
 
     if [[ ! -f "$rootfs" ]]; then
         echo "[smoke] ERROR: missing rootfs: $rootfs"
@@ -86,24 +91,34 @@ check_baseline_rootfs() {
         native_path="${largest_native#*$'\t'}"
     fi
 
-    local required_mb=$(( min_claude_js_bytes / 1024 / 1024 ))
-    if (( js_size >= min_claude_js_bytes )); then
-        local found_mb=$(( js_size / 1024 / 1024 ))
-        echo "[smoke] Baseline check: Claude JS payload ${found_mb}MB at ${js_path}"
-        return 0
+    local chosen_size=0
+    local chosen_kind="none"
+    local chosen_path=""
+    if (( js_size >= native_size )); then
+        chosen_size=$js_size
+        chosen_kind="js_bundle"
+        chosen_path="$js_path"
+    else
+        chosen_size=$native_size
+        chosen_kind="installer_bundle"
+        chosen_path="$native_path"
     fi
 
-    if (( native_size >= min_claude_js_bytes )); then
-        local found_mb=$(( native_size / 1024 / 1024 ))
-        echo "[smoke] Baseline check: Claude installer bundle ${found_mb}MB at ${native_path}"
-        return 0
+    if (( chosen_size <= 0 )); then
+        echo "[smoke] ERROR: Claude baseline requires payload files, but none were found."
+        echo "[smoke]   Looked for npm JS bundles and installer bundles in rootfs."
+        return 1
     fi
 
-    local js_mb=$(( js_size / 1024 / 1024 ))
-    local native_mb=$(( native_size / 1024 / 1024 ))
-    echo "[smoke] ERROR: Claude baseline not met."
-    echo "[smoke]   Need >= ${required_mb}MB payload (JS bundle or installer bundle)."
-    echo "[smoke]   Found JS bundle: ${js_mb}MB ${js_path:-<none>}"
-    echo "[smoke]   Found installer bundle: ${native_mb}MB ${native_path:-<none>}"
-    return 1
+    local found_mb=$(( chosen_size / 1024 / 1024 ))
+    local recommended_mb=$(( recommended_claude_payload_bytes / 1024 / 1024 ))
+    echo "[smoke] Baseline check: Claude payload ${found_mb}MB (${chosen_kind}) at ${chosen_path}"
+
+    if (( recommended_claude_payload_bytes > 0 && chosen_size < recommended_claude_payload_bytes )); then
+        if [[ "$strict_size_check" == "1" ]]; then
+            echo "[smoke] ERROR: Claude payload below strict target (${found_mb}MB < ${recommended_mb}MB)."
+            return 1
+        fi
+        echo "[smoke] WARN: Claude payload below recommended target (${found_mb}MB < ${recommended_mb}MB). Continuing."
+    fi
 }

@@ -355,10 +355,7 @@
         let sqPhaseOffset = 0;
         let sqLastTime = -1;
 
-        // Demo mode state (computed inside drawWave — single rAF loop, no racing)
-        let demoActive = true;
-        let demoStartTime = -1;
-        let demoDuration = 60000 + Math.random() * 60000; // 1-2 minutes
+        let demoActive = false;
 
         // DPI-aware canvas setup (crisp on retina/high-DPI displays)
         function setupCanvasDPI(canvas, ctx) {
@@ -476,10 +473,9 @@
             const step = SINE_STEP;
             const phase = (now / 1000) * SINE_PHASE_SPEED;
 
-            // Bouncing highlight region
-            const cycle = now * 0.001;
-            const pos = Math.sin(cycle * 1.3) * 0.5 + 0.5;
-            const fakeProgress = 0.15 + pos * 0.7;
+            // Continuous forward sweep (3s cycle, ease in-out)
+            const cycle = (now % 3000) / 3000;
+            const fakeProgress = cycle;
             const totalProgressPx = W * fakeProgress;
 
             ctx.save();
@@ -580,9 +576,8 @@
         // --- Squiggly (bezier) wave: indeterminate mode ---
         function drawSquigglyIndeterminate(ctx, W, H, now, color) {
             const midY = H / 2;
-            const cycle = now * 0.001;
-            const pos = Math.sin(cycle * 1.3) * 0.5 + 0.5;
-            const fakeProgress = 0.15 + pos * 0.7;
+            const cycle = (now % 3000) / 3000;
+            const fakeProgress = cycle;
             const totalProgressPx = W * fakeProgress;
             const waveStart = -sqPhaseOffset - SQ_WAVE_LENGTH / 2;
             const path = buildWavePath(waveStart, W, totalProgressPx, true);
@@ -648,21 +643,7 @@
         function drawWave(timestamp) {
             const now = timestamp || performance.now();
 
-            // Demo mode: compute progress directly here (same rAF frame, zero lag)
-            if (demoActive) {
-                if (demoStartTime < 0) demoStartTime = now;
-                const elapsed = now - demoStartTime;
-                const pct = Math.min(100, (elapsed / demoDuration) * 100);
-                wavePct = pct;
-                waveTarget = pct;
-                waveIndeterminate = false;
-                if (pct >= 100) {
-                    demoStartTime = now + 2000;
-                    demoDuration = 60000 + Math.random() * 60000;
-                    wavePct = 0;
-                    waveTarget = 0;
-                }
-            } else if (!waveIndeterminate) {
+            if (!demoActive && !waveIndeterminate) {
                 wavePct += (waveTarget - wavePct) * 0.12;
             }
 

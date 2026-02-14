@@ -71,6 +71,7 @@ echo "[smoke] PASS: Node.js boot"
 
 if $RUN_CLAUDE; then
     echo "[smoke] Phase 1 peephole smoke: Claude version"
+    FRISCY_TEST_ROOTFS_URL="$TEST_ROOTFS_URL" \
     node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_claude_version.js"
     echo "[smoke] PASS: Claude version"
 else

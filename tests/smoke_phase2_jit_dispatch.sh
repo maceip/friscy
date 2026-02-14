@@ -74,6 +74,7 @@ if $RUN_CLAUDE; then
     echo "[smoke] Phase 2 JIT-dispatch smoke: Claude workload"
     CLAUDE_LOG="$(mktemp)"
     trap 'rm -f "$CLAUDE_LOG"' EXIT
+    FRISCY_TEST_ROOTFS_URL="$TEST_ROOTFS_URL" \
     node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_claude_version.js" 2>&1 | tee "$CLAUDE_LOG"
 
     if ! rg -q '\[JIT\] Compiled region' "$CLAUDE_LOG"; then

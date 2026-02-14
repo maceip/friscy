@@ -17,6 +17,7 @@ const BUNDLE_DIR = join(PROJECT_ROOT, 'friscy-bundle');
 
 const PORT = 8099;
 const MARKER = 'NODEJS_BOOT_7xQ9';
+const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './rootfs.tar';
 
 async function main() {
     let server = null;
@@ -29,6 +30,7 @@ async function main() {
         writeFileSync(manifestPath, JSON.stringify({
             version: 1,
             image: "test-nodejs",
+            rootfs: ROOTFS_URL,
             entrypoint: `/usr/bin/node --jitless --max-old-space-size=256 -e console.log('${MARKER}')`,
             workdir: "/",
             env: [
@@ -51,6 +53,7 @@ async function main() {
             server.stderr.on('data', d => console.log('[server-err]', d.toString().trim()));
             server.on('error', e => { clearTimeout(t); reject(e); });
         });
+        console.log(`[test] Rootfs URL: ${ROOTFS_URL}`);
         console.log(`[test] Server on :${PORT}`);
 
         browser = await puppeteer.launch({

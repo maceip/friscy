@@ -87,29 +87,52 @@
             margin-left: 1rem;
         }
         .header-logo:hover { opacity: 1; }
-        .terminal-actions button {
+        .example-bar {
+            display: flex;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+        }
+        .example-bar button {
             background-color: #0f3460;
             color: #eee;
             border: none;
-            padding: 0.5rem 1rem;
+            padding: 0.4rem 0.8rem;
             border-radius: 5px;
             cursor: pointer;
             font-size: 0.8rem;
-            margin-left: 0.5rem;
         }
-        .terminal-actions button:hover {
-            background-color: #16213e;
-        }
-        .terminal-actions button.active {
+        .example-bar button:hover { background-color: #1a3a6e; }
+        .example-bar button.active {
             background-color: #1a4d2e;
             color: #98c379;
         }
-        .action-sep {
-            width: 1px;
-            height: 1.2rem;
-            background: #0f3460;
-            margin: 0 0.25rem;
+        #terminal-wrapper {
+            position: relative;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
         }
+        #reset-btn {
+            display: none;
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            z-index: 10;
+            background: rgba(15, 52, 96, 0.7);
+            color: #8b949e;
+            border: none;
+            border-radius: 4px;
+            width: 28px;
+            height: 28px;
+            cursor: pointer;
+            font-size: 1rem;
+            line-height: 28px;
+            text-align: center;
+            padding: 0;
+        }
+        #reset-btn:hover { background: rgba(15, 52, 96, 0.95); color: #eee; }
     </style>
 </head>
 <body>
@@ -118,15 +141,13 @@
             <h1>friscy container</h1>
             <div class="status" id="status">Loading...<span id="net-status" class="net-status disconnected">net: off</span></div>
         </div>
-        <div class="terminal-actions">
-            <button id="example-nodejs" title="Interactive Node.js REPL">Node.js</button>
-            <button id="example-server" title="HTTP echo server on port 8080">Server</button>
-            <span class="action-sep"></span>
-            <button id="fit-button">Fit Terminal</button>
-            <button id="reset-button">Reset</button>
-        </div>
         <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
     </header>
+    <div class="example-bar">
+        <button id="example-alpine" title="Alpine Linux shell">Load Alpine</button>
+        <button id="example-nodejs" title="Interactive Node.js REPL">Load Node.js</button>
+        <button id="example-server" title="HTTP echo server on port 8080">Load Server</button>
+    </div>
     <div id="terminal-container">
         <div id="progress-overlay">
             <div class="progress-title">friscy</div>
@@ -134,7 +155,10 @@
             <canvas id="progress-canvas" class="progress-wave" width="800" height="48"></canvas>
             <div class="progress-detail" id="progress-detail">&nbsp;</div>
         </div>
-        <div id="terminal" style="display:none;"></div>
+        <div id="terminal-wrapper">
+            <button id="reset-btn" title="Reset">&#x21bb;</button>
+            <div id="terminal" style="display:none;"></div>
+        </div>
     </div>
 
     <!-- Service worker: caching + COOP/COEP for cross-origin isolation -->
@@ -839,10 +863,10 @@
             const exampleCfg = (activeExample && manifest.examples && manifest.examples[activeExample]) || {};
             const imageName = exampleCfg.image || manifest.image;
             const rootfsUrl = exampleCfg.rootfs || manifest.rootfs || './rootfs.tar';
-            statusEl.textContent = `Image: ${imageName}`;
+            statusEl.textContent = `Loading ${imageName}...`;
 
             // Download rootfs with progress
-            setProgress(0, `Downloading ${imageName}...`, 'Starting download...');
+            setProgress(0, `Loading ${imageName}...`, 'Starting download...');
             const rootfs = await fetchWithProgress(rootfsUrl);
 
             // Initialize runtime (indeterminate)
@@ -888,7 +912,6 @@
             const debouncedFit = debounce(updateTerminalSize, 150);
 
             window.addEventListener('resize', debouncedFit);
-            document.getElementById('fit-button').addEventListener('click', debouncedFit);
             terminalEl.addEventListener('click', () => term.focus());
 
             // Create SharedArrayBuffers for Worker communication
@@ -948,9 +971,10 @@
                 netRPCHost.start();
             }
 
-            // Transition: hide progress overlay, show terminal
+            // Transition: hide progress overlay, show terminal + reset button
             overlayEl.classList.add('hidden');
             terminalEl.style.display = 'flex';
+            document.getElementById('reset-btn').style.display = 'block';
             term.focus();
             updateTerminalSize();
 
@@ -1045,18 +1069,20 @@
         const params = new URLSearchParams(location.search);
         const activeExample = params.get('example');
 
-        // Highlight active example button
-        if (activeExample && document.getElementById('example-' + activeExample)) {
-            document.getElementById('example-' + activeExample).classList.add('active');
-        }
+        // Highlight active example button (default = alpine when no param)
+        const activeBtn = document.getElementById('example-' + (activeExample || 'alpine'));
+        if (activeBtn) activeBtn.classList.add('active');
 
-        document.getElementById('example-nodejs').addEventListener('click', () => {
-            const u = new URL(location); u.searchParams.set('example', 'nodejs'); location.href = u;
-        });
-        document.getElementById('example-server').addEventListener('click', () => {
-            const u = new URL(location); u.searchParams.set('example', 'server'); location.href = u;
-        });
-        document.getElementById('reset-button').addEventListener('click', () => location.reload());
+        function switchExample(name) {
+            const u = new URL(location);
+            if (name === 'alpine') u.searchParams.delete('example');
+            else u.searchParams.set('example', name);
+            location.href = u;
+        }
+        document.getElementById('example-alpine').addEventListener('click', () => switchExample('alpine'));
+        document.getElementById('example-nodejs').addEventListener('click', () => switchExample('nodejs'));
+        document.getElementById('example-server').addEventListener('click', () => switchExample('server'));
+        document.getElementById('reset-btn').addEventListener('click', () => location.reload());
 
         main().catch(e => {
             console.error(e);

@@ -697,6 +697,16 @@ function runResumeLoop() {
 
 ### 2.3 Testing Phase 2
 
+#### Browser Smoke (Node.js + Claude)
+
+```bash
+# Full smoke: Node.js + Claude plus JIT compilation log check
+bash ./tests/smoke_phase2_jit_dispatch.sh
+
+# Faster local loop: Node.js only
+bash ./tests/smoke_phase2_jit_dispatch.sh --skip-claude
+```
+
 #### Correctness: Single-block equivalence
 
 The dispatch loop must produce identical results to the old per-block dispatch.

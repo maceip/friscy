@@ -213,21 +213,12 @@
             color: #8b949e;
             min-height: 1.2em;
         }
-        .import-progress-bar {
+        .import-progress-canvas {
             width: min(460px, 90%);
-            height: 4px;
-            background: #21262d;
-            border-radius: 2px;
-            overflow: hidden;
+            height: 18px;
             display: none;
         }
-        .import-progress-bar.visible { display: block; }
-        .import-progress-fill {
-            height: 100%;
-            background: #58a6ff;
-            border-radius: 2px;
-            width: 0%;
-            transition: width 0.3s;
+        .import-progress-canvas.visible { display: block;
         }
 
         .header-link {
@@ -391,7 +382,7 @@
                 <div class="import-autocomplete" id="import-ac"></div>
             </div>
             </form>
-            <div class="import-progress-bar" id="import-progress-bar"><div class="import-progress-fill" id="import-progress-fill"></div></div>
+            <canvas class="import-progress-canvas" id="import-progress-canvas" width="460" height="18"></canvas>
             <div class="import-status" id="import-status">&nbsp;</div>
         </div>
         <div id="terminal-wrapper">
@@ -1382,8 +1373,23 @@
             const ac = document.getElementById('import-ac');
             const goBtn = document.getElementById('import-go-btn');
             const statusDiv = document.getElementById('import-status');
-            const progressBar = document.getElementById('import-progress-bar');
-            const progressFill = document.getElementById('import-progress-fill');
+            const importCanvas = document.getElementById('import-progress-canvas');
+            const importCtx = importCanvas.getContext('2d');
+            let importProgress = 0;
+            let importAnimId = null;
+            const PINK = '#f9a8d4';
+
+            function drawImportProgress() {
+                const { W, H } = ensureCanvasDPI(importCanvas, importCtx);
+                importCtx.clearRect(0, 0, W, H);
+                if (importProgress < 0) {
+                    // Indeterminate
+                    drawSquigglyIndeterminate(importCtx, W, H, performance.now(), PINK);
+                } else {
+                    drawSquigglyProgress(importCtx, W, H, performance.now(), importProgress, PINK);
+                }
+                importAnimId = requestAnimationFrame(drawImportProgress);
+            }
             let selectedIdx = -1;
             let filtered = [];
 
@@ -1500,14 +1506,15 @@
                 input.disabled = true;
                 ac.classList.remove('open');
                 statusDiv.textContent = `Pulling ${image}...`;
-                progressBar.classList.add('visible');
-                progressFill.style.width = '0%';
+                importCanvas.classList.add('visible');
+                importProgress = -1; // indeterminate until we know size
+                if (!importAnimId) importAnimId = requestAnimationFrame(drawImportProgress);
 
                 try {
-                    // Determine proxy pull URL
+                    // Determine proxy pull URL (Caddy reverse proxy with valid Let's Encrypt cert)
                     const proxyHost = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
                         ? `https://${location.hostname}:4434`
-                        : 'https://78.141.219.102:4434';
+                        : 'https://78.141.219.102.nip.io';
                     const pullUrl = `${proxyHost}/pull?image=${encodeURIComponent(image)}`;
 
                     const resp = await fetch(pullUrl);
@@ -1526,12 +1533,11 @@
                         if (done) break;
                         chunks.push(value);
                         loaded += value.length;
-                        const pct = total ? Math.round((loaded / total) * 100) : 0;
-                        progressFill.style.width = (total ? pct : 50) + '%';
+                        importProgress = total ? loaded / total : -1;
                         statusDiv.textContent = `Pulling ${image}... ${(loaded/1024/1024).toFixed(1)} MB` + (total ? ` / ${(total/1024/1024).toFixed(1)} MB` : '');
                     }
 
-                    progressFill.style.width = '100%';
+                    importProgress = 1.0;
                     statusDiv.textContent = `Booting ${image}...`;
 
                     // Combine chunks into rootfs ArrayBuffer
@@ -1540,11 +1546,14 @@
                     for (const c of chunks) { rootfs.set(c, off); off += c.length; }
 
                     // Boot the emulator with this rootfs
+                    importCanvas.classList.remove('visible');
+                    if (importAnimId) { cancelAnimationFrame(importAnimId); importAnimId = null; }
                     await bootImportedImage(image, rootfs.buffer);
 
                 } catch (e) {
                     statusDiv.textContent = `Error: ${e.message}`;
-                    progressBar.classList.remove('visible');
+                    importCanvas.classList.remove('visible');
+                    if (importAnimId) { cancelAnimationFrame(importAnimId); importAnimId = null; }
                     goBtn.disabled = false;
                     input.disabled = false;
                 }
@@ -1762,7 +1771,7 @@
                     if (!image.includes(':')) image += ':latest';
                     const proxyHost = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
                         ? `https://${location.hostname}:4434`
-                        : 'https://78.141.219.102:4434';
+                        : 'https://78.141.219.102.nip.io';
                     const pullUrl = `${proxyHost}/pull?image=${encodeURIComponent(image)}`;
 
                     try {

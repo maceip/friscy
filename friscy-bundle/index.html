@@ -1143,6 +1143,9 @@
         }
 
         async function main() {
+            // Snapshot net-status HTML before any textContent call destroys it
+            const netStatusHTML = (document.getElementById('net-status') || {outerHTML: ''}).outerHTML;
+
             // Check for SharedArrayBuffer support (requires COOP/COEP headers)
             if (typeof SharedArrayBuffer === 'undefined') {
                 statusEl.textContent = 'Error: SharedArrayBuffer not available';
@@ -1396,8 +1399,6 @@
             const guestCmd = Array.isArray(entrypoint) ? entrypoint : entrypoint.split(' ').filter(s => s);
             const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
 
-            // Save net-status HTML before textContent destroys it
-            const netStatusHTML = document.getElementById('net-status').outerHTML;
             statusEl.textContent = 'Booting...';
             machineRunning = true;
 
@@ -1977,12 +1978,12 @@
 
             // Boot: use /bin/sh as default entrypoint for imported images
             const args = ['--rootfs', '/rootfs.tar', '/bin/sh'];
-            const netStatusHTML2 = document.getElementById('net-status').outerHTML;
+            const netStatusHTML3 = (document.getElementById('net-status') || {outerHTML: ''}).outerHTML;
             statusEl.textContent = 'Booting...';
             machineRunning = true;
             const rootfsArray = new Uint8Array(rootfs);
             worker.postMessage({ type: 'run', args, rootfsData: rootfsArray.buffer }, [rootfsArray.buffer]);
-            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + netStatusHTML2;
+            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + netStatusHTML3;
         }
 
         function debounce(fn, ms) {

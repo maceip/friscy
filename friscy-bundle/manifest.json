@@ -1,14 +1,13 @@
 {
   "version": 1,
-  "image": "friscy-claude",
-  "entrypoint": "/usr/bin/node --jitless --max-old-space-size=256 /usr/local/bin/claude --version",
+  "image": "friscy-alpine",
+  "entrypoint": "/bin/sh",
   "workdir": "/root",
   "env": [
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    "NODE_OPTIONS=--jitless --max-old-space-size=256",
     "HOME=/root",
     "TERM=xterm-256color"
   ],
   "aot": [],
-  "rootfs_url": "https://github.com/anthropics/friscy-standalone/releases/download/v1/rootfs.tar"
+  "rootfs_url": "https://github.com/maceip/friscy/releases/download/v1/rootfs.tar"
 }

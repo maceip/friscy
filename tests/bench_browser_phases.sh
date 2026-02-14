@@ -18,6 +18,9 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNS=5
 WRITE_BASELINE=0
 ROOTFS_URL="./nodejs.tar"
+NODE_EVAL='console.log("42")'
+EXPECTED_OUTPUT='42'
+BENCHMARK_PREFIX='browser_node42'
 
 PHASE1_QUERY="?noproxy&nojit=1"
 PHASE2_QUERY="?noproxy&jithot=20"
@@ -41,9 +44,21 @@ while [[ $# -gt 0 ]]; do
             ROOTFS_URL="${2:-}"
             shift 2
             ;;
+        --eval)
+            NODE_EVAL="${2:-}"
+            shift 2
+            ;;
+        --expected)
+            EXPECTED_OUTPUT="${2:-}"
+            shift 2
+            ;;
+        --benchmark-prefix)
+            BENCHMARK_PREFIX="${2:-}"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--runs N] [--write-baseline] [--rootfs-url URL]"
+            echo "Usage: $0 [--runs N] [--write-baseline] [--rootfs-url URL] [--eval JS] [--expected TEXT] [--benchmark-prefix NAME]"
             exit 1
             ;;
     esac
@@ -66,6 +81,9 @@ bash "$PROJECT_DIR/tests/bench_browser_node42.sh" \
     --query "$PHASE1_QUERY" \
     --out "$PHASE1_OUT" \
     --baseline "$PHASE1_BASELINE" \
+    --eval "$NODE_EVAL" \
+    --expected "$EXPECTED_OUTPUT" \
+    --benchmark "${BENCHMARK_PREFIX}.phase1" \
     "${WRITE_FLAG[@]}"
 
 echo
@@ -76,6 +94,9 @@ bash "$PROJECT_DIR/tests/bench_browser_node42.sh" \
     --query "$PHASE2_QUERY" \
     --out "$PHASE2_OUT" \
     --baseline "$PHASE2_BASELINE" \
+    --eval "$NODE_EVAL" \
+    --expected "$EXPECTED_OUTPUT" \
+    --benchmark "${BENCHMARK_PREFIX}.phase2" \
     "${WRITE_FLAG[@]}"
 
 echo

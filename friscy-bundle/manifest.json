@@ -9,5 +9,17 @@
     "TERM=xterm-256color"
   ],
   "aot": [],
-  "rootfs_url": "https://github.com/maceip/friscy/releases/download/v1/rootfs.tar"
+  "rootfs_url": "https://github.com/maceip/friscy/releases/download/v1/rootfs.tar",
+  "examples": {
+    "nodejs": {
+      "rootfs_url": "https://github.com/maceip/friscy/releases/download/v1/nodejs.tar",
+      "entrypoint": "/usr/bin/node --jitless --max-old-space-size=256 -i",
+      "image": "friscy-nodejs"
+    },
+    "server": {
+      "rootfs_url": "https://github.com/maceip/friscy/releases/download/v1/nodejs.tar",
+      "entrypoint": "/usr/bin/node --jitless --max-old-space-size=256 -e const http=require('http');const s=http.createServer((q,r)=>{let b='';q.on('data',c=>b+=c);q.on('end',()=>{r.writeHead(200,{'Content-Type':'application/json'});r.end(JSON.stringify({method:q.method,url:q.url,headers:q.headers,body:b}))})});s.listen(8080,()=>console.log('Echo server listening on :8080'))",
+      "image": "friscy-nodejs"
+    }
+  }
 }

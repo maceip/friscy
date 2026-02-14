@@ -10,6 +10,9 @@
 # Usage:
 #   ./tests/smoke_phase2_jit_dispatch.sh
 #   ./tests/smoke_phase2_jit_dispatch.sh --skip-claude
+# Environment overrides:
+#   FRISCY_PHASE_ROOTFS=/abs/path/to/rootfs.tar
+#   FRISCY_TEST_ROOTFS_URL=./nodejs.tar
 # ============================================================================
 set -euo pipefail
 
@@ -38,11 +41,22 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 ROOTFS="$PROJECT_DIR/friscy-bundle/rootfs.tar"
+TEST_ROOTFS_URL="./rootfs.tar"
+if ! $RUN_CLAUDE; then
+    ROOTFS="$PROJECT_DIR/friscy-bundle/nodejs.tar"
+    TEST_ROOTFS_URL="./nodejs.tar"
+fi
+ROOTFS="${FRISCY_PHASE_ROOTFS:-$ROOTFS}"
+TEST_ROOTFS_URL="${FRISCY_TEST_ROOTFS_URL:-$TEST_ROOTFS_URL}"
+
+echo "[smoke] Using rootfs: $ROOTFS"
+echo "[smoke] Browser rootfs URL: $TEST_ROOTFS_URL"
 check_baseline_rootfs "$ROOTFS" "$RUN_CLAUDE" 62914560
 
 NODE_OPTS=(--experimental-default-type=module)
 
 echo "[smoke] Phase 2 JIT-dispatch smoke: Node.js workload"
+FRISCY_TEST_ROOTFS_URL="$TEST_ROOTFS_URL" \
 node "${NODE_OPTS[@]}" "$PROJECT_DIR/tests/test_phase1_nodejs2.js"
 echo "[smoke] PASS: Node.js workload"
 

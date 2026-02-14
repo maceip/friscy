@@ -1396,6 +1396,8 @@
             const guestCmd = Array.isArray(entrypoint) ? entrypoint : entrypoint.split(' ').filter(s => s);
             const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
 
+            // Save net-status HTML before textContent destroys it
+            const netStatusHTML = document.getElementById('net-status').outerHTML;
             statusEl.textContent = 'Booting...';
             machineRunning = true;
 
@@ -1408,7 +1410,7 @@
                 rootfsData: rootfsArray.buffer,
             }, [rootfsArray.buffer]);
 
-            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + document.getElementById('net-status').outerHTML;
+            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + netStatusHTML;
 
             // Server tab: boot companion Alpine shell + auto wget
             if (activeExample === 'server' && companionRootfs) {
@@ -1975,11 +1977,12 @@
 
             // Boot: use /bin/sh as default entrypoint for imported images
             const args = ['--rootfs', '/rootfs.tar', '/bin/sh'];
+            const netStatusHTML2 = document.getElementById('net-status').outerHTML;
             statusEl.textContent = 'Booting...';
             machineRunning = true;
             const rootfsArray = new Uint8Array(rootfs);
             worker.postMessage({ type: 'run', args, rootfsData: rootfsArray.buffer }, [rootfsArray.buffer]);
-            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + document.getElementById('net-status').outerHTML;
+            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + netStatusHTML2;
         }
 
         function debounce(fn, ms) {

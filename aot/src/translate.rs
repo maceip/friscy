@@ -2723,9 +2723,23 @@ fn cache_gpr_i64_values(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<WasmI
         // later uses can avoid reloading from machine-state memory.
         if let WasmInst::I64Store { offset } = body[i] {
             if is_cacheable_gpr_offset(offset) {
-                let cache_local = get_or_alloc_local_for_offset(&mut offset_to_local, offset, next_local);
-                let already_cached = i > 0
-                    && matches!(body[i - 1], WasmInst::LocalTee { idx } if idx == cache_local);
+                let preceding_tee = if i > 0 {
+                    match body[i - 1] {
+                        WasmInst::LocalTee { idx } => Some(idx),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                let cache_local = if let Some(idx) = preceding_tee {
+                    offset_to_local.entry(offset).or_insert(idx);
+                    idx
+                } else {
+                    get_or_alloc_local_for_offset(&mut offset_to_local, offset, next_local)
+                };
+
+                let already_cached = preceding_tee == Some(cache_local);
                 if !already_cached {
                     out.push(WasmInst::LocalTee { idx: cache_local });
                     changes += 1;

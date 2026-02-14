@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>friscy container</title>
+    <title>friscy</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -47,8 +47,26 @@
             overflow: hidden;
             display: flex;
         }
-        .xterm-viewport {
-             overflow-y: auto;
+        .xterm .xterm-viewport {
+            overflow-y: hidden !important;
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+        }
+        .xterm .xterm-viewport::-webkit-scrollbar {
+            width: 0 !important;
+            height: 0 !important;
+            display: none !important;
+        }
+        #terminal::-webkit-scrollbar,
+        #terminal-wrapper::-webkit-scrollbar {
+            display: none !important;
+        }
+        #terminal, #terminal-wrapper, .xterm-screen {
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+        }
+        .xterm-screen::-webkit-scrollbar {
+            display: none !important;
         }
         /* Progress overlay */
         #progress-overlay {
@@ -81,6 +99,125 @@
             font-variant-numeric: tabular-nums;
         }
 
+        /* Import panel */
+        #import-panel {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            background: #0d1117;
+            border-radius: 8px;
+            gap: 1.5rem;
+            padding: 2rem;
+        }
+        #import-panel.visible { display: flex; }
+        .import-title {
+            font-size: 1.1rem;
+            color: #e6edf3;
+            font-weight: 500;
+        }
+        .import-subtitle {
+            font-size: 0.8rem;
+            color: #6e7681;
+            margin-top: -0.8rem;
+        }
+        .import-input-wrapper {
+            position: relative;
+            width: min(460px, 90%);
+        }
+        .import-input {
+            width: 100%;
+            padding: 10px 14px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            color: #e6edf3;
+            font-size: 0.95rem;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+        .import-input:focus { border-color: #58a6ff; }
+        .import-input::placeholder { color: transparent; }
+        .import-chip {
+            position: absolute;
+            top: 50%;
+            left: 14px;
+            transform: translateY(-50%);
+            background: #21262d;
+            color: #8b949e;
+            padding: 3px 10px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            pointer-events: none;
+            transition: opacity 0.15s;
+        }
+        .import-chip.hidden { opacity: 0; pointer-events: none; }
+        .import-autocomplete {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            max-height: 240px;
+            overflow-y: auto;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+            z-index: 50;
+            display: none;
+        }
+        .import-autocomplete.open { display: block; }
+        .import-ac-item {
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            color: #c9d1d9;
+            border-bottom: 1px solid #21262d;
+        }
+        .import-ac-item:last-child { border-bottom: none; }
+        .import-ac-item:hover, .import-ac-item.selected {
+            background: #1f6feb22;
+            color: #58a6ff;
+        }
+        .import-ac-item .match { color: #58a6ff; font-weight: 600; }
+        .import-go-btn {
+            padding: 8px 24px;
+            background: #238636;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .import-go-btn:hover { background: #2ea043; }
+        .import-go-btn:disabled { background: #21262d; color: #484f58; cursor: default; }
+        .import-status {
+            font-size: 0.8rem;
+            color: #8b949e;
+            min-height: 1.2em;
+        }
+        .import-progress-bar {
+            width: min(460px, 90%);
+            height: 4px;
+            background: #21262d;
+            border-radius: 2px;
+            overflow: hidden;
+            display: none;
+        }
+        .import-progress-bar.visible { display: block; }
+        .import-progress-fill {
+            height: 100%;
+            background: #58a6ff;
+            border-radius: 2px;
+            width: 0%;
+            transition: width 0.3s;
+        }
+
         .header-link {
             color: inherit;
             text-decoration: none;
@@ -92,11 +229,40 @@
             margin-left: 1rem;
         }
         .header-logo:hover { opacity: 1; }
-        .description {
-            padding: 0.5rem 1rem;
-            font-size: 0.85rem;
-            color: #8b949e;
-            line-height: 1.4;
+        /* Mobile breakpoints */
+        @media (max-width: 768px) {
+            header { padding: 0.5rem 0.75rem; }
+            h1 { font-size: 1rem; }
+            .status { font-size: 0.75rem; }
+            .header-logo { height: 18px; margin-left: 0.5rem; }
+            .tab-bar { padding: 0 0.5rem; gap: 1px; overflow-x: auto; scrollbar-width: none; }
+            .tab-bar::-webkit-scrollbar { display: none; }
+            .tab { padding: 5px 8px; font-size: 0.7rem; gap: 4px; white-space: nowrap; }
+            .tab-icon { width: 13px; height: 13px; }
+            .tab-strip-border { margin: 0 0.5rem; }
+            #terminal-container { padding: 0.5rem; }
+            #reset-btn { width: 24px; height: 24px; font-size: 0.9rem; line-height: 22px; }
+            .import-input-wrapper { width: 95%; }
+            .import-title { font-size: 0.95rem; }
+            .import-input { font-size: 0.85rem; padding: 8px 10px; }
+        }
+        @media (max-width: 480px) {
+            header { padding: 0.4rem 0.5rem; }
+            h1 { font-size: 0.9rem; }
+            .status { font-size: 0.7rem; margin-top: 0.15rem; }
+            .net-status { font-size: 0.65rem; padding: 0.15rem 0.35rem; }
+            .tab { padding: 4px 6px; font-size: 0.65rem; }
+            .tab-icon { width: 12px; height: 12px; }
+            #terminal-container { padding: 0.25rem; }
+        }
+        /* IME-aware: when virtual keyboard is visible, shrink terminal */
+        @media (max-height: 450px) {
+            header { padding: 0.25rem 0.5rem; }
+            h1 { font-size: 0.85rem; }
+            .status { display: none; }
+            .tab-bar { padding: 0 0.25rem; }
+            .tab { padding: 3px 5px; font-size: 0.6rem; }
+            #terminal-container { padding: 0.25rem; }
         }
         .tab-bar {
             display: flex;
@@ -110,9 +276,9 @@
             align-items: center;
             gap: 6px;
             padding: 6px 14px;
-            background: #0d1117;
-            color: #8b949e;
-            border: 1px solid #30363d;
+            background: #0a0e14;
+            color: #6e7681;
+            border: 1px solid #21262d;
             border-bottom: none;
             border-radius: 8px 8px 0 0;
             cursor: pointer;
@@ -124,7 +290,7 @@
         }
         .tab:hover { background: #161b22; color: #c9d1d9; }
         .tab.active {
-            background: #1a1a2e;
+            background: #0d1117;
             color: #e6edf3;
             border-color: #30363d;
             z-index: 1;
@@ -144,24 +310,27 @@
             flex: 1;
             display: flex;
             flex-direction: column;
+            overflow: hidden;
         }
         #reset-btn {
             display: none;
             position: absolute;
-            top: 0.5rem;
-            right: 0.5rem;
-            z-index: 10;
-            background: rgba(15, 52, 96, 0.7);
+            top: 6px;
+            right: 6px;
+            z-index: 100;
+            background: rgba(15, 52, 96, 0.75);
             color: #8b949e;
-            border: none;
+            border: 1px solid rgba(48, 54, 61, 0.5);
             border-radius: 4px;
             width: 28px;
             height: 28px;
             cursor: pointer;
-            font-size: 1rem;
-            line-height: 28px;
+            font-size: 1.1rem;
+            line-height: 26px;
             text-align: center;
             padding: 0;
+            backdrop-filter: blur(4px);
+            transition: background 0.15s, color 0.15s;
         }
         #reset-btn:hover { background: rgba(15, 52, 96, 0.95); color: #eee; }
     </style>
@@ -169,14 +338,14 @@
 <body>
     <header>
         <div>
-            <h1><a href="https://github.com/maceip/friscy" class="header-link">friscy container</a></h1>
-            <div class="status" id="status">Loading...<span id="net-status" class="net-status disconnected">net: off</span></div>
+            <h1><a href="https://github.com/maceip/friscy" class="header-link">friscy</a></h1>
+            <div class="status" id="status">fast risc-v runtime for the browser &amp; wasm<span id="net-status" class="net-status disconnected">net: off</span></div>
         </div>
-        <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
+        <div style="display:flex;align-items:center;gap:0.5rem;">
+            <img src="./webmcp-icon.svg" alt="WebMCP" class="header-logo" title="WebMCP enabled">
+            <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
+        </div>
     </header>
-    <div class="description">
-        Run Docker containers in the browser. friscy cross-compiles Linux containers to RISC-V and executes them in a userland emulator compiled to WebAssembly.
-    </div>
     <div class="tab-bar">
         <button class="tab active" id="tab-alpine" data-example="alpine" title="Alpine Linux shell">
             <img src="./alpine-icon.svg" alt="" class="tab-icon">Alpine
@@ -187,6 +356,9 @@
         <button class="tab" id="tab-server" data-example="server" title="HTTP echo server on port 8080">
             <img src="./go-icon.svg" alt="" class="tab-icon">Go Server
         </button>
+        <button class="tab" id="tab-import" data-example="import" title="Import a Docker image">
+            <img src="./docker-icon.svg" alt="" class="tab-icon">Import
+        </button>
     </div>
     <div class="tab-strip-border"></div>
     <div id="terminal-container">
@@ -195,6 +367,20 @@
             <div class="progress-stage" id="progress-stage">Preparing...</div>
             <canvas id="progress-canvas" class="progress-wave" width="800" height="48"></canvas>
             <div class="progress-detail" id="progress-detail">&nbsp;</div>
+        </div>
+        <div id="import-panel">
+            <div class="import-title">Import a Docker image</div>
+            <div class="import-subtitle">Pull any public image from Docker Hub and run it in friscy</div>
+            <form id="import-form" toolname="import_docker_image" tooldescription="Pull a Docker image from Docker Hub and run it in a RISC-V emulator in the browser">
+            <div class="import-input-wrapper">
+                <input type="text" class="import-input" id="import-input" name="image" autocomplete="off" spellcheck="false" toolparamdescription="Docker image reference, e.g. ubuntu:latest or python:3.12">
+                <div class="import-chip" id="import-chip">ubuntu:latest</div>
+                <div class="import-autocomplete" id="import-ac"></div>
+            </div>
+            <button type="submit" class="import-go-btn" id="import-go-btn">Pull &amp; Run</button>
+            </form>
+            <div class="import-progress-bar" id="import-progress-bar"><div class="import-progress-fill" id="import-progress-fill"></div></div>
+            <div class="import-status" id="import-status">&nbsp;</div>
         </div>
         <div id="terminal-wrapper">
             <button id="reset-btn" title="Reset">&#x21bb;</button>
@@ -877,6 +1063,15 @@
                 return;
             }
 
+            // Import tab: show import panel instead of booting
+            if (activeExample === 'import') {
+                overlayEl.style.display = 'none';
+                document.getElementById('import-panel').classList.add('visible');
+                statusEl.textContent = 'Import';
+                initImportPanel();
+                return;
+            }
+
             setProgress(-1, 'Loading manifest...');
             const manifest = await fetch('./manifest.json').then(r => r.json());
 
@@ -978,10 +1173,13 @@
             await workerReady;
 
             // Connect network bridge (optional — needs proxy server)
-            // Only connect if ?proxy= URL is explicitly provided, or on localhost
-            const proxyUrl = new URLSearchParams(location.search).get('proxy')
+            // Priority: ?noproxy disables > ?proxy= param > localhost > default public proxy
+            const DEFAULT_PROXY = 'https://78.141.219.102:4433/connect';
+            const params = new URLSearchParams(location.search);
+            const proxyUrl = params.has('noproxy') ? null
+                           : params.get('proxy')
                              || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
-                                 ? `https://${location.hostname}:4433/connect` : null);
+                                 ? `https://${location.hostname}:4433/connect` : DEFAULT_PROXY);
             if (proxyUrl) {
                 setProgress(-1, 'Connecting network...');
                 try {
@@ -1011,14 +1209,16 @@
             updateTerminalSize();
 
             const rootfsMB = (rootfs.byteLength / 1024 / 1024).toFixed(1);
-            term.writeln('\x1b[1;32mfriscy\x1b[0m container runtime');
+            term.writeln('\x1b[4:3m\x1b[58;2;255;0;255mRun Docker containers in the browser. friscy cross-compiles Linux containers to RISC-V and executes them in a userland emulator compiled to WebAssembly.\x1b[0m');
+            term.writeln('');
+            term.writeln('\x1b[1;32mfriscy\x1b[0m fast risc-v runtime for the browser & wasm');
             term.writeln(`Image: ${manifest.image} (${rootfsMB} MB)`);
             term.writeln(netBridge && netBridge.isAvailable()
                 ? '\x1b[32mNetwork: connected\x1b[0m'
                 : '\x1b[33mNetwork: offline (no proxy)\x1b[0m');
             term.writeln('');
 
-            // --- Clipboard support (Ctrl+C copy / Ctrl+V paste) ---
+            // --- Clipboard support (Ctrl+C copy / Ctrl+V paste) + Tab capture ---
             term.attachCustomKeyEventHandler((ev) => {
                 if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
                     navigator.clipboard.writeText(term.getSelection());
@@ -1029,6 +1229,11 @@
                         if (text) term.paste(text);
                     }).catch(() => {});
                     return false;
+                }
+                // Capture Tab key — send \t to guest shell for tab completion
+                if (ev.key === 'Tab') {
+                    ev.preventDefault();
+                    return true; // let xterm process it (sends \t via onData)
                 }
                 return true;
             });
@@ -1094,7 +1299,24 @@
                 rootfsData: rootfsArray.buffer,
             }, [rootfsArray.buffer]);
 
-            statusEl.textContent = 'Interactive';
+            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + document.getElementById('net-status').outerHTML;
+
+            // Auto-run uname -a on Alpine boot — wait until shell is ready (requesting stdin)
+            if (activeExample === 'alpine') {
+                const waitForShell = () => {
+                    // controlView[0] == 1 means worker is blocking on stdin (shell prompt ready)
+                    if (controlView && Atomics.load(controlView, 0) === 1) {
+                        const cmd = 'uname -a\n';
+                        for (let i = 0; i < cmd.length; i++) {
+                            stdinQueue.push(cmd.charCodeAt(i));
+                        }
+                        checkStdinRequest();
+                    } else {
+                        setTimeout(waitForShell, 200);
+                    }
+                };
+                setTimeout(waitForShell, 1000);
+            }
         }
 
         // --- Tab bar ---
@@ -1118,6 +1340,350 @@
         });
         document.getElementById('reset-btn').addEventListener('click', () => location.reload());
 
+        // --- Popular Docker images for autocomplete (riscv64-available) ---
+        const POPULAR_IMAGES = [
+            'ubuntu','alpine','debian','busybox','centos','fedora','archlinux','amazonlinux','oraclelinux','rockylinux','almalinux','clearlinux',
+            'node','python','ruby','rust','golang','openjdk','eclipse-temurin','amazoncorretto','php','perl','erlang','elixir','swift','dart','julia','haskell','clojure','groovy','scala','dotnet/sdk','dotnet/runtime',
+            'nginx','httpd','caddy','traefik','haproxy','envoyproxy/envoy',
+            'postgres','mysql','mariadb','mongo','redis','memcached','cassandra','couchdb','neo4j','influxdb','clickhouse/clickhouse-server','timescale/timescaledb',
+            'rabbitmq','nats','mosquitto','kafka',
+            'elasticsearch','kibana','logstash','grafana/grafana','prom/prometheus','prom/alertmanager',
+            'vault','consul','etcd',
+            'docker','docker/compose','registry','portainer/portainer-ce',
+            'jenkins/jenkins','gitlab/gitlab-ce','gitea/gitea','drone/drone','sonarqube',
+            'nextcloud','wordpress','ghost','mediawiki','drupal','joomla',
+            'minio/minio','rclone/rclone',
+            'ubuntu:22.04','ubuntu:24.04','ubuntu:latest','debian:bookworm','debian:bullseye','alpine:3.19','alpine:3.20','alpine:edge',
+            'node:22','node:20','node:lts','node:alpine','python:3.12','python:3.11','python:slim','python:alpine',
+            'rust:latest','rust:slim','rust:alpine','golang:1.22','golang:1.21','golang:alpine',
+            'nginx:alpine','nginx:latest','redis:alpine','redis:latest','postgres:16','postgres:15','postgres:alpine',
+            'mongo:7','mongo:6','mysql:8','mariadb:11','mariadb:10',
+            'gcc','cmake','maven','gradle','composer','pip','cargo','npm',
+            'curl','wget','git','openssh-server','openssl',
+            'bash','zsh','fish','tmux','vim','neovim','emacs',
+            'ubuntu:20.04','ubuntu:18.04','centos:7','fedora:39','fedora:40',
+        ];
+
+        function initImportPanel() {
+            const input = document.getElementById('import-input');
+            const chip = document.getElementById('import-chip');
+            const ac = document.getElementById('import-ac');
+            const goBtn = document.getElementById('import-go-btn');
+            const statusDiv = document.getElementById('import-status');
+            const progressBar = document.getElementById('import-progress-bar');
+            const progressFill = document.getElementById('import-progress-fill');
+            let selectedIdx = -1;
+            let filtered = [];
+
+            // Chip behavior: visible when input empty and not focused
+            function updateChip() {
+                chip.classList.toggle('hidden', input.value.length > 0 || document.activeElement === input);
+            }
+
+            input.addEventListener('focus', () => { chip.classList.add('hidden'); });
+            input.addEventListener('blur', () => { setTimeout(updateChip, 150); });
+            input.addEventListener('input', () => {
+                updateChip();
+                updateAutocomplete();
+            });
+
+            // Click on chip fills input
+            chip.style.pointerEvents = 'auto';
+            chip.style.cursor = 'pointer';
+            chip.addEventListener('click', (e) => {
+                e.stopPropagation();
+                input.value = 'ubuntu:latest';
+                chip.classList.add('hidden');
+                input.focus();
+                updateAutocomplete();
+            });
+
+            function updateAutocomplete() {
+                const q = input.value.trim().toLowerCase();
+                if (!q) { ac.classList.remove('open'); filtered = []; return; }
+                filtered = POPULAR_IMAGES.filter(img => img.toLowerCase().includes(q)).slice(0, 12);
+                if (filtered.length === 0 || (filtered.length === 1 && filtered[0] === q)) {
+                    ac.classList.remove('open');
+                    return;
+                }
+                selectedIdx = -1;
+                renderAC();
+                ac.classList.add('open');
+            }
+
+            function renderAC() {
+                const q = input.value.trim().toLowerCase();
+                ac.innerHTML = filtered.map((img, i) => {
+                    const idx = img.toLowerCase().indexOf(q);
+                    let html;
+                    if (idx >= 0) {
+                        html = escHtml(img.slice(0, idx))
+                            + '<span class="match">' + escHtml(img.slice(idx, idx + q.length)) + '</span>'
+                            + escHtml(img.slice(idx + q.length));
+                    } else {
+                        html = escHtml(img);
+                    }
+                    return `<div class="import-ac-item${i === selectedIdx ? ' selected' : ''}" data-idx="${i}">${html}</div>`;
+                }).join('');
+            }
+
+            function escHtml(s) {
+                return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            }
+
+            ac.addEventListener('mousedown', (e) => {
+                const item = e.target.closest('.import-ac-item');
+                if (item) {
+                    input.value = filtered[+item.dataset.idx];
+                    ac.classList.remove('open');
+                    input.focus();
+                }
+            });
+
+            input.addEventListener('keydown', (e) => {
+                if (!ac.classList.contains('open')) {
+                    if (e.key === 'Enter') { doImport(); e.preventDefault(); }
+                    if (e.key === 'Tab' && input.value === '') {
+                        e.preventDefault();
+                        input.value = 'ubuntu:latest';
+                        chip.classList.add('hidden');
+                        updateAutocomplete();
+                    }
+                    return;
+                }
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    selectedIdx = Math.min(selectedIdx + 1, filtered.length - 1);
+                    renderAC();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    selectedIdx = Math.max(selectedIdx - 1, -1);
+                    renderAC();
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (selectedIdx >= 0) input.value = filtered[selectedIdx];
+                    ac.classList.remove('open');
+                    if (input.value.trim()) doImport();
+                } else if (e.key === 'Escape') {
+                    ac.classList.remove('open');
+                } else if (e.key === 'Tab') {
+                    e.preventDefault();
+                    if (selectedIdx >= 0) input.value = filtered[selectedIdx];
+                    else if (filtered.length > 0) input.value = filtered[0];
+                    ac.classList.remove('open');
+                }
+            });
+
+            // Handle both button click and form submit (for WebMCP declarative API)
+            const importForm = document.getElementById('import-form');
+            importForm.addEventListener('submit', (e) => { e.preventDefault(); doImport(); });
+
+            async function doImport() {
+                let image = input.value.trim();
+                if (!image) {
+                    image = 'ubuntu:latest';
+                    input.value = image;
+                }
+                // Add :latest if no tag specified
+                if (!image.includes(':')) image += ':latest';
+
+                goBtn.disabled = true;
+                input.disabled = true;
+                ac.classList.remove('open');
+                statusDiv.textContent = `Pulling ${image}...`;
+                progressBar.classList.add('visible');
+                progressFill.style.width = '0%';
+
+                try {
+                    // Determine proxy pull URL
+                    const proxyHost = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+                        ? `https://${location.hostname}:4434`
+                        : 'https://78.141.219.102:4434';
+                    const pullUrl = `${proxyHost}/pull?image=${encodeURIComponent(image)}`;
+
+                    const resp = await fetch(pullUrl);
+                    if (!resp.ok) {
+                        const errText = await resp.text();
+                        throw new Error(errText || `HTTP ${resp.status}`);
+                    }
+
+                    const total = parseInt(resp.headers.get('Content-Length') || '0', 10);
+                    const reader = resp.body.getReader();
+                    const chunks = [];
+                    let loaded = 0;
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        loaded += value.length;
+                        const pct = total ? Math.round((loaded / total) * 100) : 0;
+                        progressFill.style.width = (total ? pct : 50) + '%';
+                        statusDiv.textContent = `Pulling ${image}... ${(loaded/1024/1024).toFixed(1)} MB` + (total ? ` / ${(total/1024/1024).toFixed(1)} MB` : '');
+                    }
+
+                    progressFill.style.width = '100%';
+                    statusDiv.textContent = `Booting ${image}...`;
+
+                    // Combine chunks into rootfs ArrayBuffer
+                    const rootfs = new Uint8Array(loaded);
+                    let off = 0;
+                    for (const c of chunks) { rootfs.set(c, off); off += c.length; }
+
+                    // Boot the emulator with this rootfs
+                    await bootImportedImage(image, rootfs.buffer);
+
+                } catch (e) {
+                    statusDiv.textContent = `Error: ${e.message}`;
+                    progressBar.classList.remove('visible');
+                    goBtn.disabled = false;
+                    input.disabled = false;
+                }
+            }
+        }
+
+        // Boot an imported Docker image (reuses the normal boot flow)
+        async function bootImportedImage(imageName, rootfs) {
+            const importPanel = document.getElementById('import-panel');
+            const importStatus = document.getElementById('import-status');
+
+            // Hide import panel, show progress overlay
+            importPanel.classList.remove('visible');
+            overlayEl.style.display = '';
+            setProgress(-1, 'Initializing runtime...');
+
+            // Initialize xterm
+            term = new Terminal({
+                cursorBlink: true,
+                convertEol: true,
+                fontSize: 14,
+                fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                theme: {
+                    background: '#0d1117', foreground: '#c9d1d9',
+                    selectionBackground: '#00507a', cursor: '#c9d1d9',
+                    black: '#000000', red: '#e06c75', green: '#98c379',
+                    yellow: '#e5c07b', blue: '#61afef', magenta: '#c678dd',
+                    cyan: '#56b6c2', white: '#ffffff',
+                    brightBlack: '#5c6370', brightRed: '#e06c75', brightGreen: '#98c379',
+                    brightYellow: '#e5c07b', brightBlue: '#61afef', brightMagenta: '#c678dd',
+                    brightCyan: '#56b6c2', brightWhite: '#ffffff',
+                }
+            });
+            fitAddon = new FitAddon();
+            term.loadAddon(fitAddon);
+            term.open(terminalEl);
+            terminalEl.addEventListener('click', () => term.focus());
+
+            const debouncedFit = debounce(updateTerminalSize, 150);
+            window.addEventListener('resize', debouncedFit);
+
+            controlSab = new SharedArrayBuffer(4096);
+            stdoutSab = new SharedArrayBuffer(65536);
+            netSab = new SharedArrayBuffer(65536);
+            controlView = new Int32Array(controlSab);
+            stdoutView = new Int32Array(stdoutSab);
+            stdoutBytes = new Uint8Array(stdoutSab);
+            fitAddon.fit();
+            Atomics.store(controlView, 6, term.cols);
+            Atomics.store(controlView, 7, term.rows);
+
+            setProgress(-1, 'Starting worker...');
+            worker = new Worker('./worker.js', { type: 'module' });
+            const workerReady = new Promise((resolve, reject) => {
+                const onMsg = (e) => {
+                    if (e.data.type === 'ready') { resolve(); worker.onmessage = null; }
+                    if (e.data.type === 'error') reject(new Error(`Worker: ${e.data.message}`));
+                };
+                worker.onmessage = onMsg;
+                worker.onerror = (e) => reject(new Error(`Worker failed: ${e.message || 'unknown'}`));
+            });
+            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            await workerReady;
+
+            // Connect network
+            const DEFAULT_PROXY = 'https://78.141.219.102:4433/connect';
+            const params = new URLSearchParams(location.search);
+            const proxyUrl = params.has('noproxy') ? null
+                           : params.get('proxy')
+                             || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+                                 ? `https://${location.hostname}:4433/connect` : DEFAULT_PROXY);
+            if (proxyUrl) {
+                try {
+                    updateNetStatus('connecting');
+                    netBridge = new FriscyNetworkBridge(proxyUrl);
+                    await netBridge.connect();
+                    updateNetStatus('connected');
+                } catch (e) { updateNetStatus('disconnected'); }
+            } else { updateNetStatus('disconnected'); }
+            if (netBridge) { netRPCHost = new NetworkRPCHost(netSab, netBridge); netRPCHost.start(); }
+
+            // Show terminal
+            overlayEl.classList.add('hidden');
+            terminalEl.style.display = 'flex';
+            document.getElementById('reset-btn').style.display = 'block';
+            term.focus();
+            updateTerminalSize();
+
+            const rootfsMB = (rootfs.byteLength / 1024 / 1024).toFixed(1);
+            term.writeln('\x1b[4:3m\x1b[58;2;255;0;255mRun Docker containers in the browser. friscy cross-compiles Linux containers to RISC-V and executes them in a userland emulator compiled to WebAssembly.\x1b[0m');
+            term.writeln('');
+            term.writeln('\x1b[1;32mfriscy\x1b[0m fast risc-v runtime for the browser & wasm');
+            term.writeln(`Image: ${imageName} (${rootfsMB} MB)`);
+            term.writeln(netBridge && netBridge.isAvailable()
+                ? '\x1b[32mNetwork: connected\x1b[0m'
+                : '\x1b[33mNetwork: offline (no proxy)\x1b[0m');
+            term.writeln('');
+
+            // Clipboard + Tab capture
+            term.attachCustomKeyEventHandler((ev) => {
+                if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
+                    navigator.clipboard.writeText(term.getSelection()); return false;
+                }
+                if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'v') {
+                    navigator.clipboard.readText().then(t => { if (t) term.paste(t); }).catch(() => {});
+                    return false;
+                }
+                if (ev.key === 'Tab') { ev.preventDefault(); return true; }
+                return true;
+            });
+
+            // stdin handler
+            term.onData((data) => {
+                if (!machineRunning) return;
+                for (let i = 0; i < data.length; i++) {
+                    const code = data.charCodeAt(i);
+                    if (code === 3) stdinQueue.push(0x03);
+                    else if (code === 26) stdinQueue.push(0x1a);
+                    else if (code === 12) { term.clear(); stdinQueue.push(0x0c); }
+                    else if (code === 4) stdinQueue.push(0x04);
+                    else if (data[i] === '\r') stdinQueue.push(0x0a);
+                    else if (code === 127) stdinQueue.push(0x7f);
+                    else if (code === 27) { stdinQueue.push(...new TextEncoder().encode(data.slice(i))); break; }
+                    else stdinQueue.push(...new TextEncoder().encode(data[i]));
+                }
+                checkStdinRequest();
+            });
+
+            const pollTimer = setInterval(() => {
+                drainStdout();
+                checkStdinRequest();
+                if (checkExit()) { clearInterval(pollTimer); if (netRPCHost) netRPCHost.stop(); }
+            }, 4);
+
+            // Boot: use /bin/sh as default entrypoint for imported images
+            const args = ['--rootfs', '/rootfs.tar', '/bin/sh'];
+            statusEl.textContent = 'Booting...';
+            machineRunning = true;
+            const rootfsArray = new Uint8Array(rootfs);
+            worker.postMessage({ type: 'run', args, rootfsData: rootfsArray.buffer }, [rootfsArray.buffer]);
+            statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + document.getElementById('net-status').outerHTML;
+        }
+
+        function debounce(fn, ms) {
+            let id;
+            return (...args) => { clearTimeout(id); id = setTimeout(() => fn(...args), ms); };
+        }
+
         main().catch(e => {
             console.error(e);
             statusEl.textContent = 'Error: ' + e.message;
@@ -1125,6 +1691,156 @@
             detailEl.textContent = e.message;
             waveColor = ERR_COLOR;
         });
+
+        // --- WebMCP: Expose friscy tools to AI agents ---
+        // https://developer.chrome.com/blog/webmcp-epp
+        if ('modelContext' in navigator) {
+            // Tool 1: Run a shell command in the active container
+            navigator.modelContext.registerTool({
+                name: 'run_command',
+                description: 'Run a shell command in the friscy Linux container and return stdout. The container is a RISC-V Alpine Linux running in-browser via WebAssembly.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        command: {
+                            type: 'string',
+                            description: 'The shell command to execute (e.g. "ls -la", "uname -a", "cat /etc/os-release")'
+                        }
+                    },
+                    required: ['command']
+                },
+                async execute({ command }) {
+                    if (!machineRunning) {
+                        return { error: 'No container is running. Switch to a tab (Alpine, Node.js, Go Server) first.' };
+                    }
+                    // Inject command + newline into stdin
+                    const cmd = command + '\n';
+                    for (let i = 0; i < cmd.length; i++) {
+                        stdinQueue.push(cmd.charCodeAt(i));
+                    }
+                    checkStdinRequest();
+
+                    // Wait for output to settle (command execution + flush)
+                    await new Promise(r => setTimeout(r, 1500));
+                    drainStdout();
+
+                    // Read recent terminal content
+                    const buffer = term.buffer.active;
+                    const lines = [];
+                    for (let i = Math.max(0, buffer.cursorY - 40); i <= buffer.cursorY; i++) {
+                        const line = buffer.getLine(i);
+                        if (line) lines.push(line.translateToString(true));
+                    }
+                    return { output: lines.join('\n') };
+                }
+            });
+
+            // Tool 2: Import and boot a Docker image
+            navigator.modelContext.registerTool({
+                name: 'import_docker_image',
+                description: 'Pull a Docker image from Docker Hub and boot it in friscy. Supports any public image (e.g. "ubuntu:latest", "python:3.12", "rust:latest"). The image is pulled as riscv64 if available, otherwise amd64.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        image: {
+                            type: 'string',
+                            description: 'Docker image reference (e.g. "ubuntu:latest", "node:22-alpine", "rust:slim")'
+                        }
+                    },
+                    required: ['image']
+                },
+                async execute({ image }) {
+                    if (!image.includes(':')) image += ':latest';
+                    const proxyHost = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+                        ? `https://${location.hostname}:4434`
+                        : 'https://78.141.219.102:4434';
+                    const pullUrl = `${proxyHost}/pull?image=${encodeURIComponent(image)}`;
+
+                    try {
+                        const resp = await fetch(pullUrl);
+                        if (!resp.ok) throw new Error(await resp.text());
+                        const buf = await resp.arrayBuffer();
+                        await bootImportedImage(image, buf);
+                        return { success: true, image, size_mb: (buf.byteLength / 1024 / 1024).toFixed(1) };
+                    } catch (e) {
+                        return { error: e.message };
+                    }
+                }
+            });
+
+            // Tool 3: Get container status
+            navigator.modelContext.registerTool({
+                name: 'get_status',
+                description: 'Get the current status of the friscy container runtime — whether a container is running, which image, and network connectivity.',
+                inputSchema: { type: 'object', properties: {} },
+                async execute() {
+                    return {
+                        running: machineRunning,
+                        tab: new URLSearchParams(location.search).get('example') || 'alpine',
+                        network: netBridge && netBridge.isAvailable() ? 'connected' : 'disconnected',
+                    };
+                }
+            });
+
+            // Tool 4: Switch to a different example tab
+            navigator.modelContext.registerTool({
+                name: 'switch_tab',
+                description: 'Switch to a different friscy example tab. Available tabs: "alpine" (Alpine Linux shell), "nodejs" (Node.js REPL), "server" (Go echo HTTP server), "import" (import Docker image).',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        tab: {
+                            type: 'string',
+                            description: 'Tab name: "alpine", "nodejs", "server", or "import"'
+                        }
+                    },
+                    required: ['tab']
+                },
+                async execute({ tab }) {
+                    const valid = ['alpine', 'nodejs', 'server', 'import'];
+                    if (!valid.includes(tab)) return { error: `Invalid tab. Choose from: ${valid.join(', ')}` };
+                    const u = new URL(location);
+                    if (tab === 'alpine') u.searchParams.delete('example');
+                    else u.searchParams.set('example', tab);
+                    location.href = u;
+                    return { success: true, switching_to: tab };
+                }
+            });
+
+            console.log('[friscy] WebMCP tools registered: run_command, import_docker_image, get_status, switch_tab');
+        }
+
+        // --- Virtual keyboard / IME detection ---
+        // Uses VirtualKeyboard API (Chrome 94+) or visualViewport fallback
+        if ('virtualKeyboard' in navigator) {
+            navigator.virtualKeyboard.overlaysContent = true;
+            navigator.virtualKeyboard.addEventListener('geometrychange', () => {
+                const kbRect = navigator.virtualKeyboard.boundingRect;
+                const container = document.getElementById('terminal-container');
+                if (kbRect.height > 0) {
+                    container.style.paddingBottom = kbRect.height + 'px';
+                } else {
+                    container.style.paddingBottom = '';
+                }
+                if (typeof updateTerminalSize === 'function') updateTerminalSize();
+            });
+        } else if (window.visualViewport) {
+            // Fallback: detect viewport shrink from soft keyboard
+            const vv = window.visualViewport;
+            let lastHeight = vv.height;
+            vv.addEventListener('resize', () => {
+                const container = document.getElementById('terminal-container');
+                const diff = window.innerHeight - vv.height;
+                if (diff > 100) {
+                    // Keyboard is open — shrink terminal, scroll cursor into view
+                    container.style.paddingBottom = diff + 'px';
+                } else {
+                    container.style.paddingBottom = '';
+                }
+                if (typeof updateTerminalSize === 'function') updateTerminalSize();
+                lastHeight = vv.height;
+            });
+        }
     </script>
 </body>
 </html>

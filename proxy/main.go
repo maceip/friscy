@@ -28,13 +28,103 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 )
+
+// Rate limiter tracks per-IP usage
+type RateLimiter struct {
+	mu              sync.Mutex
+	ipSessions      map[string]int       // current concurrent sessions per IP
+	ipConnections   map[string]int       // total connections made today per IP
+	ipLastReset     map[string]time.Time // when counters were last reset
+	maxSessions     int                  // max concurrent sessions per IP
+	maxConnsPerDay  int                  // max outbound connections per IP per day
+}
+
+func NewRateLimiter(maxSessions, maxConnsPerDay int) *RateLimiter {
+	return &RateLimiter{
+		ipSessions:     make(map[string]int),
+		ipConnections:  make(map[string]int),
+		ipLastReset:    make(map[string]time.Time),
+		maxSessions:    maxSessions,
+		maxConnsPerDay: maxConnsPerDay,
+	}
+}
+
+func (rl *RateLimiter) extractIP(addr string) string {
+	// Handle both "ip:port" and bare "ip"
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
+}
+
+// TryAcquireSession returns true if a new session is allowed for this IP
+func (rl *RateLimiter) TryAcquireSession(remoteAddr string) bool {
+	ip := rl.extractIP(remoteAddr)
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if rl.ipSessions[ip] >= rl.maxSessions {
+		return false
+	}
+	rl.ipSessions[ip]++
+	return true
+}
+
+// ReleaseSession decrements the session count for an IP
+func (rl *RateLimiter) ReleaseSession(remoteAddr string) {
+	ip := rl.extractIP(remoteAddr)
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if rl.ipSessions[ip] > 0 {
+		rl.ipSessions[ip]--
+	}
+	if rl.ipSessions[ip] == 0 {
+		delete(rl.ipSessions, ip)
+	}
+}
+
+// TryConnection returns true if a new outbound connection is allowed for this IP
+func (rl *RateLimiter) TryConnection(remoteAddr string) bool {
+	ip := rl.extractIP(remoteAddr)
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	// Reset daily counter if needed
+	now := time.Now()
+	if last, ok := rl.ipLastReset[ip]; !ok || now.Sub(last) > 24*time.Hour {
+		rl.ipConnections[ip] = 0
+		rl.ipLastReset[ip] = now
+	}
+
+	if rl.ipConnections[ip] >= rl.maxConnsPerDay {
+		return false
+	}
+	rl.ipConnections[ip]++
+	return true
+}
+
+func (rl *RateLimiter) Stats() (totalSessions int, totalIPs int) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for _, v := range rl.ipSessions {
+		totalSessions += v
+	}
+	return totalSessions, len(rl.ipSessions)
+}
 
 // Protocol message types (varint prefix)
 const (
@@ -81,22 +171,34 @@ type Session struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	streamMu    sync.Mutex
+	rateLimiter *RateLimiter
+	remoteIP    string
 }
 
 // Server is the WebTransport proxy server
 type Server struct {
-	certFile string
-	keyFile  string
-	listen   string
-	sessions sync.Map
+	certFile    string
+	keyFile     string
+	listen      string
+	sessions    sync.Map
+	rateLimiter *RateLimiter
+	allowedOrigins map[string]bool // nil = allow all
 }
 
-func NewServer(listen, certFile, keyFile string) *Server {
-	return &Server{
-		listen:   listen,
-		certFile: certFile,
-		keyFile:  keyFile,
+func NewServer(listen, certFile, keyFile string, rl *RateLimiter, origins []string) *Server {
+	s := &Server{
+		listen:      listen,
+		certFile:    certFile,
+		keyFile:     keyFile,
+		rateLimiter: rl,
 	}
+	if len(origins) > 0 {
+		s.allowedOrigins = make(map[string]bool)
+		for _, o := range origins {
+			s.allowedOrigins[o] = true
+		}
+	}
+	return s
 }
 
 func (s *Server) Run() error {
@@ -116,17 +218,30 @@ func (s *Server) Run() error {
 			TLSConfig: tlsConfig,
 		},
 		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all origins for development
+			if s.allowedOrigins == nil {
+				return true
+			}
+			origin := r.Header.Get("Origin")
+			return s.allowedOrigins[origin]
 		},
 	}
 
 	http.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
+		remoteIP := r.RemoteAddr
+		// Check rate limit: concurrent sessions per IP
+		if !s.rateLimiter.TryAcquireSession(remoteIP) {
+			log.Printf("Rate limited (sessions): %s", remoteIP)
+			http.Error(w, "too many sessions", http.StatusTooManyRequests)
+			return
+		}
+
 		session, err := wtServer.Upgrade(w, r)
 		if err != nil {
+			s.rateLimiter.ReleaseSession(remoteIP)
 			log.Printf("WebTransport upgrade failed: %v", err)
 			return
 		}
-		s.handleSession(session)
+		s.handleSession(session, remoteIP)
 	})
 
 	log.Printf("friscy-proxy listening on https://localhost%s/connect", s.listen)
@@ -135,12 +250,14 @@ func (s *Server) Run() error {
 	return wtServer.ListenAndServe()
 }
 
-func (s *Server) handleSession(wt *webtransport.Session) {
+func (s *Server) handleSession(wt *webtransport.Session, remoteIP string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &Session{
-		wt:     wt,
-		ctx:    ctx,
-		cancel: cancel,
+		wt:          wt,
+		ctx:         ctx,
+		cancel:      cancel,
+		rateLimiter: s.rateLimiter,
+		remoteIP:    remoteIP,
 	}
 
 	log.Printf("New WebTransport session from %s", wt.RemoteAddr())
@@ -163,7 +280,8 @@ func (s *Server) handleSession(wt *webtransport.Session) {
 		return true
 	})
 
-	log.Printf("WebTransport session closed")
+	s.rateLimiter.ReleaseSession(remoteIP)
+	log.Printf("WebTransport session closed (released session for %s)", remoteIP)
 }
 
 func (sess *Session) acceptStreams() {
@@ -230,6 +348,20 @@ func (sess *Session) handleConnect(stream webtransport.Stream) {
 	addr := fmt.Sprintf("%s:%d", host, port)
 
 	log.Printf("[%d] Connect to %s (type=%d)", connID, addr, sockType)
+
+	// Block connections to private/loopback addresses (prevent SSRF)
+	if isPrivateAddr(host) {
+		log.Printf("[%d] Blocked connect to private address %s", connID, addr)
+		sess.sendEvent(MsgConnectError, connID, []byte("connection to private addresses not allowed"))
+		return
+	}
+
+	// Rate limit outbound connections per IP
+	if !sess.rateLimiter.TryConnection(sess.remoteIP) {
+		log.Printf("[%d] Rate limited (connections): %s", connID, sess.remoteIP)
+		sess.sendEvent(MsgConnectError, connID, []byte("daily connection limit exceeded"))
+		return
+	}
 
 	// Create connection
 	conn := &Connection{
@@ -512,6 +644,145 @@ func (c *Connection) Close() {
 	}
 }
 
+// isPrivateAddr checks if a host resolves to a private/loopback address (SSRF protection)
+func isPrivateAddr(host string) bool {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// If we can't resolve, allow (the connection will fail naturally)
+		return false
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return true
+		}
+	}
+	return false
+}
+
+// --- Docker Pull API (HTTPS on :4434) ---
+
+func (s *Server) RunAPIServer(apiListen string) error {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/pull", s.handleDockerPull)
+	mux.HandleFunc("/search", s.handleDockerSearch)
+
+	// Health check
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Write([]byte("ok"))
+	})
+
+	tlsCert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
+	if err != nil {
+		return fmt.Errorf("API server TLS: %w", err)
+	}
+
+	srv := &http.Server{
+		Addr:    apiListen,
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+		},
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 10 * time.Minute, // large images take time to stream
+	}
+
+	log.Printf("API server listening on https://0.0.0.0%s", apiListen)
+	return srv.ListenAndServeTLS("", "")
+}
+
+func (s *Server) corsHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, X-Image-Name")
+}
+
+func (s *Server) handleDockerPull(w http.ResponseWriter, r *http.Request) {
+	s.corsHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	imageRef := r.URL.Query().Get("image")
+	if imageRef == "" {
+		http.Error(w, "missing ?image= parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Validate image reference
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid image reference: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[API] Pull request: %s", ref.String())
+
+	// Rate limit: reuse connection rate limiter
+	remoteIP := r.RemoteAddr
+	if !s.rateLimiter.TryConnection(remoteIP) {
+		http.Error(w, "daily pull limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	// Try riscv64 first, fall back to amd64
+	platform := v1.Platform{Architecture: "riscv64", OS: "linux"}
+	img, err := remote.Image(ref, remote.WithPlatform(platform))
+	if err != nil {
+		log.Printf("[API] riscv64 not available for %s, trying amd64: %v", imageRef, err)
+		platform = v1.Platform{Architecture: "amd64", OS: "linux"}
+		img, err = remote.Image(ref, remote.WithPlatform(platform))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to pull image: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	log.Printf("[API] Pulled %s (%s), exporting as tar...", imageRef, platform.Architecture)
+
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("X-Image-Name", imageRef)
+	w.Header().Set("X-Image-Arch", platform.Architecture)
+
+	// Export flattened filesystem as tar directly to response
+	if err := crane.Export(img, w); err != nil {
+		log.Printf("[API] Export error for %s: %v", imageRef, err)
+		// Can't set status code after streaming started
+		return
+	}
+
+	log.Printf("[API] Finished exporting %s", imageRef)
+}
+
+func (s *Server) handleDockerSearch(w http.ResponseWriter, r *http.Request) {
+	s.corsHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		http.Error(w, "missing ?q= parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Proxy Docker Hub search API
+	url := fmt.Sprintf("https://hub.docker.com/v2/search/repositories/?query=%s&page_size=20", q)
+	resp, err := http.Get(url)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("search failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	io.Copy(w, resp.Body)
+}
+
 // byteReader wraps an io.Reader to implement io.ByteReader
 type byteReader struct {
 	io.Reader
@@ -527,9 +798,29 @@ func main() {
 	listen := flag.String("listen", ":4433", "Address to listen on")
 	certFile := flag.String("cert", "cert.pem", "TLS certificate file")
 	keyFile := flag.String("key", "key.pem", "TLS key file")
+	maxSessions := flag.Int("max-sessions", 3, "Max concurrent sessions per IP")
+	maxConns := flag.Int("max-conns", 100, "Max outbound connections per IP per day")
+	origins := flag.String("origins", "", "Comma-separated allowed origins (empty = allow all)")
 	flag.Parse()
 
-	server := NewServer(*listen, *certFile, *keyFile)
+	rl := NewRateLimiter(*maxSessions, *maxConns)
+
+	var originList []string
+	if *origins != "" {
+		for _, o := range strings.Split(*origins, ",") {
+			originList = append(originList, strings.TrimSpace(o))
+		}
+	}
+
+	server := NewServer(*listen, *certFile, *keyFile, rl, originList)
+
+	// Start API server (Docker pull) on :4434 in background
+	go func() {
+		if err := server.RunAPIServer(":4434"); err != nil {
+			log.Fatalf("API server failed: %v", err)
+		}
+	}()
+
 	if err := server.Run(); err != nil {
 		log.Fatal(err)
 	}

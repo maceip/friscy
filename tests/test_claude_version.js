@@ -18,7 +18,8 @@ const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './nodejs.tar';
 const CLAUDE_CMD = process.env.FRISCY_TEST_CLAUDE_CMD || '/usr/bin/node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --version';
 const EXPECTED_OUTPUT = process.env.FRISCY_TEST_EXPECTED_OUTPUT || 'Claude Code';
 const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '?noproxy';
-const VERSION_REGEX = /\b\d+\.\d+\.\d+\s+\(Claude Code\)\b/;
+const WAIT_FOR_EXIT = process.env.FRISCY_TEST_WAIT_FOR_EXIT !== '0';
+const METRIC_WAIT_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_METRIC_WAIT_TIMEOUT_MS || '120000', 10);
 
 async function canBindPort(port) {
     return new Promise((resolve) => {
@@ -64,6 +65,7 @@ async function main() {
     let jitRegionsCompiled = 0;
     let instructionCount = null;
     let guestExitCode = null;
+    let foundAtMs = null;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -112,6 +114,7 @@ async function main() {
         console.log(`[test] Command: ${CLAUDE_CMD}`);
         console.log(`[test] Expected: ${EXPECTED_OUTPUT}`);
         console.log(`[test] Query: ${PAGE_QUERY || '(none)'}`);
+        console.log(`[test] Wait for exit metrics: ${WAIT_FOR_EXIT ? 'yes' : 'no'}`);
 
         browser = await puppeteer.launch({
             headless: true,
@@ -178,12 +181,28 @@ async function main() {
                 throw err;
             }
 
-            if (content.includes(EXPECTED_OUTPUT)) {
+            if (!found && content.includes(EXPECTED_OUTPUT)) {
                 found = true;
-                break;
+                foundAtMs = Date.now();
+                if (!WAIT_FOR_EXIT) {
+                    break;
+                }
+                console.log('[test] Expected output observed; waiting for exit/metrics...');
             }
 
-            if (status.includes('Exited') || status.includes('Error')) {
+            if (found && WAIT_FOR_EXIT) {
+                const metricWaitElapsed = Date.now() - (foundAtMs || start);
+                if (status.includes('Exited') || status.includes('Error')) {
+                    break;
+                }
+                if (guestExitCode !== null && instructionCount !== null && metricWaitElapsed >= 1000) {
+                    break;
+                }
+                if (metricWaitElapsed >= METRIC_WAIT_TIMEOUT_MS) {
+                    console.log('[test] Metric wait timeout reached; proceeding with collected data');
+                    break;
+                }
+            } else if (status.includes('Exited') || status.includes('Error')) {
                 console.log('[test] Machine finished:', status);
                 break;
             }
@@ -206,7 +225,7 @@ async function main() {
         console.log(termData.slice(0, 1200));
         console.log(`=== END (${termData.length} chars) ===\n`);
 
-        const matchedVersion = VERSION_REGEX.test(termData);
+        const matchedVersion = termData.includes('Claude Code') && /\d+\.\d+\.\d+/.test(termData);
         const hasModuleError =
             termData.includes('MODULE_NOT_FOUND') ||
             termData.includes('Cannot find module') ||

@@ -64,30 +64,52 @@ static void setup_virtual_files();
 // Global machine pointer for JS interop (stdin resume loop)
 #ifdef __EMSCRIPTEN__
 static Machine* g_machine = nullptr;
+static constexpr int FRISCY_STOP_NONE = 0;
+static constexpr int FRISCY_STOP_STDIN = 1;
+static constexpr int FRISCY_STOP_TIMESLICE = 2;
 
 extern "C" {
-// Returns 1 if machine is stopped waiting for stdin, 0 otherwise.
-// Uses g_waiting_for_stdin flag (set by syscall handlers) to distinguish
-// stdin-wait from program exit (both call machine.stop()).
+// Returns non-zero if machine is cooperatively stopped and can be resumed.
+// Legacy helper retained for compatibility with existing JS paths.
 EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
-    return syscalls::g_waiting_for_stdin ? 1 : 0;
+    return (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_timeslice) ? 1 : 0;
 }
 
-// Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
+// Returns detailed stop reason:
+// 0 = running/finished, 1 = waiting for stdin, 2 = periodic timeslice yield.
+EMSCRIPTEN_KEEPALIVE int friscy_stop_reason() {
+    if (syscalls::g_waiting_for_stdin) return FRISCY_STOP_STDIN;
+    if (syscalls::g_waiting_for_timeslice) return FRISCY_STOP_TIMESLICE;
+    return FRISCY_STOP_NONE;
+}
+
+// Resume execution. Returns 1 if machine stopped again (stdin/timeslice), 0 if done.
 // Handles page protection faults by making the faulting page writable and
 // retrying. This acts as a simple page fault handler for pages at the
 // boundary between read-only code and writable data segments.
 EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     if (!g_machine) return 0;
     syscalls::g_waiting_for_stdin = false;
+    syscalls::g_waiting_for_timeslice = false;
     static constexpr uint64_t YIELD_CHUNK = 2'000'000;
     for (int retries = 0; retries < 8; retries++) {
         try {
             while (true) {
                 g_machine->resume<false>(YIELD_CHUNK);
                 if (syscalls::g_waiting_for_stdin) break;
-                if (!g_machine->instruction_limit_reached()) break;
-                // No yield needed — Worker thread doesn't block UI
+                if (syscalls::g_execve_restart) break;
+                if (g_machine->instruction_limit_reached()) {
+                    // Periodic cooperative return to JS so non-interactive
+                    // workloads can flow through JIT scheduling paths.
+                    syscalls::g_waiting_for_timeslice = true;
+                    break;
+                }
+                break;
+            }
+            if (syscalls::g_execve_restart) {
+                syscalls::g_execve_restart = false;
+                retries = -1;  // incremented to 0 by for loop
+                continue;
             }
             return friscy_stopped();
         } catch (const riscv::MachineException& e) {
@@ -723,6 +745,8 @@ int main(int argc, char** argv) {
 
 #ifdef __EMSCRIPTEN__
         g_machine = &machine;
+        syscalls::g_waiting_for_stdin = false;
+        syscalls::g_waiting_for_timeslice = false;
 #endif
         // Run! The machine may stop for several reasons:
         // 1. Program exit (natural end)
@@ -742,8 +766,13 @@ int main(int argc, char** argv) {
                     machine.resume<false>(YIELD_CHUNK);
                     if (syscalls::g_waiting_for_stdin) break;
                     if (syscalls::g_execve_restart) break;
-                    if (!machine.instruction_limit_reached()) break;
-                    // No yield needed — Worker thread doesn't block UI
+                    if (machine.instruction_limit_reached()) {
+                        // Cooperative timeslice return lets JS drive JIT
+                        // dispatch/scheduling on non-interactive workloads.
+                        syscalls::g_waiting_for_timeslice = true;
+                        break;
+                    }
+                    break;
                 }
                 // execve: re-enter simulate with new binary
                 if (syscalls::g_execve_restart) {
@@ -762,7 +791,9 @@ int main(int argc, char** argv) {
                     continue;
                 }
 #endif
-                std::cerr << "[friscy] simulate() returned normally, retries=" << retries << "\n";
+                if (!syscalls::g_waiting_for_timeslice) {
+                    std::cerr << "[friscy] simulate() returned normally, retries=" << retries << "\n";
+                }
                 break;
             } catch (const riscv::MachineException& e) {
                 uint64_t fault_addr = e.data();
@@ -810,8 +841,9 @@ int main(int argc, char** argv) {
         }
 
 #ifdef __EMSCRIPTEN__
-        if (syscalls::g_waiting_for_stdin) {
-            // Machine stopped because stdin has no data.
+        if (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_timeslice) {
+            // Machine stopped because stdin has no data or due to timeslice
+            // yield. Return to JS — worker resumes execution.
             // Return to JS — the resume loop will call friscy_resume().
             return 0;
         }

@@ -158,7 +158,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_stopped" "_friscy_stop_reason" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)

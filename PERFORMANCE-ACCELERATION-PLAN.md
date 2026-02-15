@@ -188,7 +188,7 @@ longer the primary optimization target.
 
 | Phase | Focus | Status | Primary Goal |
 |------:|-------|--------|--------------|
-| 7 | Main-path JIT activation | PLANNED | Ensure non-interactive Claude prompt execution actually exercises JIT dispatch paths |
+| 7 | Main-path JIT activation | IN PROGRESS | Ensure non-interactive Claude prompt execution actually exercises JIT dispatch paths |
 | 8 | Process/resource reliability | PLANNED | Eliminate `vfork`/resource failures and prompt hangs for haiku workload |
 | 9 | Haiku-path scheduler/predictor tuning | PLANNED | Convert telemetry into real first-output/completion latency gains on haiku runs |
 | 10 | Bottleneck discovery | DISCOVERY REQUIRED | Identify next dominant bottlenecks after Phases 7-9 |
@@ -196,7 +196,7 @@ longer the primary optimization target.
 
 ### Phase 7: Main-Path JIT Activation for Non-Interactive Workloads
 
-Status: PLANNED
+Status: IN PROGRESS
 
 #### 7.1 Problem Statement
 

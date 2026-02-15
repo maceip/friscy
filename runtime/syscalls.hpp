@@ -28,6 +28,11 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // Used by JS resume loop to distinguish stdin-wait from program exit.
 inline bool g_waiting_for_stdin = false;
 
+// Flag: true when machine stopped due to cooperative timeslice yield.
+// Used by JS resume loop to drive non-interactive workloads through
+// periodic JIT decision points instead of waiting only on stdin stops.
+inline bool g_waiting_for_timeslice = false;
+
 // Flag: true when machine stopped due to execve loading a new binary.
 // The dispatch loop must re-enter simulate() with the new binary.
 inline bool g_execve_restart = false;
@@ -3504,20 +3509,13 @@ static void sys_kill(Machine& m) {
 static void sys_tkill(Machine& m) {
     int sig = m.template sysarg<int>(1);
     if (sig == 6) { // SIGABRT
-        // Dump ring buffer of recent syscalls
+        // Dump ring buffer of recent syscalls when available.
+        // Newer libriscv versions no longer expose the global ring symbols.
         static bool dumped = false;
         if (!dumped) {
             dumped = true;
             fprintf(stderr, "[ABORT] Last 32 syscalls before abort:\n");
-            int idx = riscv::g_syscall_ring_idx;
-            for (int i = 0; i < 32; i++) {
-                int j = (idx - 32 + i) % 32;
-                if (j < 0) j += 32;
-                auto& e = riscv::g_syscall_ring[j];
-                if (e.sysnum == 0 && e.pc == 0) continue;
-                fprintf(stderr, "  [%d] sys#%zu a0=0x%lx a1=0x%lx a2=0x%lx => %ld (PC=0x%lx)\n",
-                    i, e.sysnum, (long)e.a0, (long)e.a1, (long)e.a2, (long)e.result, (long)e.pc);
-            }
+            fprintf(stderr, "  (syscall ring unavailable in current libriscv build)\n");
         }
         fprintf(stderr, "[ABORT] tkill(SIGABRT)! PC=0x%lx RA=0x%lx SP=0x%lx\n",
                 (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2));

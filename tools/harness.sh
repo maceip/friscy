@@ -8,18 +8,25 @@
 #   ./harness.sh              # Development build (fast compile, debugging)
 #   ./harness.sh --production # Production build (O3, LTO, SIMD, minified)
 #   ./harness.sh --wizer      # Build with Wizer snapshot support
+#   ./harness.sh --native     # Force local emsdk build (no Docker)
 #
-# Prerequisites: Docker (or see setup_native_harness.sh for local build)
+# Uses pinned versions from tools/build-lock.env.
 # ============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNTIME_DIR="$(cd "$SCRIPT_DIR/../runtime" && pwd)"
+LOCK_FILE="$SCRIPT_DIR/build-lock.env"
 cd "$RUNTIME_DIR"
+
+# shellcheck disable=SC1090
+source "$LOCK_FILE"
 
 # Parse arguments
 PRODUCTION=OFF
 WIZER=OFF
+FORCE_NATIVE=OFF
 while [[ $# -gt 0 ]]; do
     case $1 in
         --production|-p)
@@ -30,9 +37,13 @@ while [[ $# -gt 0 ]]; do
             WIZER=ON
             shift
             ;;
+        --native)
+            FORCE_NATIVE=ON
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--production] [--wizer]"
+            echo "Usage: $0 [--production] [--wizer] [--native]"
             exit 1
             ;;
     esac
@@ -43,19 +54,63 @@ echo ""
 echo "Build configuration:"
 echo "  Production: $PRODUCTION"
 echo "  Wizer snapshots: $WIZER"
+echo "  Force native: $FORCE_NATIVE"
+echo "  Pinned emsdk: ${FRISCY_EMSDK_VERSION}"
+echo "  Pinned libriscv: ${FRISCY_LIBRISCV_COMMIT}"
 echo ""
 
-# 1. Clone libriscv (upstream, actively maintained)
-VENDOR_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/vendor"
-mkdir -p "$VENDOR_DIR"
-if [ ! -d "$VENDOR_DIR/libriscv" ]; then
-    echo "Cloning libriscv (upstream)..."
-    git clone --depth=1 https://github.com/libriscv/libriscv.git "$VENDOR_DIR/libriscv"
-else
-    echo "libriscv already present"
-fi
+# 1. Pin libriscv to deterministic commit
+bash "$SCRIPT_DIR/pin_libriscv.sh"
 
-# 2. Build with Emscripten via Docker
+build_with_docker() {
+    echo ""
+    echo "Building with Dockerized Emscripten..."
+    rm -rf build
+    mkdir -p build
+    docker run --rm \
+        -v "${PROJECT_DIR}:/src" \
+        -w /src/runtime/build \
+        -u "$(id -u):$(id -g)" \
+        "emscripten/emsdk:${FRISCY_EMSDK_VERSION}" \
+        bash -c "
+            emcmake cmake .. \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DFRISCY_PRODUCTION=${PRODUCTION} \
+                -DFRISCY_WIZER=${WIZER} \
+            && emmake make -j\$(nproc) VERBOSE=1
+        "
+}
+
+build_with_native_emsdk() {
+    echo ""
+    echo "Building with native emsdk..."
+    local emsdk_dir="$RUNTIME_DIR/emsdk"
+
+    if [[ ! -d "$emsdk_dir" ]]; then
+        git clone https://github.com/emscripten-core/emsdk.git "$emsdk_dir"
+    fi
+
+    (
+        cd "$emsdk_dir"
+        ./emsdk install "$FRISCY_EMSDK_VERSION"
+        ./emsdk activate "$FRISCY_EMSDK_VERSION"
+    )
+
+    # shellcheck disable=SC1091
+    source "$emsdk_dir/emsdk_env.sh"
+    rm -rf build
+    mkdir -p build
+    (
+        cd build
+        emcmake cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFRISCY_PRODUCTION=${PRODUCTION} \
+            -DFRISCY_WIZER=${WIZER} \
+        && emmake make -j"$(nproc)" VERBOSE=1
+    )
+}
+
+# 2. Build runtime
 echo ""
 echo "Building with Emscripten..."
 if [ "$PRODUCTION" = "ON" ]; then
@@ -63,32 +118,12 @@ if [ "$PRODUCTION" = "ON" ]; then
 else
     echo "  Mode: DEVELOPMENT (O2, assertions enabled)"
 fi
-echo ""
 
-mkdir -p build
-
-# Use latest emsdk for final-spec Wasm exception handling (try_table/exnref)
-# Required for wizer (wasmtime) compatibility — emsdk 3.1.50 emits legacy try/catch
-EMSDK_VERSION="latest"
-
-# Mount the entire project root (not just tools/) so cmake can find
-# runtime/CMakeLists.txt and vendor/libriscv
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-docker run --rm \
-    -v "${PROJECT_DIR}:/src" \
-    -w /src/runtime/build \
-    -u "$(id -u):$(id -g)" \
-    emscripten/emsdk:${EMSDK_VERSION} \
-    bash -c "
-        emcmake cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DFRISCY_PRODUCTION=${PRODUCTION} \
-            -DFRISCY_WIZER=${WIZER} \
-            -DCMAKE_CXX_FLAGS=\"-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0\" \
-            -DCMAKE_C_FLAGS=\"-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0\" \
-        && emmake make -j\$(nproc) VERBOSE=1
-    "
+if [[ "$FORCE_NATIVE" == "OFF" ]] && command -v docker >/dev/null 2>&1; then
+    build_with_docker
+else
+    build_with_native_emsdk
+fi
 
 # 3. Verify output
 OUTPUT_FILE="build/friscy.js"

@@ -9,17 +9,374 @@ and how to validate correctness with real-world programs that detect regressions
 and prevent "cheating" (optimizations that appear fast but silently produce
 wrong results).
 
-**Implementation order:**
+**Implementation order (Phases 1-6 complete):**
 
-| Phase | Technique | Files Modified | Expected Impact | Risk |
-|-------|-----------|---------------|-----------------|------|
-| **1** | Peephole optimization | `aot/src/translate.rs` | 10-20% code size, 5-15% runtime | Very low |
-| **2** | Wasm-internal JIT dispatch | `aot/src/wasm_builder.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js` | 5-50x JIT throughput | Low |
-| **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium |
+| Phase | Technique | Files Modified | Expected Impact | Risk | Status |
+|-------|-----------|---------------|-----------------|------|--------|
+| **1** | Peephole optimization | `aot/src/translate.rs` | 10-20% code size, 5-15% runtime | Very low | DONE |
+| **2** | Wasm-internal JIT dispatch | `aot/src/wasm_builder.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js` | 5-50x JIT throughput | Low | DONE |
+| **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium | DONE |
+| **4** | Trace-driven region prefetch | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Fewer region-miss fallbacks on hot cross-region paths | Low | DONE |
+| **5** | Two-tier JIT promotion (fast -> optimized) | `aot/src/translate.rs`, `aot-jit/src/lib.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Faster first-compile with hotter-region quality recovery | Medium | DONE |
+| **6** | Trace-sequence prediction (A->B->C) | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Better precompile precision on repeated multi-region paths | Low | DONE |
+
+---
+
+## Phase 4: Trace-Driven Region Prefetch (Incremental Medium-Phase Work)
+
+Status: DONE
+
+### 4.1 Problem Statement
+
+The current JIT compiles regions strictly by page hit count. This misses an
+important signal: during JIT `run()` chaining we already observe cross-region
+transfer edges (`region miss` from one compiled region to another PC). Repeated
+edges indicate a hot path spanning multiple regions.
+
+### 4.2 Implementation Summary
+
+- Added a trace edge table in `jit_manager.js` keyed by
+  `from_region -> to_region`.
+- On repeated hot edges (`traceEdgeHotThreshold`, default `8`), the manager
+  proactively compiles the target region (if not already compiled/in-flight).
+- Worker now records region-miss transitions via
+  `jitManager.recordTraceTransition(fromPc, toPc)`.
+- Browser query controls:
+  - `?nojittrace` disables trace-driven prefetch.
+  - `?jitedgehot=N` sets hot-edge compile threshold.
+
+### 4.3 Required Verification Proof
+
+Keep the Claude proof workload as the phase gate:
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+---
+
+## Phase 5: Two-Tier JIT Promotion (Fast Baseline -> Optimized Recompile)
+
+Status: DONE
+
+### 5.1 Problem Statement
+
+A single JIT tier forces a tradeoff: either compile quickly with minimal
+optimization, or compile slower with better code quality. Hot code needs both:
+fast first hit and stronger optimization once it proves hot.
+
+### 5.2 Implementation Summary
+
+- Added fast JIT translation path in `aot/src/translate.rs`:
+  - `translate_jit_fast(...)` (skips optimization pass)
+  - `translate_jit_with_options(...)` for explicit mode selection.
+- Added wasm-bindgen exports in `aot-jit/src/lib.rs`:
+  - `compile_region_fast(...)`
+  - `compile_region_optimized(...)`
+  - existing `compile_region(...)` kept as optimized compatibility entry.
+- Updated `jit_manager.js` to:
+  - compile baseline regions with fast tier,
+  - track per-region hit counts,
+  - promote baseline regions to optimized tier at `optimizeThreshold`,
+  - preserve optimized regions from downgrade.
+- Added runtime controls:
+  - `?nojittier` disables promotion,
+  - `?jitopt=N` sets promotion threshold.
+
+### 5.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+---
+
+## Phase 6: Trace-Sequence Prediction (Second-Order Hot Paths)
+
+Status: DONE
+
+### 6.1 Problem Statement
+
+Single-edge prefetch (`A -> B`) can still over-compile on branchy code. Repeated
+multi-region sequences (`A -> B -> C`) are a stronger signal for what to compile
+next.
+
+### 6.2 Implementation Summary
+
+- Added compile scheduler in `jit_manager.js`:
+  - priority queue with bounded depth (`compileQueueMax`),
+  - compile token budget per second (`compileBudgetPerSecond`),
+  - task priority based on `confidence * missCost`.
+- Upgraded predictor to weighted Markov:
+  - first-order transitions (`A -> B`) + second-order contexts (`A:B -> C`),
+  - predicts top-`K` likely next regions (default 2) when confidence exceeds threshold,
+  - keeps probabilities (transition totals), not just raw edge counts.
+- Added adaptive thresholds:
+  - lowers confidence/hot thresholds when region miss rate is high,
+  - raises thresholds when compile queue pressure is high.
+- Added failure cooldown + stale pruning:
+  - failed regions get exponential compile backoff,
+  - invalidation prunes queued tasks and trace/Markov entries touching dirty regions.
+- Added UX telemetry:
+  - browser "JIT Warmup" HUD (compiled regions, queue depth, miss rate, predictor hit rate),
+  - worker periodically posts JIT stats to main thread for debugging and benchmarks.
+- Added runtime controls:
+  - `?jittrace3hot=N` triplet hot threshold,
+  - `?nojitmarkov` disables Markov predictor,
+  - `?nojittriplet` disables triplet predictor,
+  - `?jitawait` waits for JIT compiler load before guest run (benchmark mode),
+  - `?jitbudget=N` compile budget per second,
+  - `?jitqmax=N` compile queue bound,
+  - `?jitpredk=N` Markov top-K width,
+  - `?jitpredconf=X` predictor base confidence threshold,
+  - `?nojithud` disables warmup HUD.
+
+### 6.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+Comparative latency benchmark:
+
+```bash
+bash ./tests/bench_browser_claude_predictor_modes.sh --runs 3
+```
+
+This compares:
+- no predictor (`nojittrace`),
+- edge-only predictor,
+- edge + triplet + Markov predictor,
+
+and records:
+- first output latency,
+- completion latency,
+- misses before steady-state.
+
+---
+
+## JS OPTIMIZATION (Current and Only Focus)
+
+Effective immediately, all new optimization work targets this command:
+
+```bash
+claude -p "write me a haiku"
+```
+
+`claude --version` remains a lightweight regression smoke check only. It is no
+longer the primary optimization target.
+
+### 7.0 JS Optimization Phase Roadmap
+
+| Phase | Focus | Status | Primary Goal |
+|------:|-------|--------|--------------|
+| 7 | Main-path JIT activation | IN PROGRESS | Ensure non-interactive Claude prompt execution actually exercises JIT dispatch paths |
+| 8 | Process/resource reliability | PLANNED | Eliminate `vfork`/resource failures and prompt hangs for haiku workload |
+| 9 | Haiku-path scheduler/predictor tuning | PLANNED | Convert telemetry into real first-output/completion latency gains on haiku runs |
+| 10 | Bottleneck discovery | DISCOVERY REQUIRED | Identify next dominant bottlenecks after Phases 7-9 |
+| 11 | Highest-ROI fix from discovery | DISCOVERY REQUIRED | Implement and validate the best Phase 10 finding for additional speedup |
+
+### Phase 7: Main-Path JIT Activation for Non-Interactive Workloads
+
+Status: IN PROGRESS
+
+#### 7.1 Problem Statement
+
+Current JIT dispatch activity is concentrated in resume-loop paths. One-shot
+commands can finish (or stall) without producing enough JIT/predictor events,
+which makes scheduler/Markov optimizations ineffective for the target workload.
+
+#### 7.2 Implementation Direction
+
+- Move or mirror JIT dispatch opportunities into the main execution path for
+  non-interactive commands.
+- Introduce bounded run-slicing/checkpoints so long guest runs can re-enter JIT
+  decision points without relying on stdin-stop behavior.
+- Ensure telemetry (`regionMisses`, queue depth, predictor events) is emitted
+  for prompt workloads.
+
+#### 7.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+FRISCY_TEST_CLAUDE_CMD='claude -p "write me a haiku"' \
+node --experimental-default-type=module ./tests/test_claude_haiku.js
+```
+
+Pass criteria:
+- haiku response detected (`haiku_like=1`),
+- guest exits cleanly (`guest_exit_code=0`),
+- non-zero JIT activity on target path (for example non-zero misses or queue activity).
+
+#### 7.4 Runtime Rebuild Blocker Isolation (2026-02-15)
+
+The runtime rebuild crash signature has been isolated to machine construction,
+before interpreter mapping and before any JIT dispatch logic:
+
+- Last successful marker: `[friscy-debug] Constructing Machine (...)`
+- Missing marker on crash path: `[friscy-debug] Machine constructed (...)`
+- Browser stack consistently reports trap in `wasm-function[55]` during `callMain`.
+
+Targeted A/B constructor experiments:
+
+- `FRISCY_EXPERIMENT_NO_PROGRAM_LOAD=1`:
+  still crashes before constructor returns (rules out ELF load as primary trigger).
+- `FRISCY_EXPERIMENT_EMPTY_MACHINE=1`:
+  still crashes before constructor returns (binary-independent crash).
+- `FRISCY_EXPERIMENT_DISABLE_ARENA=1`:
+  constructor returns; crash mode shifts later to execution/protection faults.
+- `RISCV_ENCOMPASSING_ARENA_BITS` sweep:
+  - `31`: constructor-time `memory access out of bounds`
+  - `30/29`: constructor succeeds, then `Illegal opcode executed`
+  - `28`: process starts but shared-library/TLS out-of-memory (guest exit 127)
+
+Current inference:
+
+- The OOB trap is in the libriscv machine memory constructor path when
+  encompassing arena semantics are enabled for rebuilt runtime.
+- This points at the arena initialization strategy as the immediate blocker
+  (not JIT scheduler/predictor logic and not Claude command path behavior).
+
+Next runtime-side isolation/mitigation targets:
+
+- test wasm-specific arena allocation behavior in the libriscv constructor path
+  to avoid constructor-time OOB while preserving enough address space for Node.
+- validate a constructor path that avoids both:
+  1) 31-bit constructor OOB, and
+  2) sub-31-bit address-space aliasing/illegal-opcode regressions.
+
+### Phase 8: Process/Resource Reliability for Claude Prompt Path
+
+Status: PLANNED
+
+#### 8.1 Problem Statement
+
+The haiku workload currently encounters resource/process failures (for example
+`vfork: Resource temporarily unavailable`) and can stall without completion.
+Until this path is reliable, performance work cannot be trusted.
+
+#### 8.2 Implementation Direction
+
+- Diagnose process creation and task scheduling constraints in the emulator path
+  used by Claude prompt execution.
+- Remove or mitigate failure modes that cause hangs/timeouts.
+- Add explicit failure signatures to smoke output so regressions are detected.
+
+#### 8.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+FRISCY_TEST_CLAUDE_CMD='claude -p "write me a haiku"' \
+node --experimental-default-type=module ./tests/test_claude_haiku.js
+```
+
+Pass criteria:
+- no `Resource temporarily unavailable` / `std::bad_alloc` / timeout failure,
+- haiku response detected,
+- guest exits `0`.
+
+### Phase 9: Haiku-Path Scheduler/Predictor Performance Tuning
+
+Status: PLANNED
+
+#### 9.1 Problem Statement
+
+Scheduler and Markov predictor infrastructure exists, but current target
+workloads do not yet show clear user-facing latency gains. This phase tunes
+those systems specifically against haiku prompt latency.
+
+#### 9.2 Implementation Direction
+
+- Benchmark no-predictor vs edge vs edge+triplet+Markov on the haiku command.
+- Use telemetry-guided tuning for budget, queue depth, and adaptive thresholds.
+- Optimize for user-perceived metrics first (first output and completion).
+
+#### 9.3 Required Verification Proof
+
+Use a dedicated haiku mode comparison benchmark (to be added/updated) that
+records:
+- first output latency,
+- completion latency,
+- misses before steady-state,
+- predictor hit rate and queue pressure.
+
+Pass criteria:
+- measurable latency improvement over no-predictor mode on repeated runs,
+- no correctness regression (still returns a haiku and exits cleanly).
+
+### Phase 10: Discovery Phase - Bottleneck Attribution Beyond Current JIT
+
+Status: DISCOVERY REQUIRED
+
+Goal:
+- produce a ranked list of remaining bottlenecks that block faster haiku runs
+  after Phases 7-9 (for example process model, syscall emulation, memory
+  pressure, network/proxy latency, allocator behavior, or host/guest handoff).
+
+Expected output:
+- short evidence report with traces/metrics,
+- selected Phase 11 candidate with estimated ROI.
+
+### Phase 11: Discovery Phase - Highest-ROI Fix for Haiku Throughput
+
+Status: DISCOVERY REQUIRED
+
+Goal:
+- implement the single highest-ROI fix identified in Phase 10,
+- validate end-to-end correctness and latency gains for the haiku workload.
+
+Required verification proof:
+- repeat the Phase 9 benchmark suite and compare against pre-Phase 11 results.
+
+---
+
+## Historical Baseline Definition (Phases 1-6)
+
+All optimization claims must be measured against these two baseline workloads:
+
+1. **Node.js baseline**: guest Node.js boot/execution (e.g. `node -e ...`)
+2. **Node.js + Claude baseline**: `claude --version` with a Claude package JS
+   payload present in the rootfs (with **~60 MiB** as a recommended size,
+   not a hard requirement).
+   Accepted acquisition paths:
+   - npm package (`@anthropic-ai/claude-code` JS/MJS payload), or
+   - Claude installer bundle (from `curl -fsSL https://claude.ai/install.sh | bash`)
+
+The smoke scripts enforce this with rootfs preflight checks:
+
+```bash
+bash ./tests/smoke_phase1_peephole.sh
+bash ./tests/smoke_phase2_jit_dispatch.sh
+```
+
+If `/usr/bin/node`, `/usr/bin/claude`, or Claude payload files are missing,
+smoke should fail fast and the benchmark baseline is considered invalid.
+If payload size is below the 60 MiB recommendation, smoke warns by default and
+only fails when `CLAUDE_PAYLOAD_STRICT=1` is set.
 
 ---
 
 ## Phase 1: Peephole Optimization
+
+Status: DONE
 
 ### 1.1 Problem Statement
 
@@ -231,6 +588,19 @@ fn test_constant_folding() {
 }
 ```
 
+#### Browser Smoke (Node.js + Claude)
+
+Phase 1 rollout requires a browser-level smoke run to ensure we still boot real
+workloads that exercise the hot translation paths:
+
+```bash
+# Full smoke: Node.js boot + claude --version
+bash ./tests/smoke_phase1_peephole.sh
+
+# Quicker local loop (Node.js only)
+bash ./tests/smoke_phase1_peephole.sh --skip-claude
+```
+
 #### Cheater-Detection: Deterministic Output Programs
 
 These programs have specific, computable correct answers. If an optimization
@@ -413,9 +783,27 @@ time busybox sha256sum /dev/urandom | head -c 1048576
 # Compare wall-clock time before/after optimization
 ```
 
+For repeatable Puppeteer-based tracking (same command every run), use:
+
+```bash
+# 5 browser runs, writes tests/perf/browser_node42.latest.json
+bash ./tests/bench_browser_node42.sh --runs 5
+
+# Capture a baseline snapshot for future regression deltas
+bash ./tests/bench_browser_node42.sh --runs 7 --write-baseline
+```
+
+This benchmark runs inside the browser emulator and records:
+- wall-clock elapsed time (`median`, `p95`, `min`, `max`)
+- emulator instruction counts (`median`, `p95`, `min`, `max`)
+
+`latest.json` includes % deltas vs the saved baseline file to show gains/losses.
+
 ---
 
 ## Phase 2: Wasm-Internal JIT Dispatch
+
+Status: DONE
 
 ### 2.1 Problem Statement
 
@@ -684,6 +1072,16 @@ function runResumeLoop() {
 
 ### 2.3 Testing Phase 2
 
+#### Browser Smoke (Node.js + Claude)
+
+```bash
+# Full smoke: Node.js + Claude plus JIT compilation log check
+bash ./tests/smoke_phase2_jit_dispatch.sh
+
+# Faster local loop: Node.js only
+bash ./tests/smoke_phase2_jit_dispatch.sh --skip-claude
+```
+
 #### Correctness: Single-block equivalence
 
 The dispatch loop must produce identical results to the old per-block dispatch.
@@ -832,6 +1230,8 @@ workload. Count `call` entries in the Wasm→JS direction.
 ---
 
 ## Phase 3: Register Caching in Wasm Locals
+
+Status: DONE
 
 ### 3.1 Problem Statement
 

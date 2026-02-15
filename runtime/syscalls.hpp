@@ -426,6 +426,7 @@ constexpr int O_CLOEXEC = 02000000;
 namespace err {
     constexpr int64_t NOENT = -2;
     constexpr int64_t BADF = -9;
+    constexpr int64_t AGAIN = -11;
     constexpr int64_t ACCES = -13;
     constexpr int64_t EXIST = -17;
     constexpr int64_t NOTDIR = -20;
@@ -1355,9 +1356,28 @@ static void sys_read(Machine& m) {
         return;
     }
 
-    // Socket FDs: delegate to recv
-#ifndef __EMSCRIPTEN__
+    // Socket FDs: delegate to network bridge/native recv
     if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        auto view = m.memory.memview(buf_addr, count);
+        int bytes_read = EM_ASM_INT({
+            if (typeof Module.readSocketData !== 'function') return -38;
+            var result = Module.readSocketData($0, $1);
+            if (!result || result.length === 0) return 0;
+            for (var i = 0; i < result.length; i++) {
+                Module.HEAPU8[$2 + i] = result[i];
+            }
+            return result.length;
+        }, fd, (int)count, (int)(uintptr_t)view.data());
+        if (bytes_read > 0) {
+            m.set_result(bytes_read);
+        } else if (bytes_read == 0) {
+            m.set_result(err::AGAIN);
+        } else {
+            m.set_result(bytes_read);
+        }
+        return;
+#else
         int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
         if (native_fd >= 0) {
             std::vector<uint8_t> buf(count);
@@ -1368,8 +1388,8 @@ static void sys_read(Machine& m) {
             m.set_result(n >= 0 ? n : -errno);
             return;
         }
+ #endif
     }
-#endif
 
     std::vector<uint8_t> buf(count);
     ssize_t n = fs.read(fd, buf.data(), count);
@@ -1426,9 +1446,21 @@ static void sys_write(Machine& m) {
         return;
     }
 
-    // Socket FDs: delegate to send
-#ifndef __EMSCRIPTEN__
+    // Socket FDs: delegate to network bridge/native send
     if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        std::vector<uint8_t> buf(count);
+        m.memory.memcpy_out(buf.data(), buf_addr, count);
+        int result = EM_ASM_INT({
+            if (typeof Module.onSocketSend === 'function') {
+                const data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                return Module.onSocketSend($0, data);
+            }
+            return -38;  // ENOSYS
+        }, fd, buf.data(), count);
+        m.set_result(result >= 0 ? (int64_t)count : result);
+        return;
+#else
         int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
         if (native_fd >= 0) {
             std::vector<uint8_t> buf(count);
@@ -1437,8 +1469,8 @@ static void sys_write(Machine& m) {
             m.set_result(n >= 0 ? n : -errno);
             return;
         }
-    }
 #endif
+    }
 
     m.set_result(err::BADF);
 }
@@ -1487,8 +1519,33 @@ static void sys_writev(Machine& m) {
     }
 
     // Socket FDs: gather iov and send
-#ifndef __EMSCRIPTEN__
     if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len > 0) {
+                std::vector<uint8_t> buf(len);
+                m.memory.memcpy_out(buf.data(), base, len);
+                int n = EM_ASM_INT({
+                    if (typeof Module.onSocketSend === 'function') {
+                        const data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                        return Module.onSocketSend($0, data);
+                    }
+                    return -38;  // ENOSYS
+                }, fd, buf.data(), len);
+                if (n < 0) {
+                    m.set_result(total > 0 ? (int64_t)total : n);
+                    return;
+                }
+                total += static_cast<size_t>(n);
+                if (static_cast<size_t>(n) < len) break;
+            }
+        }
+        m.set_result(total);
+        return;
+#else
         int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
         if (native_fd >= 0) {
             size_t total = 0;
@@ -1510,8 +1567,8 @@ static void sys_writev(Machine& m) {
             m.set_result(total);
             return;
         }
-    }
 #endif
+    }
 
     m.set_result(err::BADF);
 }
@@ -3404,6 +3461,68 @@ static void sys_recvmsg(Machine& m) {
     auto iov_addr = m.memory.template read<uint64_t>(msghdr_addr + 16);
     auto iovlen   = m.memory.template read<uint64_t>(msghdr_addr + 24);
 
+    if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        size_t total = 0;
+        for (uint64_t i = 0; i < iovlen && i < 16; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len  = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len == 0) continue;
+            auto view = m.memory.memview(base, len);
+            int n = EM_ASM_INT({
+                if (typeof Module.readSocketData !== 'function') return -38;
+                var result = Module.readSocketData($0, $1);
+                if (!result || result.length === 0) return 0;
+                for (var j = 0; j < result.length; j++) {
+                    Module.HEAPU8[$2 + j] = result[j];
+                }
+                return result.length;
+            }, fd, (int)len, (int)(uintptr_t)view.data());
+            if (n > 0) {
+                total += static_cast<size_t>(n);
+                if (static_cast<size_t>(n) < len) break;
+                continue;
+            }
+            if (n == 0) {
+                if (total > 0) break;
+                m.set_result(err::AGAIN);
+                return;
+            }
+            m.set_result(total > 0 ? (int64_t)total : n);
+            return;
+        }
+        m.memory.template write<uint64_t>(msghdr_addr + 40, 0);
+        m.memory.template write<int32_t>(msghdr_addr + 48, 0);
+        m.set_result(total);
+        return;
+#else
+        int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
+        if (native_fd >= 0) {
+            size_t total = 0;
+            for (uint64_t i = 0; i < iovlen && i < 16; i++) {
+                uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+                uint64_t len  = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+                if (len == 0) continue;
+                std::vector<uint8_t> buf(len);
+                ssize_t n = ::recv(native_fd, buf.data(), len, 0);
+                if (n < 0) {
+                    m.set_result(total > 0 ? (int64_t)total : -errno);
+                    return;
+                }
+                if (n > 0) {
+                    m.memory.memcpy(base, buf.data(), n);
+                    total += static_cast<size_t>(n);
+                }
+                if (static_cast<size_t>(n) < len) break;
+            }
+            m.memory.template write<uint64_t>(msghdr_addr + 40, 0);
+            m.memory.template write<int32_t>(msghdr_addr + 48, 0);
+            m.set_result(total);
+            return;
+        }
+#endif
+    }
+
     // Read into iovec buffers, similar to readv
     size_t total = 0;
     for (uint64_t i = 0; i < iovlen && i < 16; i++) {
@@ -3662,6 +3781,55 @@ static void sys_sendmsg(Machine& m) {
 
     auto iov_addr = m.memory.template read<uint64_t>(msghdr_addr + 16);
     auto iovlen   = m.memory.template read<uint64_t>(msghdr_addr + 24);
+
+    if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        size_t total = 0;
+        for (uint64_t i = 0; i < iovlen && i < 16; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len  = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len == 0) continue;
+            std::vector<uint8_t> buf(len);
+            m.memory.memcpy_out(buf.data(), base, len);
+            int n = EM_ASM_INT({
+                if (typeof Module.onSocketSend === 'function') {
+                    const data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                    return Module.onSocketSend($0, data);
+                }
+                return -38;  // ENOSYS
+            }, fd, buf.data(), len);
+            if (n < 0) {
+                m.set_result(total > 0 ? (int64_t)total : n);
+                return;
+            }
+            total += static_cast<size_t>(n);
+            if (static_cast<size_t>(n) < len) break;
+        }
+        m.set_result(total);
+        return;
+#else
+        int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
+        if (native_fd >= 0) {
+            size_t total = 0;
+            for (uint64_t i = 0; i < iovlen && i < 16; i++) {
+                uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+                uint64_t len  = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+                if (len == 0) continue;
+                std::vector<uint8_t> buf(len);
+                m.memory.memcpy_out(buf.data(), base, len);
+                ssize_t n = ::send(native_fd, buf.data(), len, 0);
+                if (n < 0) {
+                    m.set_result(total > 0 ? (int64_t)total : -errno);
+                    return;
+                }
+                total += static_cast<size_t>(n);
+                if (static_cast<size_t>(n) < len) break;
+            }
+            m.set_result(total);
+            return;
+        }
+#endif
+    }
 
     size_t total = 0;
     for (uint64_t i = 0; i < iovlen && i < 16; i++) {

@@ -166,15 +166,18 @@ node friscy-bundle/serve.js 9000
 
 Requires COOP/COEP headers for SharedArrayBuffer (serve.js handles this).
 
-### Build Emscripten (Docker)
+### Build Emscripten (Reproducible)
 
 ```bash
-docker run --rm -v $(pwd):/src emscripten/emsdk:latest bash -c "
-  cd /src && mkdir -p build-wasm && cd build-wasm
-  emcmake cmake ../runtime
-  emmake make -j\$(nproc)
-"
-cp build-wasm/friscy.{js,wasm} friscy-bundle/
+# Uses pinned versions from tools/build-lock.env.
+# Docker if available:
+bash tools/harness.sh
+
+# Force native emsdk (no Docker):
+bash tools/harness.sh --native
+
+# Sync built artifacts into browser bundle:
+cp runtime/build/friscy.{js,wasm} friscy-bundle/
 ```
 
 ### Build Native
@@ -183,6 +186,19 @@ cp build-wasm/friscy.{js,wasm} friscy-bundle/
 mkdir -p build-native && cd build-native
 cmake ../runtime && make -j$(nproc)
 ./friscy --rootfs ../friscy-bundle/rootfs.tar /bin/sh
+```
+
+### Reproducible Build + Test
+
+```bash
+# Run claude --version smoke against checked-in stable bundle runtime
+bash tools/build_and_test.sh
+
+# Attempt runtime rebuild first, then smoke test (restores stable bundle on failure):
+bash tools/build_and_test.sh --rebuild-runtime --native
+
+# Include haiku attempt in the same run:
+bash tools/build_and_test.sh --haiku
 ```
 
 ### Build Claude Rootfs

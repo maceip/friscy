@@ -712,7 +712,9 @@ int main(int argc, char** argv) {
             "LANG=C.UTF-8",
             "HOSTNAME=friscy",
             "TZ=UTC",
-            "NODE_OPTIONS=--jitless --max-old-space-size=256",
+            // Keep memory bounded, but do not force --jitless:
+            // undici/fetch in this Node build requires WebAssembly support.
+            "NODE_OPTIONS=--max-old-space-size=256",
             "NODE_COMPILE_CACHE=/tmp/node-compile-cache",
         };
         syscalls::g_exec_ctx.env = env;
@@ -724,10 +726,8 @@ int main(int argc, char** argv) {
             guest_args.insert(guest_args.begin(), entry_path);
         }
 
-        // Note: V8 JIT (--no-turbofan --no-maglev for Sparkplug-only) was tested
-        // but is ~9x slower than --jitless in emulation. JIT compiles JS to RISC-V
-        // native code, but that code still gets interpreted by libriscv — all
-        // compilation overhead with zero execution benefit, plus decoder cache thrash.
+        // Note: --jitless can be faster for some pure-CPU JS in emulation, but it
+        // disables WebAssembly in this guest runtime, which breaks undici/fetch.
 
         // Set up program arguments and environment
         if (use_dynamic_linker) {

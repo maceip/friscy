@@ -29,6 +29,7 @@ const NETWORK_READY_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_NETWORK
 
 const GUEST_WORKLOAD_SOURCE_TEMPLATE = String.raw`
 const vm = require('vm');
+const http = require('http');
 
 function buildSyntheticBundle(targetMB) {
   const targetBytes = Math.max(1, targetMB) * 1024 * 1024;
@@ -80,8 +81,67 @@ async function run() {
 
   const streamUrl = __MOCK_STREAM_URL__;
   const apiKey = __MOCK_API_KEY__;
-  if (typeof fetch !== "function") {
-    throw new Error("global fetch unavailable in guest Node runtime");
+
+  async function streamViaFetch() {
+    if (typeof fetch !== "function") {
+      throw new Error("global fetch unavailable in guest Node runtime");
+    }
+    const res = await fetch(streamUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+      },
+      body: JSON.stringify({ prompt: "stream me synthetic response" }),
+    });
+    if (!res.ok) {
+      throw new Error("stream status " + res.status);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      text += chunk;
+      process.stdout.write(chunk);
+    }
+    return text;
+  }
+
+  async function streamViaHttpRequest() {
+    const body = JSON.stringify({ prompt: "stream me synthetic response" });
+    const url = new URL(streamUrl);
+    return await new Promise((resolve, reject) => {
+      const req = http.request({
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: Number(url.port || 80),
+        path: url.pathname + (url.search || ""),
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "content-length": Buffer.byteLength(body),
+        },
+      }, (res) => {
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error("stream status " + (res.statusCode || 0)));
+          return;
+        }
+        let text = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          text += chunk;
+          process.stdout.write(chunk);
+        });
+        res.on("end", () => resolve(text));
+      });
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
   }
 
   let sseText = "";
@@ -89,32 +149,40 @@ async function run() {
   let lastErr = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await fetch(streamUrl, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": apiKey,
-        },
-        body: JSON.stringify({ prompt: "stream me synthetic response" }),
-      });
-      if (!res.ok) {
-        throw new Error("stream status " + res.status);
-      }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
       sseText = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        sseText += chunk;
-        process.stdout.write(chunk);
+      try {
+        sseText = await streamViaFetch();
+      } catch (fetchErr) {
+        const causeMsg = fetchErr && fetchErr.cause && fetchErr.cause.message
+          ? String(fetchErr.cause.message)
+          : "";
+        const useHttpFallback =
+          /WebAssembly is not defined/i.test(causeMsg) ||
+          /global fetch unavailable/i.test(fetchErr && fetchErr.message ? String(fetchErr.message) : "");
+        if (!useHttpFallback) {
+          throw fetchErr;
+        }
+        console.error("[synthetic] fetch backend unavailable; using http.request fallback");
+        sseText = await streamViaHttpRequest();
       }
       lastErr = null;
       break;
     } catch (err) {
       lastErr = err;
       console.error("[synthetic] stream attempt " + attempt + " failed:", err && err.message ? err.message : String(err));
+      if (err && err.code) console.error("[synthetic] err.code=" + err.code);
+      if (err && err.cause) {
+        const cause = err.cause;
+        const details = [
+          cause && cause.code ? ("code=" + cause.code) : null,
+          cause && cause.errno ? ("errno=" + cause.errno) : null,
+          cause && cause.syscall ? ("syscall=" + cause.syscall) : null,
+          cause && cause.address ? ("address=" + cause.address) : null,
+          cause && cause.port ? ("port=" + cause.port) : null,
+          cause && cause.message ? ("message=" + cause.message) : null,
+        ].filter(Boolean).join(" ");
+        console.error("[synthetic] err.cause " + details);
+      }
       if (attempt < maxAttempts) {
         await wait(1200);
       }
@@ -138,6 +206,18 @@ async function run() {
 
 run().catch((err) => {
   console.error("[synthetic] fatal", err && err.stack ? err.stack : String(err));
+  if (err && err.cause) {
+    const cause = err.cause;
+    const details = [
+      cause && cause.code ? ("code=" + cause.code) : null,
+      cause && cause.errno ? ("errno=" + cause.errno) : null,
+      cause && cause.syscall ? ("syscall=" + cause.syscall) : null,
+      cause && cause.address ? ("address=" + cause.address) : null,
+      cause && cause.port ? ("port=" + cause.port) : null,
+      cause && cause.message ? ("message=" + cause.message) : null,
+    ].filter(Boolean).join(" ");
+    console.error("[synthetic] fatal cause " + details);
+  }
   process.exit(1);
 });
 `;

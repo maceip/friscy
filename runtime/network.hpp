@@ -115,6 +115,9 @@ struct VSocket {
     bool connected;
     bool listening;
     bool nonblocking;
+    bool has_peer_v4;
+    uint32_t peer_addr_v4;
+    uint16_t peer_port;
 
 #ifndef __EMSCRIPTEN__
     int native_fd;           // Real socket fd for native builds
@@ -128,7 +131,8 @@ struct VSocket {
     std::function<void(const uint8_t*, size_t)> on_recv;
 
     VSocket() : fd(-1), domain(0), type(0), protocol(0),
-                connected(false), listening(false), nonblocking(false)
+                connected(false), listening(false), nonblocking(false),
+                has_peer_v4(false), peer_addr_v4(0), peer_port(0)
 #ifndef __EMSCRIPTEN__
                 , native_fd(-1)
 #endif
@@ -622,6 +626,15 @@ inline void sys_connect(Machine& m) {
     // Read the sockaddr from guest memory
     std::vector<uint8_t> addr_data(addrlen);
     m.memory.memcpy_out(addr_data.data(), addr_ptr, addrlen);
+    if (addrlen >= sizeof(sockaddr_in)) {
+        sockaddr_in parsed {};
+        std::memcpy(&parsed, addr_data.data(), sizeof(sockaddr_in));
+        if (parsed.sin_family == af::INET) {
+            sock->has_peer_v4 = true;
+            sock->peer_addr_v4 = parsed.sin_addr;
+            sock->peer_port = parsed.sin_port;
+        }
+    }
 
 #ifdef __EMSCRIPTEN__
     // Send connect request to JS bridge
@@ -719,7 +732,7 @@ inline void sys_sendto(Machine& m) {
             return Module.onSocketSend($0, data);
         }
         return -38;
-    }, sockfd, data.data(), len);
+    }, sockfd, data.data(), (int)len);
 
     m.set_result(result >= 0 ? (int64_t)len : result);
 #else
@@ -853,7 +866,20 @@ inline void sys_getsockopt(Machine& m) {
         return;
     }
 
-    m.set_result(err::NOPROTOOPT);
+    // Return zero/default values for unknown options to keep user-space
+    // network stacks progressing instead of failing hard on -ENOPROTOOPT.
+    uint32_t req_len = 0;
+    if (optlen_ptr != 0) {
+        m.memory.memcpy_out(&req_len, optlen_ptr, sizeof(req_len));
+    }
+    if (optval_ptr != 0 && req_len > 0) {
+        std::vector<uint8_t> zero(req_len, 0);
+        m.memory.memcpy(optval_ptr, zero.data(), req_len);
+    }
+    if (optlen_ptr != 0) {
+        m.memory.memcpy(optlen_ptr, &req_len, sizeof(req_len));
+    }
+    m.set_result(0);
 }
 
 // syscall 210: shutdown
@@ -927,6 +953,8 @@ inline void sys_getsockname(Machine& m) {
 // syscall 205: getpeername
 inline void sys_getpeername(Machine& m) {
     int sockfd = m.template sysarg<int>(0);
+    uint64_t addr_ptr = m.template sysarg<uint64_t>(1);
+    uint64_t addrlen_ptr = m.template sysarg<uint64_t>(2);
 
     auto* sock = get_network_ctx().get_socket(sockfd);
     if (!sock) {
@@ -939,8 +967,32 @@ inline void sys_getpeername(Machine& m) {
         return;
     }
 
-    // Would need to track peer address
-    m.set_result(err::NOSYS);
+    sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = af::INET;
+    if (sock->has_peer_v4) {
+        addr.sin_port = sock->peer_port;
+        addr.sin_addr = sock->peer_addr_v4;
+    } else {
+        addr.sin_port = 0;
+        addr.sin_addr = 0x0100007f;  // 127.0.0.1 fallback
+    }
+
+    uint32_t addrlen = sizeof(addr);
+    if (addrlen_ptr != 0) {
+        uint32_t requested = 0;
+        m.memory.memcpy_out(&requested, addrlen_ptr, sizeof(requested));
+        if (requested > 0) {
+            addrlen = std::min(requested, (uint32_t)sizeof(addr));
+        }
+    }
+    if (addr_ptr != 0) {
+        m.memory.memcpy(addr_ptr, &addr, addrlen);
+    }
+    if (addrlen_ptr != 0) {
+        m.memory.memcpy(addrlen_ptr, &addrlen, sizeof(addrlen));
+    }
+    m.set_result(0);
 }
 
 // syscall 72: pselect6 (for socket readiness checking)

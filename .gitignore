@@ -40,6 +40,9 @@ tests/test_http_minimal
 *.swp
 *.swo
 
+# Large rootfs tarballs (built locally via Docker)
+friscy-bundle/*.tar
+
 # OS
 .DS_Store
 Thumbs.db

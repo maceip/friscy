@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use wasm_encoder::{
     CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, ImportSection, Instruction, MemorySection, MemoryType, Module,
+    Function, FunctionSection, ImportSection, Instruction, MemoryType, Module,
     TableSection, TableType, TypeSection, ValType,
 };
 
@@ -151,21 +151,31 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     Ok(wasm.finish())
 }
 
-/// Build a JIT Wasm module — simpler than AOT:
-/// - Imports shared memory from "env"/"memory"
-/// - No dispatch function — JS manages block dispatch
-/// - Each block function exported by name (block_XXXXXXXX)
-/// - No table or element sections needed
-/// - Syscalls returned via high-bit convention (same as AOT)
+/// Build a JIT Wasm module with internal block dispatch.
+///
+/// Unlike the original per-block JIT ABI, this exports a single `run` function:
+///   (param $m i32, $start_pc i32) -> (result i32)
+///
+/// The dispatch loop stays inside Wasm and returns to JS only when:
+/// - halt (-1)
+/// - syscall marker (bit31 set)
+/// - dispatch miss (PC not present in this region's compiled table)
 pub fn build_jit(module: &WasmModule) -> Result<Vec<u8>> {
     let mut wasm = Module::new();
 
-    // Type section: block function (param $m i32) (result i32)
+    // ==========================================================================
+    // Type section
+    // ==========================================================================
     let mut types = TypeSection::new();
+    // Type 0: block function (param $m i32) (result i32)
     types.function(vec![ValType::I32], vec![ValType::I32]);
+    // Type 1: dispatch function (param $m i32, $pc i32) (result i32)
+    types.function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
     wasm.section(&types);
 
-    // Import section: shared memory
+    // ==========================================================================
+    // Import section: shared memory (shared with interpreter)
+    // ==========================================================================
     let mut imports = ImportSection::new();
     imports.import(
         "env",
@@ -179,22 +189,62 @@ pub fn build_jit(module: &WasmModule) -> Result<Vec<u8>> {
     );
     wasm.section(&imports);
 
-    // Function section
+    // ==========================================================================
+    // Function section: dispatch + blocks
+    // ==========================================================================
     let mut functions = FunctionSection::new();
+    functions.function(1); // dispatch function
     for _ in &module.functions {
-        functions.function(0); // type 0 = block function
+        functions.function(0); // block function
     }
     wasm.section(&functions);
 
-    // Export section: each block function exported by name
+    // ==========================================================================
+    // Table section (for call_indirect)
+    // ==========================================================================
+    let mut tables = TableSection::new();
+    tables.table(TableType {
+        element_type: wasm_encoder::RefType::FUNCREF,
+        minimum: module.functions.len() as u32,
+        maximum: Some(module.functions.len() as u32),
+    });
+    wasm.section(&tables);
+
+    // ==========================================================================
+    // Element section (populate block function table)
+    // Function indices: 0 = dispatch, 1.. = blocks
+    // ==========================================================================
+    let func_indices: Vec<u32> = (0..module.functions.len())
+        .map(|i| (i + 1) as u32)
+        .collect();
+    let mut elements = ElementSection::new();
+    elements.active(
+        Some(0),
+        &ConstExpr::i32_const(0),
+        Elements::Functions(&func_indices),
+    );
+    wasm.section(&elements);
+
+    // ==========================================================================
+    // Export section
+    // ==========================================================================
     let mut exports = ExportSection::new();
-    for (idx, func) in module.functions.iter().enumerate() {
-        exports.export(&func.name, ExportKind::Func, idx as u32);
-    }
+    exports.export("run", ExportKind::Func, 0);
     wasm.section(&exports);
 
+    // ==========================================================================
     // Code section
+    // ==========================================================================
+    let addr_to_table_idx: BTreeMap<u64, u32> = module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.block_addr, i as u32))
+        .collect();
+
     let mut codes = CodeSection::new();
+    let dispatch_func = build_jit_dispatch_function(module, &addr_to_table_idx);
+    codes.function(&dispatch_func);
     for func in &module.functions {
         let wasm_func = build_block_function(func)?;
         codes.function(&wasm_func);
@@ -202,6 +252,58 @@ pub fn build_jit(module: &WasmModule) -> Result<Vec<u8>> {
     wasm.section(&codes);
 
     Ok(wasm.finish())
+}
+
+/// Build JIT dispatch:
+/// - loops over compiled blocks using call_indirect
+/// - returns immediately on halt/syscall/dispatch miss
+fn build_jit_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) -> Function {
+    // Locals: param0=$m (i32), param1=$start_pc (i32), local2=$pc (i32)
+    let mut func = Function::new(vec![(1, ValType::I32)]);
+
+    // Initialize PC from parameter
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // Main dispatch loop
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // Halt marker propagates directly to JS
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(-1));
+    func.instruction(&Instruction::I32Eq);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::I32Const(-1));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // Syscall marker propagates directly to JS
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(0x80000000u32 as i32));
+    func.instruction(&Instruction::I32And);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    if module.functions.is_empty() {
+        // No compiled blocks in this module: region miss.
+        func.instruction(&Instruction::LocalGet(2));
+        func.instruction(&Instruction::Return);
+    } else {
+        // Sparse dispatch handles both compact and sparse address layouts.
+        emit_sparse_dispatch_jit(&mut func, addr_to_table_idx);
+    }
+
+    // Continue dispatching with updated $pc from called block.
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // end loop
+
+    // Should be unreachable, but keep function well-formed.
+    func.instruction(&Instruction::I32Const(-1));
+    func.instruction(&Instruction::End);
+
+    func
 }
 
 /// Build the main dispatch function with O(1) block lookup via call_indirect
@@ -269,7 +371,7 @@ fn build_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64
     } else {
         // Sparse addresses: use br_table with block nesting
         // Generate a block per address with nested blocks for br_table targets
-        emit_sparse_dispatch(&mut func, module, addr_to_table_idx);
+        emit_sparse_dispatch(&mut func, addr_to_table_idx);
     }
 
     func.instruction(&Instruction::Br(0)); // Continue loop
@@ -297,7 +399,7 @@ fn can_use_dense_table(module: &WasmModule) -> bool {
 }
 
 /// Emit sparse dispatch using br_table with dense index mapping, or if-else fallback
-fn emit_sparse_dispatch(func: &mut Function, module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) {
+fn emit_sparse_dispatch(func: &mut Function, addr_to_table_idx: &BTreeMap<u64, u32>) {
     let sorted_addrs: Vec<(u64, u32)> = addr_to_table_idx.iter().map(|(&a, &t)| (a, t)).collect();
     let n = sorted_addrs.len(); // number of real blocks
 
@@ -324,6 +426,34 @@ fn emit_sparse_dispatch(func: &mut Function, module: &WasmModule, addr_to_table_
     } else {
         // Fallback: if-else chain for extremely sparse address spaces
         emit_if_else_dispatch(func, &sorted_addrs);
+    }
+}
+
+/// JIT sparse dispatch: identical block lookup strategy to AOT, but on default
+/// path returns the current PC as a region miss instead of forcing halt.
+fn emit_sparse_dispatch_jit(func: &mut Function, addr_to_table_idx: &BTreeMap<u64, u32>) {
+    let sorted_addrs: Vec<(u64, u32)> = addr_to_table_idx.iter().map(|(&a, &t)| (a, t)).collect();
+    let n = sorted_addrs.len();
+
+    if n == 0 {
+        func.instruction(&Instruction::LocalGet(2));
+        func.instruction(&Instruction::Return);
+        return;
+    }
+
+    let base_addr = sorted_addrs[0].0;
+    let max_addr = sorted_addrs[n - 1].0;
+    let alignment = compute_addr_alignment(&sorted_addrs);
+    let table_size = if max_addr == base_addr {
+        1
+    } else {
+        ((max_addr - base_addr) / alignment + 1) as usize
+    };
+
+    if table_size <= 65536 {
+        emit_br_table_dispatch_jit(func, &sorted_addrs, base_addr, alignment, table_size, n);
+    } else {
+        emit_if_else_dispatch_jit(func, &sorted_addrs);
     }
 }
 
@@ -456,6 +586,88 @@ fn emit_if_else_dispatch(func: &mut Function, sorted_addrs: &[(u64, u32)]) {
     // Default: unknown PC, halt
     func.instruction(&Instruction::I32Const(-1));
     func.instruction(&Instruction::LocalSet(2));
+}
+
+/// JIT br_table dispatch: default branch returns region miss ($pc) to JS.
+fn emit_br_table_dispatch_jit(
+    func: &mut Function,
+    sorted_addrs: &[(u64, u32)],
+    base_addr: u64,
+    alignment: u64,
+    table_size: usize,
+    n: usize,
+) {
+    let mut addr_to_case: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for (case_num, &(addr, _)) in sorted_addrs.iter().enumerate() {
+        addr_to_case.insert(addr, case_num);
+    }
+
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $outer
+    for _ in 0..n {
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $case_j
+    }
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $default
+
+    func.instruction(&Instruction::LocalGet(2)); // $pc
+    func.instruction(&Instruction::I32Const(base_addr as i32));
+    func.instruction(&Instruction::I32Sub);
+    let shift = alignment.trailing_zeros();
+    if alignment.is_power_of_two() && shift > 0 {
+        func.instruction(&Instruction::I32Const(shift as i32));
+        func.instruction(&Instruction::I32ShrU);
+    } else if alignment > 1 {
+        func.instruction(&Instruction::I32Const(alignment as i32));
+        func.instruction(&Instruction::I32DivU);
+    }
+
+    let mut targets: Vec<u32> = Vec::with_capacity(table_size);
+    for i in 0..table_size {
+        let addr = base_addr + (i as u64) * alignment;
+        match addr_to_case.get(&addr) {
+            Some(&case_num) => targets.push((case_num + 1) as u32),
+            None => targets.push(0), // default
+        }
+    }
+    func.instruction(&Instruction::BrTable(targets.into(), 0));
+
+    func.instruction(&Instruction::End); // end $default
+    // Default: unknown PC for this compiled region => return miss PC.
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::Return);
+
+    for (case_num, &(_addr, table_idx)) in sorted_addrs.iter().enumerate() {
+        func.instruction(&Instruction::End); // end $case_{case_num}
+
+        func.instruction(&Instruction::LocalGet(0)); // $m
+        func.instruction(&Instruction::I32Const(table_idx as i32));
+        func.instruction(&Instruction::CallIndirect { ty: 0, table: 0 });
+        func.instruction(&Instruction::LocalSet(2));
+        func.instruction(&Instruction::Br((n - 1 - case_num) as u32));
+    }
+
+    func.instruction(&Instruction::End); // end $outer
+}
+
+/// JIT fallback if-else dispatch for very sparse tables.
+fn emit_if_else_dispatch_jit(func: &mut Function, sorted_addrs: &[(u64, u32)]) {
+    for &(addr, table_idx) in sorted_addrs {
+        func.instruction(&Instruction::LocalGet(2)); // $pc
+        func.instruction(&Instruction::I32Const(addr as i32));
+        func.instruction(&Instruction::I32Eq);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+        func.instruction(&Instruction::LocalGet(0)); // $m
+        func.instruction(&Instruction::I32Const(table_idx as i32));
+        func.instruction(&Instruction::CallIndirect { ty: 0, table: 0 });
+        func.instruction(&Instruction::LocalSet(2));
+        func.instruction(&Instruction::Br(1)); // break to loop continue
+
+        func.instruction(&Instruction::End);
+    }
+
+    // Default: region miss
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::Return);
 }
 
 /// Build a block function from our IR
@@ -1079,6 +1291,7 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
 mod tests {
     use super::*;
     use crate::translate::{WasmFunction, WasmModule};
+    use wasmparser::{Parser, Payload};
 
     /// Helper: create a minimal WasmModule with block functions at the given addresses
     fn make_module(addrs: &[u64]) -> WasmModule {
@@ -1168,5 +1381,24 @@ mod tests {
     fn test_compute_addr_alignment_single() {
         let addrs = vec![(0x1000u64, 0u32)];
         assert_eq!(compute_addr_alignment(&addrs), 2); // minimum C-ext alignment
+    }
+
+    #[test]
+    fn test_build_jit_exports_run_only() {
+        let module = make_module(&[0x1000, 0x1004]);
+        let bytes = build_jit(&module).unwrap();
+        assert_eq!(&bytes[0..4], b"\0asm");
+
+        let mut export_names = Vec::new();
+        for payload in Parser::new(0).parse_all(&bytes) {
+            if let Payload::ExportSection(reader) = payload.unwrap() {
+                for export in reader {
+                    export_names.push(export.unwrap().name.to_string());
+                }
+            }
+        }
+
+        assert!(export_names.iter().any(|name| name == "run"));
+        assert!(!export_names.iter().any(|name| name.starts_with("block_")));
     }
 }

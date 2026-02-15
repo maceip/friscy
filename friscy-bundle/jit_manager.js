@@ -113,7 +113,7 @@ class JITManager {
             compileFailures: 0,
             cooldownDeferrals: 0,
             stalePrunes: 0,
-            missesBeforeSteady: -1,
+            missesBeforeSteady: 0,
         };
 
         // Regions that were proactively predicted for compile:
@@ -1049,7 +1049,7 @@ class JITManager {
             compileFailures: 0,
             cooldownDeferrals: 0,
             stalePrunes: 0,
-            missesBeforeSteady: -1,
+            missesBeforeSteady: 0,
         };
     }
 }

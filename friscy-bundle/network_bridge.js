@@ -51,11 +51,12 @@ const SOCK_DGRAM = 2;
  * Main network bridge class using WebTransport
  */
 export class FriscyNetworkBridge {
-  constructor(proxyUrl) {
+  constructor(proxyUrl, options = {}) {
     this.proxyUrl = proxyUrl;
     this.transport = null;
     this.connected = false;
     this.reconnecting = false;
+    this.proxyCertHash = options.certHash || null;
 
     // Connection tracking
     this.connections = new Map(); // connID -> ConnectionState
@@ -78,14 +79,17 @@ export class FriscyNetworkBridge {
 
     try {
       // Use serverCertificateHashes for self-signed certs (WebTransport requirement).
-      // The hash is the SHA-256 of the DER-encoded certificate.
-      const certHash = '5B7pqn+Adpph4cKEidlzVG58dhaY1nZ8Dp4M0f4Wic4=';
-      this.transport = new WebTransport(this.proxyUrl, {
-        serverCertificateHashes: [{
+      // Default hash targets the public proxy certificate, but tests can override
+      // with ?proxycert=<base64-sha256-der-hash>.
+      const certHash = this.proxyCertHash || '5B7pqn+Adpph4cKEidlzVG58dhaY1nZ8Dp4M0f4Wic4=';
+      const wtOptions = {};
+      if (certHash && certHash !== 'none') {
+        wtOptions.serverCertificateHashes = [{
           algorithm: 'sha-256',
           value: Uint8Array.from(atob(certHash), c => c.charCodeAt(0)).buffer
-        }]
-      });
+        }];
+      }
+      this.transport = new WebTransport(this.proxyUrl, wtOptions);
       await this.transport.ready;
       this.connected = true;
       this.reconnecting = false;
@@ -93,6 +97,7 @@ export class FriscyNetworkBridge {
 
       // Start reading incoming streams
       this.readIncomingStreams();
+      this.readIncomingBidirectionalStreams();
 
       // Start reading datagrams
       this.readDatagrams();
@@ -364,6 +369,30 @@ export class FriscyNetworkBridge {
     } catch (e) {
       if (this.connected) {
         console.error('[friscy-net] Error reading streams:', e);
+      }
+    }
+  }
+
+  /**
+   * Read incoming bidirectional streams from proxy.
+   * Some browsers/proxy stacks are more reliable with bi-di server events.
+   */
+  async readIncomingBidirectionalStreams() {
+    if (!this.transport) return;
+
+    const reader = this.transport.incomingBidirectionalStreams.getReader();
+
+    try {
+      while (true) {
+        const { value: stream, done } = await reader.read();
+        if (done) break;
+        if (stream && stream.readable) {
+          this.handleIncomingStream(stream.readable);
+        }
+      }
+    } catch (e) {
+      if (this.connected) {
+        console.error('[friscy-net] Error reading bidirectional streams:', e);
       }
     }
   }

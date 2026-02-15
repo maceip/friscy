@@ -1342,11 +1342,12 @@
                            : params.get('proxy')
                              || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
                                  ? `https://${location.hostname}:4433/connect` : DEFAULT_PROXY);
+            const proxyCertHash = params.get('proxycert') || null;
             if (proxyUrl) {
                 setProgress(-1, 'Connecting network...');
                 try {
                     updateNetStatus('connecting');
-                    netBridge = new FriscyNetworkBridge(proxyUrl);
+                    netBridge = new FriscyNetworkBridge(proxyUrl, { certHash: proxyCertHash });
                     await netBridge.connect();
                     updateNetStatus('connected');
                 } catch (e) {
@@ -1812,10 +1813,11 @@
                            : params.get('proxy')
                              || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
                                  ? `https://${location.hostname}:4433/connect` : DEFAULT_PROXY);
+            const proxyCertHash = params.get('proxycert') || null;
             if (proxyUrl) {
                 try {
                     updateNetStatus('connecting');
-                    netBridge = new FriscyNetworkBridge(proxyUrl);
+                    netBridge = new FriscyNetworkBridge(proxyUrl, { certHash: proxyCertHash });
                     await netBridge.connect();
                     updateNetStatus('connected');
                 } catch (e) { updateNetStatus('disconnected'); }

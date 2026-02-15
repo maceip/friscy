@@ -200,6 +200,12 @@ bash tools/build_and_test.sh --rebuild-runtime --native
 # Include haiku attempt in the same run:
 bash tools/build_and_test.sh --haiku
 
+# Run synthetic Claude-like workload (large JS parse + streamed API response):
+bash tools/build_and_test.sh --synthetic-stream --synthetic-bundle-mb 6
+
+# Validate the local mock streaming API service directly:
+node --experimental-default-type=module ./tests/test_mock_stream_service.js
+
 # Sweep emsdk/libriscv compatibility for runtime rebuild debugging:
 bash tools/runtime_compat_sweep.sh --emsdk 5.0.1 4.0.23 4.0.20
 

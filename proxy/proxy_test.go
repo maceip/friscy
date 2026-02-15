@@ -47,7 +47,8 @@ func setupTestServer(t *testing.T) {
 			t.Fatalf("Failed to generate test certs: %v", err)
 		}
 
-		testServer = NewServer(":4433", testCertFile, testKeyFile)
+		rl := NewRateLimiter(100, 10000)
+		testServer = NewServer(":4433", testCertFile, testKeyFile, rl, nil, true)
 		go func() {
 			if err := testServer.Run(); err != nil {
 				// Server stopped, that's ok for tests

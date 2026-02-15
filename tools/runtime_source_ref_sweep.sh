@@ -42,13 +42,13 @@ while [[ $# -gt 0 ]]; do
             done
             continue
             ;;
-        --rootfs-url|--smoke-timeout-sec|--build-timeout-sec)
+        --rootfs-url|--smoke-timeout-sec|--build-timeout-sec|--test-script|--test-query|--test-cmd|--test-expected|--test-wait-for-exit)
             COMPAT_ARGS+=("$1" "${2:-}")
             shift 2
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--source-ref REF1 REF2 ...] [--emsdk V1 V2 ...] [--libriscv R1 R2 ...] [--rootfs-url URL] [--smoke-timeout-sec N] [--build-timeout-sec N] [--out PATH]"
+            echo "Usage: $0 [--source-ref REF1 REF2 ...] [--emsdk V1 V2 ...] [--libriscv R1 R2 ...] [--rootfs-url URL] [--smoke-timeout-sec N] [--build-timeout-sec N] [--test-script PATH] [--test-query QUERY] [--test-cmd CMD] [--test-expected TEXT] [--test-wait-for-exit 0|1] [--out PATH]"
             exit 1
             ;;
     esac

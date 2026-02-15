@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="${FRISCY_PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 RUNTIME_DIR="$PROJECT_DIR/runtime"
 EMSDK_DIR="$RUNTIME_DIR/emsdk"
 LOCK_FILE="$SCRIPT_DIR/build-lock.env"

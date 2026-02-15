@@ -130,6 +130,7 @@ next.
   - `?jittrace3hot=N` triplet hot threshold,
   - `?nojitmarkov` disables Markov predictor,
   - `?nojittriplet` disables triplet predictor,
+  - `?jitawait` waits for JIT compiler load before guest run (benchmark mode),
   - `?jitbudget=N` compile budget per second,
   - `?jitqmax=N` compile queue bound,
   - `?jitpredk=N` Markov top-K width,

@@ -364,6 +364,7 @@ self.onmessage = async function(e) {
         const jitPredictConfidence = Number.isFinite(msg.jitPredictConfidence) ? msg.jitPredictConfidence : null;
         const jitMarkovEnabled = msg.jitMarkovEnabled !== false;
         const jitTripletEnabled = msg.jitTripletEnabled !== false;
+        const jitAwaitCompiler = msg.jitAwaitCompiler === true;
         const jitTraceEnabled = msg.jitTraceEnabled !== false;
         const jitEdgeHotThreshold = Number.isFinite(msg.jitEdgeHotThreshold) ? msg.jitEdgeHotThreshold : null;
         const jitTraceTripletHotThreshold = Number.isFinite(msg.jitTraceTripletHotThreshold)
@@ -490,10 +491,18 @@ self.onmessage = async function(e) {
             const wasmMemory = emModule.wasmMemory || (emModule.asm && emModule.asm.memory);
             if (wasmMemory) {
                 jitManager.init(wasmMemory);
-                // Load JIT compiler (async, non-blocking)
-                jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
-                    console.warn('[worker] JIT compiler not available:', e.message);
-                });
+                if (jitAwaitCompiler) {
+                    try {
+                        await jitManager.loadCompiler('rv2wasm_jit_bg.wasm');
+                    } catch (e) {
+                        console.warn('[worker] JIT compiler wait failed:', e.message);
+                    }
+                } else {
+                    // Load JIT compiler (async, non-blocking)
+                    jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
+                        console.warn('[worker] JIT compiler not available:', e.message);
+                    });
+                }
             }
         } else {
             console.log('[worker] JIT disabled via configuration');

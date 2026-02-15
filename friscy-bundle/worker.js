@@ -333,6 +333,9 @@ self.onmessage = async function(e) {
         const jitOptimizeThreshold = Number.isFinite(msg.jitOptimizeThreshold) ? msg.jitOptimizeThreshold : null;
         const jitTraceEnabled = msg.jitTraceEnabled !== false;
         const jitEdgeHotThreshold = Number.isFinite(msg.jitEdgeHotThreshold) ? msg.jitEdgeHotThreshold : null;
+        const jitTraceTripletHotThreshold = Number.isFinite(msg.jitTraceTripletHotThreshold)
+            ? msg.jitTraceTripletHotThreshold
+            : null;
 
         controlView = new Int32Array(controlSab);
         controlBytes = new Uint8Array(controlSab);
@@ -415,6 +418,7 @@ self.onmessage = async function(e) {
                 jitManager.configureTrace({
                     enabled: jitTraceEnabled,
                     edgeHotThreshold: jitEdgeHotThreshold,
+                    tripletHotThreshold: jitTraceTripletHotThreshold,
                 });
                 console.log(
                     `[worker] JIT manager loaded ` +
@@ -422,7 +426,8 @@ self.onmessage = async function(e) {
                     `tiering=${jitManager.tieringEnabled ? 'on' : 'off'}, ` +
                     `optHot=${jitManager.optimizeThreshold ?? 'default'}, ` +
                     `trace=${jitManager.traceEnabled ? 'on' : 'off'}, ` +
-                    `edgeHot=${jitManager.traceEdgeHotThreshold ?? 'default'})`
+                    `edgeHot=${jitManager.traceEdgeHotThreshold ?? 'default'}, ` +
+                    `tripletHot=${jitManager.traceTripletHotThreshold ?? 'default'})`
                 );
             } catch (e) {
                 console.warn('[worker] JIT manager not available:', e.message);

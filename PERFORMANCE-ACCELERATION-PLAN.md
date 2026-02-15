@@ -18,6 +18,7 @@ wrong results).
 | **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium |
 | **4** | Trace-driven region prefetch | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Fewer region-miss fallbacks on hot cross-region paths | Low |
 | **5** | Two-tier JIT promotion (fast -> optimized) | `aot/src/translate.rs`, `aot-jit/src/lib.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Faster first-compile with hotter-region quality recovery | Medium |
+| **6** | Trace-sequence prediction (A->B->C) | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Better precompile precision on repeated multi-region paths | Low |
 
 ---
 
@@ -85,6 +86,41 @@ fast first hit and stronger optimization once it proves hot.
   - `?jitopt=N` sets promotion threshold.
 
 ### 5.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+---
+
+## Phase 6: Trace-Sequence Prediction (Second-Order Hot Paths)
+
+### 6.1 Problem Statement
+
+Single-edge prefetch (`A -> B`) can still over-compile on branchy code. Repeated
+multi-region sequences (`A -> B -> C`) are a stronger signal for what to compile
+next.
+
+### 6.2 Implementation Summary
+
+- Added triplet-trace counting in `jit_manager.js`:
+  - tracks `A -> B -> C` region sequences observed from JIT region misses,
+  - bounded table (`traceMaxTriplets`) to avoid unbounded growth.
+- Added hot-triplet compile trigger:
+  - when a triplet reaches `traceTripletHotThreshold`, proactively compiles
+    target region `C` (baseline tier).
+- Kept edge prefetch as fallback:
+  - if no hot triplet trigger occurs, edge hotness still drives compile.
+- Added runtime control:
+  - `?jittrace3hot=N` sets triplet hot threshold.
+
+### 6.3 Required Verification Proof
 
 ```bash
 FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \

@@ -199,6 +199,9 @@ bash tools/build_and_test.sh --rebuild-runtime --native
 
 # Include haiku attempt in the same run:
 bash tools/build_and_test.sh --haiku
+
+# Sweep emsdk/libriscv compatibility for runtime rebuild debugging:
+bash tools/runtime_compat_sweep.sh --emsdk 5.0.1 4.0.23 4.0.20
 ```
 
 ### Build Claude Rootfs

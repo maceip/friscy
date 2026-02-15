@@ -9,20 +9,22 @@ and how to validate correctness with real-world programs that detect regressions
 and prevent "cheating" (optimizations that appear fast but silently produce
 wrong results).
 
-**Implementation order:**
+**Implementation order (Phases 1-6 complete):**
 
-| Phase | Technique | Files Modified | Expected Impact | Risk |
-|-------|-----------|---------------|-----------------|------|
-| **1** | Peephole optimization | `aot/src/translate.rs` | 10-20% code size, 5-15% runtime | Very low |
-| **2** | Wasm-internal JIT dispatch | `aot/src/wasm_builder.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js` | 5-50x JIT throughput | Low |
-| **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium |
-| **4** | Trace-driven region prefetch | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Fewer region-miss fallbacks on hot cross-region paths | Low |
-| **5** | Two-tier JIT promotion (fast -> optimized) | `aot/src/translate.rs`, `aot-jit/src/lib.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Faster first-compile with hotter-region quality recovery | Medium |
-| **6** | Trace-sequence prediction (A->B->C) | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Better precompile precision on repeated multi-region paths | Low |
+| Phase | Technique | Files Modified | Expected Impact | Risk | Status |
+|-------|-----------|---------------|-----------------|------|--------|
+| **1** | Peephole optimization | `aot/src/translate.rs` | 10-20% code size, 5-15% runtime | Very low | DONE |
+| **2** | Wasm-internal JIT dispatch | `aot/src/wasm_builder.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js` | 5-50x JIT throughput | Low | DONE |
+| **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium | DONE |
+| **4** | Trace-driven region prefetch | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Fewer region-miss fallbacks on hot cross-region paths | Low | DONE |
+| **5** | Two-tier JIT promotion (fast -> optimized) | `aot/src/translate.rs`, `aot-jit/src/lib.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Faster first-compile with hotter-region quality recovery | Medium | DONE |
+| **6** | Trace-sequence prediction (A->B->C) | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Better precompile precision on repeated multi-region paths | Low | DONE |
 
 ---
 
 ## Phase 4: Trace-Driven Region Prefetch (Incremental Medium-Phase Work)
+
+Status: DONE
 
 ### 4.1 Problem Statement
 
@@ -60,6 +62,8 @@ Pass criteria:
 ---
 
 ## Phase 5: Two-Tier JIT Promotion (Fast Baseline -> Optimized Recompile)
+
+Status: DONE
 
 ### 5.1 Problem Statement
 
@@ -100,6 +104,8 @@ Pass criteria:
 ---
 
 ## Phase 6: Trace-Sequence Prediction (Second-Order Hot Paths)
+
+Status: DONE
 
 ### 6.1 Problem Statement
 
@@ -167,7 +173,145 @@ and records:
 
 ---
 
-## Baseline Definition (Required for all phases)
+## JS OPTIMIZATION (Current and Only Focus)
+
+Effective immediately, all new optimization work targets this command:
+
+```bash
+claude -p "write me a haiku"
+```
+
+`claude --version` remains a lightweight regression smoke check only. It is no
+longer the primary optimization target.
+
+### 7.0 JS Optimization Phase Roadmap
+
+| Phase | Focus | Status | Primary Goal |
+|------:|-------|--------|--------------|
+| 7 | Main-path JIT activation | PLANNED | Ensure non-interactive Claude prompt execution actually exercises JIT dispatch paths |
+| 8 | Process/resource reliability | PLANNED | Eliminate `vfork`/resource failures and prompt hangs for haiku workload |
+| 9 | Haiku-path scheduler/predictor tuning | PLANNED | Convert telemetry into real first-output/completion latency gains on haiku runs |
+| 10 | Bottleneck discovery | DISCOVERY REQUIRED | Identify next dominant bottlenecks after Phases 7-9 |
+| 11 | Highest-ROI fix from discovery | DISCOVERY REQUIRED | Implement and validate the best Phase 10 finding for additional speedup |
+
+### Phase 7: Main-Path JIT Activation for Non-Interactive Workloads
+
+Status: PLANNED
+
+#### 7.1 Problem Statement
+
+Current JIT dispatch activity is concentrated in resume-loop paths. One-shot
+commands can finish (or stall) without producing enough JIT/predictor events,
+which makes scheduler/Markov optimizations ineffective for the target workload.
+
+#### 7.2 Implementation Direction
+
+- Move or mirror JIT dispatch opportunities into the main execution path for
+  non-interactive commands.
+- Introduce bounded run-slicing/checkpoints so long guest runs can re-enter JIT
+  decision points without relying on stdin-stop behavior.
+- Ensure telemetry (`regionMisses`, queue depth, predictor events) is emitted
+  for prompt workloads.
+
+#### 7.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+FRISCY_TEST_CLAUDE_CMD='claude -p "write me a haiku"' \
+node --experimental-default-type=module ./tests/test_claude_haiku.js
+```
+
+Pass criteria:
+- haiku response detected (`haiku_like=1`),
+- guest exits cleanly (`guest_exit_code=0`),
+- non-zero JIT activity on target path (for example non-zero misses or queue activity).
+
+### Phase 8: Process/Resource Reliability for Claude Prompt Path
+
+Status: PLANNED
+
+#### 8.1 Problem Statement
+
+The haiku workload currently encounters resource/process failures (for example
+`vfork: Resource temporarily unavailable`) and can stall without completion.
+Until this path is reliable, performance work cannot be trusted.
+
+#### 8.2 Implementation Direction
+
+- Diagnose process creation and task scheduling constraints in the emulator path
+  used by Claude prompt execution.
+- Remove or mitigate failure modes that cause hangs/timeouts.
+- Add explicit failure signatures to smoke output so regressions are detected.
+
+#### 8.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+FRISCY_TEST_CLAUDE_CMD='claude -p "write me a haiku"' \
+node --experimental-default-type=module ./tests/test_claude_haiku.js
+```
+
+Pass criteria:
+- no `Resource temporarily unavailable` / `std::bad_alloc` / timeout failure,
+- haiku response detected,
+- guest exits `0`.
+
+### Phase 9: Haiku-Path Scheduler/Predictor Performance Tuning
+
+Status: PLANNED
+
+#### 9.1 Problem Statement
+
+Scheduler and Markov predictor infrastructure exists, but current target
+workloads do not yet show clear user-facing latency gains. This phase tunes
+those systems specifically against haiku prompt latency.
+
+#### 9.2 Implementation Direction
+
+- Benchmark no-predictor vs edge vs edge+triplet+Markov on the haiku command.
+- Use telemetry-guided tuning for budget, queue depth, and adaptive thresholds.
+- Optimize for user-perceived metrics first (first output and completion).
+
+#### 9.3 Required Verification Proof
+
+Use a dedicated haiku mode comparison benchmark (to be added/updated) that
+records:
+- first output latency,
+- completion latency,
+- misses before steady-state,
+- predictor hit rate and queue pressure.
+
+Pass criteria:
+- measurable latency improvement over no-predictor mode on repeated runs,
+- no correctness regression (still returns a haiku and exits cleanly).
+
+### Phase 10: Discovery Phase - Bottleneck Attribution Beyond Current JIT
+
+Status: DISCOVERY REQUIRED
+
+Goal:
+- produce a ranked list of remaining bottlenecks that block faster haiku runs
+  after Phases 7-9 (for example process model, syscall emulation, memory
+  pressure, network/proxy latency, allocator behavior, or host/guest handoff).
+
+Expected output:
+- short evidence report with traces/metrics,
+- selected Phase 11 candidate with estimated ROI.
+
+### Phase 11: Discovery Phase - Highest-ROI Fix for Haiku Throughput
+
+Status: DISCOVERY REQUIRED
+
+Goal:
+- implement the single highest-ROI fix identified in Phase 10,
+- validate end-to-end correctness and latency gains for the haiku workload.
+
+Required verification proof:
+- repeat the Phase 9 benchmark suite and compare against pre-Phase 11 results.
+
+---
+
+## Historical Baseline Definition (Phases 1-6)
 
 All optimization claims must be measured against these two baseline workloads:
 
@@ -194,6 +338,8 @@ only fails when `CLAUDE_PAYLOAD_STRICT=1` is set.
 ---
 
 ## Phase 1: Peephole Optimization
+
+Status: DONE
 
 ### 1.1 Problem Statement
 
@@ -620,6 +766,8 @@ This benchmark runs inside the browser emulator and records:
 
 ## Phase 2: Wasm-Internal JIT Dispatch
 
+Status: DONE
+
 ### 2.1 Problem Statement
 
 The current JIT dispatch is catastrophically inefficient. Examining the
@@ -1045,6 +1193,8 @@ workload. Count `call` entries in the Wasm→JS direction.
 ---
 
 ## Phase 3: Register Caching in Wasm Locals
+
+Status: DONE
 
 ### 3.1 Problem Statement
 

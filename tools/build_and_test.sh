@@ -8,8 +8,10 @@ NATIVE=0
 REBUILD_RUNTIME=0
 KEEP_RUNTIME_ON_FAIL=0
 RUN_HAIKU=0
+RUN_SYNTH_STREAM=0
 ROOTFS_URL="./nodejs-claude.tar"
 HAIKU_QUERY="?proxy=https://78.141.219.102:4433/connect"
+SYNTH_BUNDLE_MB="6"
 BUNDLE_JS="$PROJECT_DIR/friscy-bundle/friscy.js"
 BUNDLE_WASM="$PROJECT_DIR/friscy-bundle/friscy.wasm"
 
@@ -31,6 +33,10 @@ while [[ $# -gt 0 ]]; do
             RUN_HAIKU=1
             shift
             ;;
+        --synthetic-stream)
+            RUN_SYNTH_STREAM=1
+            shift
+            ;;
         --rootfs-url)
             ROOTFS_URL="${2:-}"
             shift 2
@@ -39,9 +45,13 @@ while [[ $# -gt 0 ]]; do
             HAIKU_QUERY="${2:-}"
             shift 2
             ;;
+        --synthetic-bundle-mb)
+            SYNTH_BUNDLE_MB="${2:-}"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--rebuild-runtime] [--native] [--keep-runtime-on-fail] [--haiku] [--rootfs-url URL] [--haiku-query QUERY]"
+            echo "Usage: $0 [--rebuild-runtime] [--native] [--keep-runtime-on-fail] [--haiku] [--synthetic-stream] [--rootfs-url URL] [--haiku-query QUERY] [--synthetic-bundle-mb N]"
             exit 1
             ;;
     esac
@@ -112,6 +122,22 @@ if [[ "$RUN_HAIKU" == "1" ]]; then
     ); then
         if [[ "$runtime_swapped" == "1" && "$KEEP_RUNTIME_ON_FAIL" == "0" ]]; then
             echo "[build-and-test] Haiku test failed; restoring bundled runtime artifacts"
+            restore_bundle_artifacts
+        fi
+        exit 1
+    fi
+fi
+
+if [[ "$RUN_SYNTH_STREAM" == "1" ]]; then
+    echo "[build-and-test] Running synthetic streaming workload"
+    if ! (
+        cd "$PROJECT_DIR"
+        FRISCY_TEST_ROOTFS_URL="$ROOTFS_URL" \
+        FRISCY_TEST_SYNTH_BUNDLE_MB="$SYNTH_BUNDLE_MB" \
+        node --experimental-default-type=module ./tests/test_synthetic_streaming_workload.js
+    ); then
+        if [[ "$runtime_swapped" == "1" && "$KEEP_RUNTIME_ON_FAIL" == "0" ]]; then
+            echo "[build-and-test] Synthetic stream test failed; restoring bundled runtime artifacts"
             restore_bundle_artifacts
         fi
         exit 1

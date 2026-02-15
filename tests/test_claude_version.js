@@ -66,6 +66,8 @@ async function main() {
     let instructionCount = null;
     let guestExitCode = null;
     let foundAtMs = null;
+    let completionMs = null;
+    let finalJitStats = null;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -220,6 +222,12 @@ async function main() {
             const term = document.querySelector('.xterm-rows');
             return term ? term.textContent : 'NO XTERM';
         });
+        try {
+            finalJitStats = await page.evaluate(() => window.__friscyJitStats || null);
+        } catch {
+            finalJitStats = null;
+        }
+        completionMs = Date.now();
 
         console.log('\n=== TERMINAL CONTENT (head) ===');
         console.log(termData.slice(0, 1200));
@@ -242,8 +250,18 @@ async function main() {
         console.log(`[METRIC] instructions=${instructionCount ?? -1}`);
         console.log(`[METRIC] jit_compiler_loaded=${jitCompilerLoaded ? 1 : 0}`);
         console.log(`[METRIC] jit_regions_compiled=${jitRegionsCompiled}`);
-        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-        console.log(`Total time: ${elapsed}s`);
+        const firstOutputSeconds = foundAtMs ? ((foundAtMs - start) / 1000) : -1;
+        const completionSeconds = completionMs ? ((completionMs - start) / 1000) : ((Date.now() - start) / 1000);
+        console.log(`[METRIC] first_output_s=${firstOutputSeconds.toFixed(3)}`);
+        console.log(`[METRIC] completion_s=${completionSeconds.toFixed(3)}`);
+        console.log(`[METRIC] misses_before_steady_state=${finalJitStats?.missesBeforeSteady ?? -1}`);
+        console.log(`[METRIC] predictor_hit_rate=${Number.isFinite(finalJitStats?.predictorHitRate) ? finalJitStats.predictorHitRate.toFixed(6) : '-1'}`);
+        console.log(`[METRIC] miss_rate=${Number.isFinite(finalJitStats?.missRate) ? finalJitStats.missRate.toFixed(6) : '-1'}`);
+        console.log(`[METRIC] queue_peak=${finalJitStats?.compileQueuePeak ?? -1}`);
+        console.log(`[METRIC] queue_depth_end=${finalJitStats?.queueDepth ?? -1}`);
+        console.log(`[METRIC] markov_predictions_accepted=${finalJitStats?.markovPredictionsAccepted ?? -1}`);
+        console.log(`[METRIC] markov_predictions_evaluated=${finalJitStats?.markovPredictionsEvaluated ?? -1}`);
+        console.log(`Total time: ${completionSeconds.toFixed(1)}s`);
 
         if (!pass) {
             if (!matchedVersion) console.log('[FAIL] missing semantic Claude version line');

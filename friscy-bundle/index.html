@@ -34,6 +34,37 @@
         .net-status.connected { background: #1a4d2e; color: #98c379; }
         .net-status.disconnected { background: #4d1a1a; color: #e06c75; }
         .net-status.connecting { background: #4d3d1a; color: #e5c07b; }
+        #jit-warmup-hud {
+            position: fixed;
+            right: 12px;
+            bottom: 12px;
+            min-width: 196px;
+            padding: 0.55rem 0.65rem;
+            border: 1px solid rgba(249, 168, 212, 0.25);
+            background: rgba(13, 17, 23, 0.88);
+            color: #c9d1d9;
+            border-radius: 8px;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-size: 0.68rem;
+            line-height: 1.45;
+            z-index: 30;
+            display: none;
+            backdrop-filter: blur(5px);
+            pointer-events: none;
+        }
+        #jit-warmup-hud.visible { display: block; }
+        #jit-warmup-hud .hud-title {
+            color: #f9a8d4;
+            margin-bottom: 0.22rem;
+            letter-spacing: 0.02em;
+        }
+        #jit-warmup-hud .hud-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+        #jit-warmup-hud .hud-row .key { color: #8b949e; }
+        #jit-warmup-hud .hud-row .val { color: #e6edf3; font-variant-numeric: tabular-nums; }
         #terminal-container {
             flex: 1;
             padding: 1rem;
@@ -248,6 +279,12 @@
             .import-input-wrapper { width: 95%; }
             .import-title { font-size: 0.95rem; }
             .import-input { font-size: 0.85rem; padding: 8px 10px; }
+            #jit-warmup-hud {
+                right: 8px;
+                bottom: 8px;
+                min-width: 176px;
+                font-size: 0.64rem;
+            }
         }
         @media (max-width: 480px) {
             header { padding: 0.4rem 0.5rem; }
@@ -257,6 +294,7 @@
             .tab { padding: 4px 6px; font-size: 0.65rem; }
             .tab-icon { width: 12px; height: 12px; }
             #terminal-container { padding: 0.25rem; }
+            #jit-warmup-hud { min-width: 165px; font-size: 0.61rem; }
         }
         /* IME-aware: when virtual keyboard is visible, shrink terminal */
         @media (max-height: 450px) {
@@ -349,6 +387,13 @@
             <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
         </div>
     </header>
+    <div id="jit-warmup-hud" aria-live="polite">
+        <div class="hud-title">JIT Warmup</div>
+        <div class="hud-row"><span class="key">compiled</span><span class="val" id="jit-hud-compiled">0</span></div>
+        <div class="hud-row"><span class="key">queue</span><span class="val" id="jit-hud-queue">0</span></div>
+        <div class="hud-row"><span class="key">miss rate</span><span class="val" id="jit-hud-miss">0.0%</span></div>
+        <div class="hud-row"><span class="key">predict hit</span><span class="val" id="jit-hud-predict">0.0%</span></div>
+    </div>
     <div class="tab-bar">
         <button class="tab active" id="tab-alpine" data-example="alpine" title="Alpine Linux shell">
             <img src="./alpine-icon.svg" alt="" class="tab-icon">Alpine
@@ -452,6 +497,97 @@
 
         // Expose for testing (Puppeteer)
         window._friscyStdinQueue = stdinQueue;
+        window.__friscyJitStats = null;
+
+        const jitWarmupHudEl = document.getElementById('jit-warmup-hud');
+        const jitHudCompiledEl = document.getElementById('jit-hud-compiled');
+        const jitHudQueueEl = document.getElementById('jit-hud-queue');
+        const jitHudMissEl = document.getElementById('jit-hud-miss');
+        const jitHudPredictEl = document.getElementById('jit-hud-predict');
+        let jitHudEnabled = true;
+        let latestJitStats = null;
+
+        function formatPercent(value) {
+            if (!Number.isFinite(value)) return '0.0%';
+            return `${(value * 100).toFixed(1)}%`;
+        }
+
+        function updateJitWarmupHud(stats) {
+            if (!jitWarmupHudEl) return;
+            if (!jitHudEnabled || !stats) {
+                jitWarmupHudEl.classList.remove('visible');
+                return;
+            }
+            const compiled = Number.isFinite(stats.compiledRegionCount) ? stats.compiledRegionCount : 0;
+            const queueDepth = Number.isFinite(stats.queueDepth) ? stats.queueDepth : 0;
+            const missRate = Number.isFinite(stats.missRate)
+                ? stats.missRate
+                : (Number.isFinite(stats.regionMisses) && Number.isFinite(stats.dispatchCalls) && stats.dispatchCalls > 0
+                    ? stats.regionMisses / stats.dispatchCalls
+                    : 0);
+            const predictorHitRate = Number.isFinite(stats.predictorHitRate) ? stats.predictorHitRate : 0;
+            jitHudCompiledEl.textContent = String(compiled);
+            jitHudQueueEl.textContent = String(queueDepth);
+            jitHudMissEl.textContent = formatPercent(missRate);
+            jitHudPredictEl.textContent = formatPercent(predictorHitRate);
+            jitWarmupHudEl.classList.add('visible');
+        }
+
+        function handleWorkerRuntimeMessage(e) {
+            const msg = e && e.data ? e.data : null;
+            if (!msg || typeof msg !== 'object') return;
+            if (msg.type === 'error') {
+                console.error('[main] Worker runtime error:', msg.message);
+                statusEl.textContent = `Error: ${msg.message}`;
+                return;
+            }
+            if (msg.type === 'jit_stats') {
+                latestJitStats = msg.stats || null;
+                window.__friscyJitStats = latestJitStats;
+                updateJitWarmupHud(latestJitStats);
+            }
+        }
+
+        function installWorkerRuntimeHandler() {
+            if (worker) {
+                worker.onmessage = handleWorkerRuntimeMessage;
+            }
+        }
+
+        function readJitRuntimeConfig(params) {
+            const parseIntParam = (name) => {
+                const raw = params.get(name);
+                if (raw === null) return null;
+                const value = Number.parseInt(raw, 10);
+                return Number.isFinite(value) ? value : null;
+            };
+            const parseFloatParam = (name) => {
+                const raw = params.get(name);
+                if (raw === null) return null;
+                const value = Number.parseFloat(raw);
+                return Number.isFinite(value) ? value : null;
+            };
+
+            const noPredict = params.has('nojitpredict');
+            const cfg = {
+                enableJit: !params.has('nojit'),
+                jitHotThreshold: parseIntParam('jithot'),
+                jitTierEnabled: !params.has('nojittier'),
+                jitOptimizeThreshold: parseIntParam('jitopt'),
+                jitTraceEnabled: !params.has('nojittrace') && !noPredict,
+                jitEdgeHotThreshold: parseIntParam('jitedgehot'),
+                jitTraceTripletHotThreshold: parseIntParam('jittrace3hot'),
+                jitSchedulerBudget: parseFloatParam('jitbudget'),
+                jitSchedulerConcurrency: parseIntParam('jitconcurrency'),
+                jitSchedulerQueueMax: parseIntParam('jitqmax'),
+                jitPredictTopK: parseIntParam('jitpredk'),
+                jitPredictConfidence: parseFloatParam('jitpredconf'),
+                jitMarkovEnabled: !params.has('nojitmarkov') && !noPredict,
+                jitTripletEnabled: !params.has('nojittriplet') && !noPredict,
+                jitHudEnabled: !params.has('nojithud'),
+            };
+            return cfg;
+        }
 
         function updateNetStatus(state) {
             netStatusEl.className = 'net-status ' + state;
@@ -1166,25 +1302,11 @@
             });
 
             const params = new URLSearchParams(location.search);
-            const enableJit = !params.has('nojit');
-            const jitHotThresholdRaw = params.get('jithot');
-            const jitHotThreshold = jitHotThresholdRaw !== null
-                ? Number.parseInt(jitHotThresholdRaw, 10)
-                : null;
-            const jitTierEnabled = !params.has('nojittier');
-            const jitOptimizeThresholdRaw = params.get('jitopt');
-            const jitOptimizeThreshold = jitOptimizeThresholdRaw !== null
-                ? Number.parseInt(jitOptimizeThresholdRaw, 10)
-                : null;
-            const jitTraceEnabled = !params.has('nojittrace');
-            const jitEdgeHotThresholdRaw = params.get('jitedgehot');
-            const jitEdgeHotThreshold = jitEdgeHotThresholdRaw !== null
-                ? Number.parseInt(jitEdgeHotThresholdRaw, 10)
-                : null;
-            const jitTraceTripletHotThresholdRaw = params.get('jittrace3hot');
-            const jitTraceTripletHotThreshold = jitTraceTripletHotThresholdRaw !== null
-                ? Number.parseInt(jitTraceTripletHotThresholdRaw, 10)
-                : null;
+            const jitCfg = readJitRuntimeConfig(params);
+            jitHudEnabled = jitCfg.jitHudEnabled;
+            if (!jitHudEnabled && jitWarmupHudEl) {
+                jitWarmupHudEl.classList.remove('visible');
+            }
 
             // Send init message with SABs
             worker.postMessage({
@@ -1192,18 +1314,24 @@
                 controlSab,
                 stdoutSab,
                 netSab,
-                enableJit,
-                jitHotThreshold: Number.isFinite(jitHotThreshold) ? jitHotThreshold : null,
-                jitTierEnabled,
-                jitOptimizeThreshold: Number.isFinite(jitOptimizeThreshold) ? jitOptimizeThreshold : null,
-                jitTraceEnabled,
-                jitEdgeHotThreshold: Number.isFinite(jitEdgeHotThreshold) ? jitEdgeHotThreshold : null,
-                jitTraceTripletHotThreshold: Number.isFinite(jitTraceTripletHotThreshold)
-                    ? jitTraceTripletHotThreshold
-                    : null,
+                enableJit: jitCfg.enableJit,
+                jitHotThreshold: jitCfg.jitHotThreshold,
+                jitTierEnabled: jitCfg.jitTierEnabled,
+                jitOptimizeThreshold: jitCfg.jitOptimizeThreshold,
+                jitTraceEnabled: jitCfg.jitTraceEnabled,
+                jitEdgeHotThreshold: jitCfg.jitEdgeHotThreshold,
+                jitTraceTripletHotThreshold: jitCfg.jitTraceTripletHotThreshold,
+                jitSchedulerBudget: jitCfg.jitSchedulerBudget,
+                jitSchedulerConcurrency: jitCfg.jitSchedulerConcurrency,
+                jitSchedulerQueueMax: jitCfg.jitSchedulerQueueMax,
+                jitPredictTopK: jitCfg.jitPredictTopK,
+                jitPredictConfidence: jitCfg.jitPredictConfidence,
+                jitMarkovEnabled: jitCfg.jitMarkovEnabled,
+                jitTripletEnabled: jitCfg.jitTripletEnabled,
             });
 
             await workerReady;
+            installWorkerRuntimeHandler();
 
             // Connect network bridge (optional — needs proxy server)
             // Priority: ?noproxy disables > ?proxy= param > localhost > default public proxy
@@ -1645,8 +1773,34 @@
                 worker.onmessage = onMsg;
                 worker.onerror = (e) => reject(new Error(`Worker failed: ${e.message || 'unknown'}`));
             });
-            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            const initParams = new URLSearchParams(location.search);
+            const jitCfg = readJitRuntimeConfig(initParams);
+            jitHudEnabled = jitCfg.jitHudEnabled;
+            if (!jitHudEnabled && jitWarmupHudEl) {
+                jitWarmupHudEl.classList.remove('visible');
+            }
+            worker.postMessage({
+                type: 'init',
+                controlSab,
+                stdoutSab,
+                netSab,
+                enableJit: jitCfg.enableJit,
+                jitHotThreshold: jitCfg.jitHotThreshold,
+                jitTierEnabled: jitCfg.jitTierEnabled,
+                jitOptimizeThreshold: jitCfg.jitOptimizeThreshold,
+                jitTraceEnabled: jitCfg.jitTraceEnabled,
+                jitEdgeHotThreshold: jitCfg.jitEdgeHotThreshold,
+                jitTraceTripletHotThreshold: jitCfg.jitTraceTripletHotThreshold,
+                jitSchedulerBudget: jitCfg.jitSchedulerBudget,
+                jitSchedulerConcurrency: jitCfg.jitSchedulerConcurrency,
+                jitSchedulerQueueMax: jitCfg.jitSchedulerQueueMax,
+                jitPredictTopK: jitCfg.jitPredictTopK,
+                jitPredictConfidence: jitCfg.jitPredictConfidence,
+                jitMarkovEnabled: jitCfg.jitMarkovEnabled,
+                jitTripletEnabled: jitCfg.jitTripletEnabled,
+            });
             await workerReady;
+            installWorkerRuntimeHandler();
 
             // Connect network
             const DEFAULT_PROXY = 'https://78.141.219.102:4433/connect';

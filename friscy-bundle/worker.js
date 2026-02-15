@@ -13,8 +13,22 @@
 console.log('[worker] Module loading...');
 
 // JIT manager — loaded lazily inside init
-let jitManager = { jitCompiler: null, init() {}, loadCompiler() { return Promise.resolve(); }, execute() { return null; }, recordExecution() {} };
+let jitManager = {
+    jitCompiler: null,
+    init() {},
+    loadCompiler() { return Promise.resolve(); },
+    execute() { return null; },
+    recordExecution() {},
+    recordTraceTransition() {},
+    configureTiering() {},
+    configureScheduler() {},
+    configurePredictor() {},
+    configureTrace() {},
+    getStats() { return null; },
+};
 let installInvalidationHook = () => {};
+let lastJitStatsPostMs = 0;
+const JIT_STATS_POST_INTERVAL_MS = 250;
 
 // Control SAB layout (4KB):
 //   [0]   i32: command   (0=idle, 1=stdout, 2=stdin_request, 3=stdin_ready,
@@ -220,6 +234,21 @@ function signalExit(exitCode) {
     Atomics.notify(controlView, 0);
 }
 
+function maybePostJitStats(force = false) {
+    if (!jitManager || typeof jitManager.getStats !== 'function') return;
+    const now = Date.now();
+    if (!force && now - lastJitStatsPostMs < JIT_STATS_POST_INTERVAL_MS) return;
+    lastJitStatsPostMs = now;
+    try {
+        const stats = jitManager.getStats();
+        if (stats) {
+            self.postMessage({ type: 'jit_stats', stats, ts: now });
+        }
+    } catch (e) {
+        // Non-fatal telemetry path.
+    }
+}
+
 /**
  * Run the resume loop: call friscy_resume() while machine is stopped for stdin.
  * Between each resume, block on Atomics.wait() for the main thread to provide stdin.
@@ -235,6 +264,7 @@ function runResumeLoop() {
     while (friscy_stopped()) {
         // Request stdin from main thread (blocks until data arrives)
         const stdinData = requestStdin(4096);
+        maybePostJitStats();
 
         // Push received bytes into the Module's stdin buffer
         if (stdinData.length > 0) {
@@ -243,26 +273,55 @@ function runResumeLoop() {
             }
         }
 
-        // Try JIT execution before falling back to interpreter
-        let jitHandled = false;
+        // Try JIT execution before falling back to interpreter.
+        // The JIT run() function chains blocks inside Wasm and returns only on:
+        //   - halt
+        //   - syscall
+        //   - region miss (PC not compiled in this region)
         if (jitManager.jitCompiler) {
-            const pc = friscy_get_pc();
-            const jitResult = jitManager.execute(pc, friscy_get_state_ptr());
-            if (jitResult) {
-                jitHandled = true;
-                if (jitResult.isHalt) return;
-                if (jitResult.isSyscall) {
-                    friscy_set_pc(jitResult.nextPC & 0x7FFFFFFF);
-                } else {
-                    friscy_set_pc(jitResult.nextPC);
+            let pc = friscy_get_pc() >>> 0;
+            const statePtr = friscy_get_state_ptr();
+            const MAX_CHAIN = 32;
+            let chainCount = 0;
+
+            while (chainCount < MAX_CHAIN) {
+                const jitResult = jitManager.execute(pc, statePtr);
+                if (!jitResult) {
+                    // No compiled region for this PC. Keep interpreter PC aligned
+                    // with the latest miss target before falling back.
+                    jitManager.recordExecution(pc);
+                    friscy_set_pc(pc);
+                    break;
                 }
-            } else {
-                jitManager.recordExecution(pc);
+
+                if (jitResult.isHalt) return;
+
+                if (jitResult.isSyscall) {
+                    friscy_set_pc(jitResult.nextPC >>> 0);
+                    break;
+                }
+
+                if (jitResult.regionMiss) {
+                    jitManager.recordTraceTransition(pc, jitResult.nextPC >>> 0);
+                    pc = jitResult.nextPC >>> 0;
+                    chainCount++;
+                    continue;
+                }
+
+                // Defensive fallback: unexpected plain return.
+                friscy_set_pc(jitResult.nextPC >>> 0);
+                break;
+            }
+
+            // Avoid getting stuck in pathological miss cycles.
+            if (chainCount >= MAX_CHAIN) {
+                friscy_set_pc(pc >>> 0);
             }
         }
 
         // Resume interpreter
         const stillStopped = friscy_resume();
+        maybePostJitStats();
         if (!stillStopped) {
             // Machine finished (guest called exit)
             return;
@@ -290,6 +349,27 @@ self.onmessage = async function(e) {
         const controlSab = msg.controlSab;
         const stdoutSab = msg.stdoutSab;
         const netSab = msg.netSab;
+        const enableJit = msg.enableJit !== false;
+        const jitHotThreshold = Number.isFinite(msg.jitHotThreshold) ? msg.jitHotThreshold : null;
+        const jitTierEnabled = msg.jitTierEnabled !== false;
+        const jitOptimizeThreshold = Number.isFinite(msg.jitOptimizeThreshold) ? msg.jitOptimizeThreshold : null;
+        const jitSchedulerBudget = Number.isFinite(msg.jitSchedulerBudget) ? msg.jitSchedulerBudget : null;
+        const jitSchedulerConcurrency = Number.isFinite(msg.jitSchedulerConcurrency)
+            ? msg.jitSchedulerConcurrency
+            : null;
+        const jitSchedulerQueueMax = Number.isFinite(msg.jitSchedulerQueueMax)
+            ? msg.jitSchedulerQueueMax
+            : null;
+        const jitPredictTopK = Number.isFinite(msg.jitPredictTopK) ? msg.jitPredictTopK : null;
+        const jitPredictConfidence = Number.isFinite(msg.jitPredictConfidence) ? msg.jitPredictConfidence : null;
+        const jitMarkovEnabled = msg.jitMarkovEnabled !== false;
+        const jitTripletEnabled = msg.jitTripletEnabled !== false;
+        const jitAwaitCompiler = msg.jitAwaitCompiler === true;
+        const jitTraceEnabled = msg.jitTraceEnabled !== false;
+        const jitEdgeHotThreshold = Number.isFinite(msg.jitEdgeHotThreshold) ? msg.jitEdgeHotThreshold : null;
+        const jitTraceTripletHotThreshold = Number.isFinite(msg.jitTraceTripletHotThreshold)
+            ? msg.jitTraceTripletHotThreshold
+            : null;
 
         controlView = new Int32Array(controlSab);
         controlBytes = new Uint8Array(controlSab);
@@ -356,27 +436,76 @@ self.onmessage = async function(e) {
             },
         });
 
-        // Load JIT manager (non-critical)
-        try {
-            const jitMod = await import('./jit_manager.js');
-            jitManager = jitMod.default;
-            installInvalidationHook = jitMod.installInvalidationHook;
-            console.log('[worker] JIT manager loaded');
-        } catch (e) {
-            console.warn('[worker] JIT manager not available:', e.message);
-        }
+        if (enableJit) {
+            // Load JIT manager (non-critical)
+            try {
+                const jitMod = await import('./jit_manager.js');
+                jitManager = jitMod.default;
+                installInvalidationHook = jitMod.installInvalidationHook;
+                if (jitHotThreshold !== null && jitHotThreshold > 0) {
+                    jitManager.hotThreshold = jitHotThreshold;
+                }
+                jitManager.configureTiering({
+                    enabled: jitTierEnabled,
+                    optimizeThreshold: jitOptimizeThreshold,
+                });
+                jitManager.configureScheduler({
+                    compileBudgetPerSecond: jitSchedulerBudget,
+                    maxConcurrentCompiles: jitSchedulerConcurrency,
+                    compileQueueMax: jitSchedulerQueueMax,
+                    predictorTopK: jitPredictTopK,
+                    predictorBaseConfidenceThreshold: jitPredictConfidence,
+                });
+                jitManager.configurePredictor({
+                    markovEnabled: jitMarkovEnabled,
+                    tripletEnabled: jitTripletEnabled,
+                });
+                jitManager.configureTrace({
+                    enabled: jitTraceEnabled,
+                    edgeHotThreshold: jitEdgeHotThreshold,
+                    tripletHotThreshold: jitTraceTripletHotThreshold,
+                });
+                console.log(
+                    `[worker] JIT manager loaded ` +
+                    `(hotThreshold=${jitManager.hotThreshold ?? 'default'}, ` +
+                    `tiering=${jitManager.tieringEnabled ? 'on' : 'off'}, ` +
+                    `optHot=${jitManager.optimizeThreshold ?? 'default'}, ` +
+                    `budget=${jitManager.compileBudgetPerSecond ?? 'default'}, ` +
+                    `qmax=${jitManager.compileQueueMax ?? 'default'}, ` +
+                    `markov=${jitManager.markovEnabled ? 'on' : 'off'}, ` +
+                    `topK=${jitManager.predictorTopK ?? 'default'}, ` +
+                    `pconf=${jitManager.predictorBaseConfidenceThreshold ?? 'default'}, ` +
+                    `trace=${jitManager.traceEnabled ? 'on' : 'off'}, ` +
+                    `triplet=${jitManager.tripletEnabled ? 'on' : 'off'}, ` +
+                    `edgeHot=${jitManager.traceEdgeHotThreshold ?? 'default'}, ` +
+                    `tripletHot=${jitManager.traceTripletHotThreshold ?? 'default'})`
+                );
+            } catch (e) {
+                console.warn('[worker] JIT manager not available:', e.message);
+            }
 
-        // Install JIT invalidation hook on Module
-        installInvalidationHook(emModule);
+            // Install JIT invalidation hook on Module
+            installInvalidationHook(emModule);
 
-        // Initialize JIT manager with the Wasm memory
-        const wasmMemory = emModule.wasmMemory || (emModule.asm && emModule.asm.memory);
-        if (wasmMemory) {
-            jitManager.init(wasmMemory);
-            // Load JIT compiler (async, non-blocking)
-            jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
-                console.warn('[worker] JIT compiler not available:', e.message);
-            });
+            // Initialize JIT manager with the Wasm memory
+            const wasmMemory = emModule.wasmMemory || (emModule.asm && emModule.asm.memory);
+            if (wasmMemory) {
+                jitManager.init(wasmMemory);
+                if (jitAwaitCompiler) {
+                    try {
+                        await jitManager.loadCompiler('rv2wasm_jit_bg.wasm');
+                    } catch (e) {
+                        console.warn('[worker] JIT compiler wait failed:', e.message);
+                    }
+                } else {
+                    // Load JIT compiler (async, non-blocking)
+                    jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
+                        console.warn('[worker] JIT compiler not available:', e.message);
+                    });
+                }
+            }
+        } else {
+            console.log('[worker] JIT disabled via configuration');
         }
 
         // Install network callbacks that route through SAB RPC
@@ -458,9 +587,11 @@ self.onmessage = async function(e) {
             }
 
             // Machine finished — signal exit
+            maybePostJitStats(true);
             signalExit(0);
         } catch (e) {
             writeStdoutRing(encoder.encode(`\r\n[worker] Error: ${e.message}\r\n`));
+            maybePostJitStats(true);
             signalExit(1);
         }
     }

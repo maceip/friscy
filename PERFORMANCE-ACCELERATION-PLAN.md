@@ -16,6 +16,180 @@ wrong results).
 | **1** | Peephole optimization | `aot/src/translate.rs` | 10-20% code size, 5-15% runtime | Very low |
 | **2** | Wasm-internal JIT dispatch | `aot/src/wasm_builder.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js` | 5-50x JIT throughput | Low |
 | **3** | Register caching in locals | `aot/src/translate.rs` | 15-30% fewer Wasm instructions | Medium |
+| **4** | Trace-driven region prefetch | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Fewer region-miss fallbacks on hot cross-region paths | Low |
+| **5** | Two-tier JIT promotion (fast -> optimized) | `aot/src/translate.rs`, `aot-jit/src/lib.rs`, `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Faster first-compile with hotter-region quality recovery | Medium |
+| **6** | Trace-sequence prediction (A->B->C) | `friscy-bundle/jit_manager.js`, `friscy-bundle/worker.js`, `friscy-bundle/index.html` | Better precompile precision on repeated multi-region paths | Low |
+
+---
+
+## Phase 4: Trace-Driven Region Prefetch (Incremental Medium-Phase Work)
+
+### 4.1 Problem Statement
+
+The current JIT compiles regions strictly by page hit count. This misses an
+important signal: during JIT `run()` chaining we already observe cross-region
+transfer edges (`region miss` from one compiled region to another PC). Repeated
+edges indicate a hot path spanning multiple regions.
+
+### 4.2 Implementation Summary
+
+- Added a trace edge table in `jit_manager.js` keyed by
+  `from_region -> to_region`.
+- On repeated hot edges (`traceEdgeHotThreshold`, default `8`), the manager
+  proactively compiles the target region (if not already compiled/in-flight).
+- Worker now records region-miss transitions via
+  `jitManager.recordTraceTransition(fromPc, toPc)`.
+- Browser query controls:
+  - `?nojittrace` disables trace-driven prefetch.
+  - `?jitedgehot=N` sets hot-edge compile threshold.
+
+### 4.3 Required Verification Proof
+
+Keep the Claude proof workload as the phase gate:
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+---
+
+## Phase 5: Two-Tier JIT Promotion (Fast Baseline -> Optimized Recompile)
+
+### 5.1 Problem Statement
+
+A single JIT tier forces a tradeoff: either compile quickly with minimal
+optimization, or compile slower with better code quality. Hot code needs both:
+fast first hit and stronger optimization once it proves hot.
+
+### 5.2 Implementation Summary
+
+- Added fast JIT translation path in `aot/src/translate.rs`:
+  - `translate_jit_fast(...)` (skips optimization pass)
+  - `translate_jit_with_options(...)` for explicit mode selection.
+- Added wasm-bindgen exports in `aot-jit/src/lib.rs`:
+  - `compile_region_fast(...)`
+  - `compile_region_optimized(...)`
+  - existing `compile_region(...)` kept as optimized compatibility entry.
+- Updated `jit_manager.js` to:
+  - compile baseline regions with fast tier,
+  - track per-region hit counts,
+  - promote baseline regions to optimized tier at `optimizeThreshold`,
+  - preserve optimized regions from downgrade.
+- Added runtime controls:
+  - `?nojittier` disables promotion,
+  - `?jitopt=N` sets promotion threshold.
+
+### 5.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+---
+
+## Phase 6: Trace-Sequence Prediction (Second-Order Hot Paths)
+
+### 6.1 Problem Statement
+
+Single-edge prefetch (`A -> B`) can still over-compile on branchy code. Repeated
+multi-region sequences (`A -> B -> C`) are a stronger signal for what to compile
+next.
+
+### 6.2 Implementation Summary
+
+- Added compile scheduler in `jit_manager.js`:
+  - priority queue with bounded depth (`compileQueueMax`),
+  - compile token budget per second (`compileBudgetPerSecond`),
+  - task priority based on `confidence * missCost`.
+- Upgraded predictor to weighted Markov:
+  - first-order transitions (`A -> B`) + second-order contexts (`A:B -> C`),
+  - predicts top-`K` likely next regions (default 2) when confidence exceeds threshold,
+  - keeps probabilities (transition totals), not just raw edge counts.
+- Added adaptive thresholds:
+  - lowers confidence/hot thresholds when region miss rate is high,
+  - raises thresholds when compile queue pressure is high.
+- Added failure cooldown + stale pruning:
+  - failed regions get exponential compile backoff,
+  - invalidation prunes queued tasks and trace/Markov entries touching dirty regions.
+- Added UX telemetry:
+  - browser "JIT Warmup" HUD (compiled regions, queue depth, miss rate, predictor hit rate),
+  - worker periodically posts JIT stats to main thread for debugging and benchmarks.
+- Added runtime controls:
+  - `?jittrace3hot=N` triplet hot threshold,
+  - `?nojitmarkov` disables Markov predictor,
+  - `?nojittriplet` disables triplet predictor,
+  - `?jitawait` waits for JIT compiler load before guest run (benchmark mode),
+  - `?jitbudget=N` compile budget per second,
+  - `?jitqmax=N` compile queue bound,
+  - `?jitpredk=N` Markov top-K width,
+  - `?jitpredconf=X` predictor base confidence threshold,
+  - `?nojithud` disables warmup HUD.
+
+### 6.3 Required Verification Proof
+
+```bash
+FRISCY_TEST_ROOTFS_URL=./nodejs-claude.tar \
+node --experimental-default-type=module ./tests/test_claude_version.js
+```
+
+Pass criteria:
+- semantic Claude version present,
+- guest exit code `0`,
+- no runtime/module errors.
+
+Comparative latency benchmark:
+
+```bash
+bash ./tests/bench_browser_claude_predictor_modes.sh --runs 3
+```
+
+This compares:
+- no predictor (`nojittrace`),
+- edge-only predictor,
+- edge + triplet + Markov predictor,
+
+and records:
+- first output latency,
+- completion latency,
+- misses before steady-state.
+
+---
+
+## Baseline Definition (Required for all phases)
+
+All optimization claims must be measured against these two baseline workloads:
+
+1. **Node.js baseline**: guest Node.js boot/execution (e.g. `node -e ...`)
+2. **Node.js + Claude baseline**: `claude --version` with a Claude package JS
+   payload present in the rootfs (with **~60 MiB** as a recommended size,
+   not a hard requirement).
+   Accepted acquisition paths:
+   - npm package (`@anthropic-ai/claude-code` JS/MJS payload), or
+   - Claude installer bundle (from `curl -fsSL https://claude.ai/install.sh | bash`)
+
+The smoke scripts enforce this with rootfs preflight checks:
+
+```bash
+bash ./tests/smoke_phase1_peephole.sh
+bash ./tests/smoke_phase2_jit_dispatch.sh
+```
+
+If `/usr/bin/node`, `/usr/bin/claude`, or Claude payload files are missing,
+smoke should fail fast and the benchmark baseline is considered invalid.
+If payload size is below the 60 MiB recommendation, smoke warns by default and
+only fails when `CLAUDE_PAYLOAD_STRICT=1` is set.
 
 ---
 
@@ -231,6 +405,19 @@ fn test_constant_folding() {
 }
 ```
 
+#### Browser Smoke (Node.js + Claude)
+
+Phase 1 rollout requires a browser-level smoke run to ensure we still boot real
+workloads that exercise the hot translation paths:
+
+```bash
+# Full smoke: Node.js boot + claude --version
+bash ./tests/smoke_phase1_peephole.sh
+
+# Quicker local loop (Node.js only)
+bash ./tests/smoke_phase1_peephole.sh --skip-claude
+```
+
 #### Cheater-Detection: Deterministic Output Programs
 
 These programs have specific, computable correct answers. If an optimization
@@ -412,6 +599,22 @@ Use the existing fRISCy browser shell to time a known workload:
 time busybox sha256sum /dev/urandom | head -c 1048576
 # Compare wall-clock time before/after optimization
 ```
+
+For repeatable Puppeteer-based tracking (same command every run), use:
+
+```bash
+# 5 browser runs, writes tests/perf/browser_node42.latest.json
+bash ./tests/bench_browser_node42.sh --runs 5
+
+# Capture a baseline snapshot for future regression deltas
+bash ./tests/bench_browser_node42.sh --runs 7 --write-baseline
+```
+
+This benchmark runs inside the browser emulator and records:
+- wall-clock elapsed time (`median`, `p95`, `min`, `max`)
+- emulator instruction counts (`median`, `p95`, `min`, `max`)
+
+`latest.json` includes % deltas vs the saved baseline file to show gains/losses.
 
 ---
 
@@ -683,6 +886,16 @@ function runResumeLoop() {
 ```
 
 ### 2.3 Testing Phase 2
+
+#### Browser Smoke (Node.js + Claude)
+
+```bash
+# Full smoke: Node.js + Claude plus JIT compilation log check
+bash ./tests/smoke_phase2_jit_dispatch.sh
+
+# Faster local loop: Node.js only
+bash ./tests/smoke_phase2_jit_dispatch.sh --skip-claude
+```
 
 #### Correctness: Single-block equivalence
 

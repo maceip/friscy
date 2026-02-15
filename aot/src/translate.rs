@@ -7,6 +7,7 @@ use crate::cfg::{BasicBlock, ControlFlowGraph};
 use crate::disasm::{Instruction, Opcode};
 use crate::elf::ElfInfo;
 use anyhow::Result;
+use std::collections::HashMap;
 
 /// A generated Wasm module (intermediate representation)
 #[derive(Debug)]
@@ -2451,6 +2452,15 @@ pub fn translate_jit(
     cfg: &ControlFlowGraph,
     base_addr: u64,
 ) -> Result<WasmModule> {
+    translate_jit_with_options(cfg, base_addr, true)
+}
+
+/// Translate CFG to Wasm module for JIT mode with optional optimization pass.
+pub fn translate_jit_with_options(
+    cfg: &ControlFlowGraph,
+    base_addr: u64,
+    optimize: bool,
+) -> Result<WasmModule> {
     let mut functions = Vec::new();
     let mut block_to_func = std::collections::HashMap::new();
     let block_addrs: Vec<u64> = cfg.blocks.keys().copied().collect();
@@ -2461,9 +2471,10 @@ pub fn translate_jit(
         functions.push(func);
     }
 
-    // Optimize
-    for func in &mut functions {
-        optimize_function(func);
+    if optimize {
+        for func in &mut functions {
+            optimize_function(func);
+        }
     }
 
     Ok(WasmModule {
@@ -2474,14 +2485,382 @@ pub fn translate_jit(
     })
 }
 
+/// Fast baseline JIT translation:
+/// skips peephole/register-caching optimization for lower compile latency.
+pub fn translate_jit_fast(
+    cfg: &ControlFlowGraph,
+    base_addr: u64,
+) -> Result<WasmModule> {
+    translate_jit_with_options(cfg, base_addr, false)
+}
+
 /// Basic peephole optimizations
 fn optimize_function(func: &mut WasmFunction) {
-    // Remove consecutive LocalGet of same index
-    // Remove dead stores
-    // etc.
-
-    // For now, just remove Comment instructions in release mode
+    // Always strip debug comments before optimization.
     func.body.retain(|inst| !matches!(inst, WasmInst::Comment { .. }));
+
+    // We currently declare all non-parameter locals as i64 in wasm_builder.rs.
+    // Any new temp introduced here must therefore hold i64 values.
+    let mut next_local = func.num_locals;
+
+    // Run small passes to a fixed point. Individual passes can expose patterns
+    // for later passes (e.g., forwarding can expose extra constant folds).
+    loop {
+        let mut changed = false;
+
+        let (body, forwarded) = forward_i64_store_loads(std::mem::take(&mut func.body), &mut next_local);
+        changed |= forwarded > 0;
+
+        let (body, tee_folds) = fold_local_set_get(body);
+        changed |= tee_folds > 0;
+
+        let (body, reg_cache_folds) = cache_gpr_i64_values(body, &mut next_local);
+        changed |= reg_cache_folds > 0;
+
+        let (body, const_folds) = fold_integer_constants(body);
+        changed |= const_folds > 0;
+
+        func.body = body;
+
+        if !changed {
+            break;
+        }
+    }
+
+    func.num_locals = next_local;
+}
+
+fn forward_i64_store_loads(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<WasmInst>, usize) {
+    fn is_local_get(inst: &WasmInst, idx: u32) -> bool {
+        matches!(inst, WasmInst::LocalGet { idx: i } if *i == idx)
+    }
+
+    fn get_or_alloc_i64_temp(temp_local: &mut Option<u32>, next_local: &mut u32) -> u32 {
+        if let Some(idx) = *temp_local {
+            return idx;
+        }
+        let idx = *next_local;
+        *next_local += 1;
+        *temp_local = Some(idx);
+        idx
+    }
+
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0usize;
+    let mut changes = 0usize;
+    let mut temp_local = None;
+
+    while i < body.len() {
+        if let WasmInst::I64Store { offset: store_offset } = body[i] {
+            // Pattern A:
+            //   i64.store X
+            //   local.get 0
+            //   i64.load X
+            if i + 2 < body.len()
+                && is_local_get(&body[i + 1], 0)
+                && matches!(body[i + 2], WasmInst::I64Load { offset } if offset == store_offset)
+            {
+                let temp = get_or_alloc_i64_temp(&mut temp_local, next_local);
+                out.push(WasmInst::LocalTee { idx: temp });
+                out.push(WasmInst::I64Store { offset: store_offset });
+                out.push(WasmInst::LocalGet { idx: temp });
+                i += 3;
+                changes += 1;
+                continue;
+            }
+
+            // Pattern B (common in translator output):
+            //   i64.store X
+            //   local.get 0
+            //   local.get 0
+            //   i64.load X
+            // Keep the first local.get 0 (address for the following store path),
+            // and forward the reloaded value from a temp.
+            if i + 3 < body.len()
+                && is_local_get(&body[i + 1], 0)
+                && is_local_get(&body[i + 2], 0)
+                && matches!(body[i + 3], WasmInst::I64Load { offset } if offset == store_offset)
+            {
+                let temp = get_or_alloc_i64_temp(&mut temp_local, next_local);
+                out.push(WasmInst::LocalTee { idx: temp });
+                out.push(WasmInst::I64Store { offset: store_offset });
+                out.push(WasmInst::LocalGet { idx: 0 });
+                out.push(WasmInst::LocalGet { idx: temp });
+                i += 4;
+                changes += 1;
+                continue;
+            }
+        }
+
+        out.push(body[i].clone());
+        i += 1;
+    }
+
+    (out, changes)
+}
+
+fn fold_local_set_get(body: Vec<WasmInst>) -> (Vec<WasmInst>, usize) {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0usize;
+    let mut changes = 0usize;
+
+    while i < body.len() {
+        if i + 1 < body.len() {
+            if let (WasmInst::LocalSet { idx: set_idx }, WasmInst::LocalGet { idx: get_idx }) =
+                (&body[i], &body[i + 1])
+            {
+                if set_idx == get_idx {
+                    out.push(WasmInst::LocalTee { idx: *set_idx });
+                    i += 2;
+                    changes += 1;
+                    continue;
+                }
+            }
+        }
+
+        out.push(body[i].clone());
+        i += 1;
+    }
+
+    (out, changes)
+}
+
+fn fold_integer_constants(body: Vec<WasmInst>) -> (Vec<WasmInst>, usize) {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0usize;
+    let mut changes = 0usize;
+
+    while i < body.len() {
+        if i + 2 < body.len() {
+            if let (WasmInst::I64Const { value: a }, WasmInst::I64Const { value: b }) =
+                (&body[i], &body[i + 1])
+            {
+                if let Some(value) = fold_i64_binop(&body[i + 2], *a, *b) {
+                    out.push(WasmInst::I64Const { value });
+                    i += 3;
+                    changes += 1;
+                    continue;
+                }
+            }
+
+            if let (WasmInst::I32Const { value: a }, WasmInst::I32Const { value: b }) =
+                (&body[i], &body[i + 1])
+            {
+                if let Some(value) = fold_i32_binop(&body[i + 2], *a, *b) {
+                    out.push(WasmInst::I32Const { value });
+                    i += 3;
+                    changes += 1;
+                    continue;
+                }
+            }
+        }
+
+        out.push(body[i].clone());
+        i += 1;
+    }
+
+    (out, changes)
+}
+
+fn fold_i64_binop(op: &WasmInst, lhs: i64, rhs: i64) -> Option<i64> {
+    match op {
+        WasmInst::I64Add => Some(lhs.wrapping_add(rhs)),
+        WasmInst::I64Sub => Some(lhs.wrapping_sub(rhs)),
+        WasmInst::I64And => Some(lhs & rhs),
+        WasmInst::I64Or => Some(lhs | rhs),
+        WasmInst::I64Xor => Some(lhs ^ rhs),
+        WasmInst::I64Shl => Some(lhs.wrapping_shl((rhs as u32) & 63)),
+        WasmInst::I64ShrS => Some(lhs >> ((rhs as u32) & 63)),
+        WasmInst::I64ShrU => Some(((lhs as u64) >> ((rhs as u32) & 63)) as i64),
+        _ => None,
+    }
+}
+
+fn fold_i32_binop(op: &WasmInst, lhs: i32, rhs: i32) -> Option<i32> {
+    match op {
+        WasmInst::I32Add => Some(lhs.wrapping_add(rhs)),
+        WasmInst::I32Sub => Some(lhs.wrapping_sub(rhs)),
+        WasmInst::I32And => Some(lhs & rhs),
+        WasmInst::I32Or => Some(lhs | rhs),
+        WasmInst::I32Xor => Some(lhs ^ rhs),
+        WasmInst::I32Shl => Some(lhs.wrapping_shl((rhs as u32) & 31)),
+        WasmInst::I32ShrS => Some(lhs >> ((rhs as u32) & 31)),
+        WasmInst::I32ShrU => Some(((lhs as u32) >> ((rhs as u32) & 31)) as i32),
+        _ => None,
+    }
+}
+
+fn cache_gpr_i64_values(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<WasmInst>, usize) {
+    fn is_local_get(inst: &WasmInst, idx: u32) -> bool {
+        matches!(inst, WasmInst::LocalGet { idx: i } if *i == idx)
+    }
+
+    fn is_cacheable_gpr_offset(offset: u32) -> bool {
+        // x0 uses offset 0 and appears frequently in non-register-memory contexts.
+        // Restrict caching to x1..x31 offsets to avoid accidental overlap with
+        // generic offset=0 memory operations.
+        offset != 0 && offset < (32 * 8) && offset % 8 == 0
+    }
+
+    fn gpr_cache_range_end() -> u32 {
+        32 * 8
+    }
+
+    fn get_or_alloc_local_for_offset(
+        offset_to_local: &mut HashMap<u32, u32>,
+        offset: u32,
+        next_local: &mut u32,
+    ) -> u32 {
+        if let Some(idx) = offset_to_local.get(&offset).copied() {
+            return idx;
+        }
+        let idx = *next_local;
+        *next_local += 1;
+        offset_to_local.insert(offset, idx);
+        idx
+    }
+
+    fn store_offset(inst: &WasmInst) -> Option<u32> {
+        match inst {
+            WasmInst::I32Store { offset }
+            | WasmInst::I64Store { offset }
+            | WasmInst::I32Store8 { offset }
+            | WasmInst::I32Store16 { offset }
+            | WasmInst::I64Store8 { offset }
+            | WasmInst::I64Store16 { offset }
+            | WasmInst::I64Store32 { offset } => Some(*offset),
+            _ => None,
+        }
+    }
+
+    fn store_width_bytes(inst: &WasmInst) -> Option<u32> {
+        match inst {
+            WasmInst::I32Store { .. } => Some(4),
+            WasmInst::I64Store { .. } => Some(8),
+            WasmInst::I32Store8 { .. } | WasmInst::I64Store8 { .. } => Some(1),
+            WasmInst::I32Store16 { .. } | WasmInst::I64Store16 { .. } => Some(2),
+            WasmInst::I64Store32 { .. } => Some(4),
+            _ => None,
+        }
+    }
+
+    fn ranges_overlap(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> bool {
+        let a_end = a_start.saturating_add(a_len);
+        let b_end = b_start.saturating_add(b_len);
+        a_start < b_end && b_start < a_end
+    }
+
+    fn invalidate_overlapping_gpr_caches(
+        offset_to_local: &mut HashMap<u32, u32>,
+        store_off: u32,
+        store_width: u32,
+    ) {
+        let mut remove = Vec::new();
+        for cached_off in offset_to_local.keys().copied() {
+            if ranges_overlap(cached_off, 8, store_off, store_width) {
+                remove.push(cached_off);
+            }
+        }
+        for cached_off in remove {
+            offset_to_local.remove(&cached_off);
+        }
+    }
+
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0usize;
+    let mut changes = 0usize;
+    let mut offset_to_local = HashMap::<u32, u32>::new();
+
+    while i < body.len() {
+        // Rewrite register-file reloads into local.get when cached.
+        // If uncached, seed the cache by teeing the first load.
+        if i + 1 < body.len()
+            && is_local_get(&body[i], 0)
+            && matches!(body[i + 1], WasmInst::I64Load { offset } if is_cacheable_gpr_offset(offset))
+        {
+            if let WasmInst::I64Load { offset } = body[i + 1] {
+                if let Some(local_idx) = offset_to_local.get(&offset).copied() {
+                    if i + 2 < body.len()
+                        && matches!(body[i + 2], WasmInst::LocalTee { idx } if idx == local_idx)
+                    {
+                        out.push(WasmInst::LocalGet { idx: local_idx });
+                        i += 3;
+                        changes += 1;
+                        continue;
+                    }
+
+                    out.push(WasmInst::LocalGet { idx: local_idx });
+                    i += 2;
+                    changes += 1;
+                    continue;
+                }
+
+                if i + 2 < body.len() {
+                    if let WasmInst::LocalTee { idx } = body[i + 2] {
+                        offset_to_local.insert(offset, idx);
+                        out.push(body[i].clone());
+                        out.push(body[i + 1].clone());
+                        out.push(body[i + 2].clone());
+                        i += 3;
+                        continue;
+                    }
+                }
+
+                let cache_local =
+                    get_or_alloc_local_for_offset(&mut offset_to_local, offset, next_local);
+                out.push(WasmInst::LocalGet { idx: 0 });
+                out.push(WasmInst::I64Load { offset });
+                out.push(WasmInst::LocalTee { idx: cache_local });
+                i += 2;
+                changes += 1;
+                continue;
+            }
+        }
+
+        // Whenever we store a register value, tee it into a dedicated local so
+        // later uses can avoid reloading from machine-state memory.
+        if let WasmInst::I64Store { offset } = body[i] {
+            if is_cacheable_gpr_offset(offset) {
+                let preceding_tee = if i > 0 {
+                    match body[i - 1] {
+                        WasmInst::LocalTee { idx } => Some(idx),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                let cache_local = if let Some(idx) = preceding_tee {
+                    offset_to_local.entry(offset).or_insert(idx);
+                    idx
+                } else {
+                    get_or_alloc_local_for_offset(&mut offset_to_local, offset, next_local)
+                };
+
+                let already_cached = preceding_tee == Some(cache_local);
+                if !already_cached {
+                    out.push(WasmInst::LocalTee { idx: cache_local });
+                    changes += 1;
+                }
+                out.push(WasmInst::I64Store { offset });
+                i += 1;
+                continue;
+            }
+        }
+
+        // Conservative invalidation: any static store into the register-file
+        // byte range invalidates overlapping cached registers.
+        if let (Some(off), Some(width)) = (store_offset(&body[i]), store_width_bytes(&body[i])) {
+            if off < gpr_cache_range_end() {
+                invalidate_overlapping_gpr_caches(&mut offset_to_local, off, width);
+            }
+        }
+
+        out.push(body[i].clone());
+        i += 1;
+    }
+
+    (out, changes)
 }
 
 /// Helper for atomic word operations (XOR, AND, OR)
@@ -2631,4 +3010,291 @@ fn emit_amo_minmax_d(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_off
     body.push(WasmInst::Select);
     // Store result to M[rs1]
     body.push(WasmInst::I64Store { offset: 0 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_function(body: Vec<WasmInst>) -> WasmFunction {
+        WasmFunction {
+            name: "test".to_string(),
+            block_addr: 0x1000,
+            body,
+            num_locals: 4,
+        }
+    }
+
+    #[test]
+    fn optimize_removes_comments() {
+        let mut func = make_test_function(vec![
+            WasmInst::Comment {
+                text: "debug".to_string(),
+            },
+            WasmInst::I64Const { value: 1 },
+        ]);
+
+        optimize_function(&mut func);
+
+        assert_eq!(func.body.len(), 1);
+        assert!(matches!(func.body[0], WasmInst::I64Const { value: 1 }));
+    }
+
+    #[test]
+    fn optimize_folds_integer_constants() {
+        let mut func = make_test_function(vec![
+            WasmInst::I64Const { value: 0x12345000 },
+            WasmInst::I64Const { value: 0x678 },
+            WasmInst::I64Add,
+            WasmInst::I32Const { value: 8 },
+            WasmInst::I32Const { value: 2 },
+            WasmInst::I32Shl,
+        ]);
+
+        optimize_function(&mut func);
+
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I64Const { value } if *value == 0x12345678)));
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I32Const { value } if *value == 32)));
+        assert!(!func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I64Add | WasmInst::I32Shl)));
+    }
+
+    #[test]
+    fn optimize_forwards_i64_store_load() {
+        let mut func = make_test_function(vec![
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Const { value: 42 },
+            WasmInst::I64Store { offset: 40 },
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            WasmInst::I64Const { value: 1 },
+            WasmInst::I64Add,
+        ]);
+
+        optimize_function(&mut func);
+
+        assert!(func.num_locals >= 5);
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::LocalTee { idx } if *idx == 4)));
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::LocalGet { idx } if *idx == 4)));
+        assert!(!func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40)));
+    }
+
+    #[test]
+    fn optimize_forwards_i64_store_load_with_leading_local_get() {
+        let mut func = make_test_function(vec![
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Const { value: 7 },
+            WasmInst::I64Store { offset: 40 },
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            WasmInst::I64Const { value: 4 },
+            WasmInst::I64Add,
+            WasmInst::I64Store { offset: 48 },
+        ]);
+
+        optimize_function(&mut func);
+
+        assert!(func.num_locals >= 5);
+        assert!(!func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40)));
+
+        assert!(func
+            .body
+            .windows(2)
+            .any(|window| matches!(
+                (&window[0], &window[1]),
+                (WasmInst::LocalGet { idx: 0 }, WasmInst::LocalGet { idx: 4 })
+            )));
+    }
+
+    #[test]
+    fn optimize_preserves_non_matching_store_load() {
+        let mut func = make_test_function(vec![
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Const { value: 1 },
+            WasmInst::I64Store { offset: 40 },
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 48 },
+        ]);
+
+        optimize_function(&mut func);
+
+        assert!(func.num_locals >= 4);
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 48)));
+    }
+
+    #[test]
+    fn optimize_folds_local_set_get_to_local_tee() {
+        let mut func = make_test_function(vec![
+            WasmInst::I64Const { value: 3 },
+            WasmInst::LocalSet { idx: 2 },
+            WasmInst::LocalGet { idx: 2 },
+            WasmInst::I64Const { value: 4 },
+            WasmInst::I64Add,
+        ]);
+
+        optimize_function(&mut func);
+
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::LocalTee { idx } if *idx == 2)));
+        assert!(!func
+            .body
+            .windows(2)
+            .any(|window| matches!(
+                (&window[0], &window[1]),
+                (WasmInst::LocalSet { idx: 2 }, WasmInst::LocalGet { idx: 2 })
+            )));
+    }
+
+    #[test]
+    fn optimize_caches_register_store_and_reuses_local_for_later_load() {
+        let mut func = make_test_function(vec![
+            // x5 = 7
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Const { value: 7 },
+            WasmInst::I64Store { offset: 40 },
+            // x6 = x5 + 1
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            WasmInst::I64Const { value: 1 },
+            WasmInst::I64Add,
+            WasmInst::I64Store { offset: 48 },
+        ]);
+
+        optimize_function(&mut func);
+
+        // local 4 caches x5 (offset 40), local 5 caches x6 (offset 48)
+        assert!(func.num_locals >= 6);
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::LocalTee { idx } if *idx == 4)));
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::LocalGet { idx } if *idx == 4)));
+        assert!(!func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40)));
+    }
+
+    #[test]
+    fn optimize_does_not_cache_offset_zero_memory_loads() {
+        let mut func = make_test_function(vec![
+            // Generic memory load path (address already on stack).
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 0 },
+        ]);
+
+        optimize_function(&mut func);
+
+        // Offset 0 is intentionally not rewritten by register-cache pass.
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 0)));
+    }
+
+    #[test]
+    fn optimize_register_cache_pass_is_idempotent() {
+        let mut func = make_test_function(vec![
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Const { value: 9 },
+            WasmInst::I64Store { offset: 80 },
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 80 },
+            WasmInst::I64Const { value: 1 },
+            WasmInst::I64Add,
+        ]);
+
+        optimize_function(&mut func);
+        let first_body_dbg = format!("{:?}", func.body);
+        let first_locals = func.num_locals;
+
+        optimize_function(&mut func);
+
+        assert_eq!(format!("{:?}", func.body), first_body_dbg);
+        assert_eq!(func.num_locals, first_locals);
+    }
+
+    #[test]
+    fn optimize_preseeds_cache_from_first_register_load() {
+        let mut func = make_test_function(vec![
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            WasmInst::I64Const { value: 3 },
+            WasmInst::I64Add,
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            WasmInst::I64Add,
+        ]);
+
+        optimize_function(&mut func);
+
+        let load40_count = func
+            .body
+            .iter()
+            .filter(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40))
+            .count();
+        assert_eq!(load40_count, 1, "first load should seed cache, second should reuse local");
+        assert!(func
+            .body
+            .iter()
+            .any(|inst| matches!(inst, WasmInst::LocalTee { idx } if *idx >= 4)));
+    }
+
+    #[test]
+    fn optimize_invalidates_cache_on_overlapping_partial_store() {
+        let mut func = make_test_function(vec![
+            // Seed x5 cache.
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Const { value: 7 },
+            WasmInst::I64Store { offset: 40 },
+            // Should use cached local.
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+            // Partial static store overlaps bytes [44,46) of x5 slot [40,48).
+            WasmInst::I32Const { value: 0 },
+            WasmInst::I32Store16 { offset: 44 },
+            // Must not reuse stale cache after partial clobber.
+            WasmInst::LocalGet { idx: 0 },
+            WasmInst::I64Load { offset: 40 },
+        ]);
+
+        optimize_function(&mut func);
+
+        let load40_count = func
+            .body
+            .iter()
+            .filter(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40))
+            .count();
+        assert!(load40_count >= 1, "overlapping store must invalidate x5 cache");
+    }
 }

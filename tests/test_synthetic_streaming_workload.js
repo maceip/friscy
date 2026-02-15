@@ -26,6 +26,7 @@ const WAIT_FOR_EXIT = process.env.FRISCY_TEST_WAIT_FOR_EXIT !== '0';
 const METRIC_WAIT_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_METRIC_WAIT_TIMEOUT_MS || '180000', 10);
 const SYNTH_BUNDLE_MB = Number.parseInt(process.env.FRISCY_TEST_SYNTH_BUNDLE_MB || '6', 10);
 const NETWORK_READY_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_NETWORK_READY_TIMEOUT_MS || '30000', 10);
+const REQUIRE_FETCH = process.env.FRISCY_TEST_REQUIRE_FETCH === '1';
 
 const GUEST_WORKLOAD_SOURCE_TEMPLATE = String.raw`
 const vm = require('vm');
@@ -81,6 +82,7 @@ async function run() {
 
   const streamUrl = __MOCK_STREAM_URL__;
   const apiKey = __MOCK_API_KEY__;
+  const requireFetch = __REQUIRE_FETCH__;
 
   async function streamViaFetch() {
     if (typeof fetch !== "function") {
@@ -153,6 +155,7 @@ async function run() {
       try {
         sseText = await streamViaFetch();
       } catch (fetchErr) {
+        if (requireFetch) throw fetchErr;
         const causeMsg = fetchErr && fetchErr.cause && fetchErr.cause.message
           ? String(fetchErr.cause.message)
           : "";
@@ -344,7 +347,8 @@ async function main() {
         const workloadSource = GUEST_WORKLOAD_SOURCE_TEMPLATE
             .replace('__SYNTH_BUNDLE_MB__', JSON.stringify(Math.max(1, SYNTH_BUNDLE_MB)))
             .replace('__MOCK_STREAM_URL__', JSON.stringify(mockService.streamUrl))
-            .replace('__MOCK_API_KEY__', JSON.stringify(mockService.apiKey));
+            .replace('__MOCK_API_KEY__', JSON.stringify(mockService.apiKey))
+            .replace('__REQUIRE_FETCH__', REQUIRE_FETCH ? 'true' : 'false');
 
         writeFileSync(manifestPath, JSON.stringify({
             version: 1,

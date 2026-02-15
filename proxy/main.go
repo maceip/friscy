@@ -43,12 +43,12 @@ import (
 
 // Rate limiter tracks per-IP usage
 type RateLimiter struct {
-	mu              sync.Mutex
-	ipSessions      map[string]int       // current concurrent sessions per IP
-	ipConnections   map[string]int       // total connections made today per IP
-	ipLastReset     map[string]time.Time // when counters were last reset
-	maxSessions     int                  // max concurrent sessions per IP
-	maxConnsPerDay  int                  // max outbound connections per IP per day
+	mu             sync.Mutex
+	ipSessions     map[string]int       // current concurrent sessions per IP
+	ipConnections  map[string]int       // total connections made today per IP
+	ipLastReset    map[string]time.Time // when counters were last reset
+	maxSessions    int                  // max concurrent sessions per IP
+	maxConnsPerDay int                  // max outbound connections per IP per day
 }
 
 func NewRateLimiter(maxSessions, maxConnsPerDay int) *RateLimiter {
@@ -165,32 +165,35 @@ type Connection struct {
 
 // Session represents a WebTransport client session
 type Session struct {
-	wt          *webtransport.Session
-	connections sync.Map // uint32 -> *Connection
-	nextConnID  atomic.Uint32
-	ctx         context.Context
-	cancel      context.CancelFunc
-	streamMu    sync.Mutex
-	rateLimiter *RateLimiter
-	remoteIP    string
+	wt                       *webtransport.Session
+	connections              sync.Map // uint32 -> *Connection
+	nextConnID               atomic.Uint32
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	streamMu                 sync.Mutex
+	rateLimiter              *RateLimiter
+	remoteIP                 string
+	allowPrivateDestinations bool
 }
 
 // Server is the WebTransport proxy server
 type Server struct {
-	certFile    string
-	keyFile     string
-	listen      string
-	sessions    sync.Map
-	rateLimiter *RateLimiter
-	allowedOrigins map[string]bool // nil = allow all
+	certFile                 string
+	keyFile                  string
+	listen                   string
+	sessions                 sync.Map
+	rateLimiter              *RateLimiter
+	allowedOrigins           map[string]bool // nil = allow all
+	allowPrivateDestinations bool
 }
 
-func NewServer(listen, certFile, keyFile string, rl *RateLimiter, origins []string) *Server {
+func NewServer(listen, certFile, keyFile string, rl *RateLimiter, origins []string, allowPrivateDestinations bool) *Server {
 	s := &Server{
-		listen:      listen,
-		certFile:    certFile,
-		keyFile:     keyFile,
-		rateLimiter: rl,
+		listen:                   listen,
+		certFile:                 certFile,
+		keyFile:                  keyFile,
+		rateLimiter:              rl,
+		allowPrivateDestinations: allowPrivateDestinations,
 	}
 	if len(origins) > 0 {
 		s.allowedOrigins = make(map[string]bool)
@@ -253,11 +256,12 @@ func (s *Server) Run() error {
 func (s *Server) handleSession(wt *webtransport.Session, remoteIP string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &Session{
-		wt:          wt,
-		ctx:         ctx,
-		cancel:      cancel,
-		rateLimiter: s.rateLimiter,
-		remoteIP:    remoteIP,
+		wt:                       wt,
+		ctx:                      ctx,
+		cancel:                   cancel,
+		rateLimiter:              s.rateLimiter,
+		remoteIP:                 remoteIP,
+		allowPrivateDestinations: s.allowPrivateDestinations,
 	}
 
 	log.Printf("New WebTransport session from %s", wt.RemoteAddr())
@@ -349,8 +353,9 @@ func (sess *Session) handleConnect(stream webtransport.Stream) {
 
 	log.Printf("[%d] Connect to %s (type=%d)", connID, addr, sockType)
 
-	// Block connections to private/loopback addresses (prevent SSRF)
-	if isPrivateAddr(host) {
+	// Block connections to private/loopback addresses (prevent SSRF),
+	// unless explicitly enabled for local integration testing.
+	if !sess.allowPrivateDestinations && isPrivateAddr(host) {
 		log.Printf("[%d] Blocked connect to private address %s", connID, addr)
 		sess.sendEvent(MsgConnectError, connID, []byte("connection to private addresses not allowed"))
 		return
@@ -601,12 +606,11 @@ func (sess *Session) readLoop(conn *Connection) {
 	}
 }
 
-
 func (sess *Session) sendEvent(msgType byte, connID uint32, data []byte) {
 	sess.streamMu.Lock()
 	defer sess.streamMu.Unlock()
 
-	stream, err := sess.wt.OpenUniStream()
+	stream, err := sess.wt.OpenStream()
 	if err != nil {
 		log.Printf("Failed to open stream for event: %v", err)
 		return
@@ -785,11 +789,13 @@ func (b byteReader) ReadByte() (byte, error) {
 
 func main() {
 	listen := flag.String("listen", ":4433", "Address to listen on")
+	apiListen := flag.String("api-listen", ":4434", "Address for Docker pull/search API server (empty disables API server)")
 	certFile := flag.String("cert", "cert.pem", "TLS certificate file")
 	keyFile := flag.String("key", "key.pem", "TLS key file")
 	maxSessions := flag.Int("max-sessions", 3, "Max concurrent sessions per IP")
 	maxConns := flag.Int("max-conns", 100, "Max outbound connections per IP per day")
 	origins := flag.String("origins", "", "Comma-separated allowed origins (empty = allow all)")
+	allowPrivateDestinations := flag.Bool("allow-private-destinations", false, "Allow proxy connects to private/loopback destinations (testing only)")
 	flag.Parse()
 
 	rl := NewRateLimiter(*maxSessions, *maxConns)
@@ -801,14 +807,17 @@ func main() {
 		}
 	}
 
-	server := NewServer(*listen, *certFile, *keyFile, rl, originList)
+	server := NewServer(*listen, *certFile, *keyFile, rl, originList, *allowPrivateDestinations)
 
-	// Start API server (Docker pull) on :4434 in background
-	go func() {
-		if err := server.RunAPIServer(":4434"); err != nil {
-			log.Fatalf("API server failed: %v", err)
-		}
-	}()
+	// Start optional API server (Docker pull/search) in background.
+	// Keep proxy alive even if API server fails to bind.
+	if *apiListen != "" {
+		go func() {
+			if err := server.RunAPIServer(*apiListen); err != nil {
+				log.Printf("API server failed: %v", err)
+			}
+		}()
+	}
 
 	if err := server.Run(); err != nil {
 		log.Fatal(err)

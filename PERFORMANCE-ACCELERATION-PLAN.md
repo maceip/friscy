@@ -109,16 +109,32 @@ next.
 
 ### 6.2 Implementation Summary
 
-- Added triplet-trace counting in `jit_manager.js`:
-  - tracks `A -> B -> C` region sequences observed from JIT region misses,
-  - bounded table (`traceMaxTriplets`) to avoid unbounded growth.
-- Added hot-triplet compile trigger:
-  - when a triplet reaches `traceTripletHotThreshold`, proactively compiles
-    target region `C` (baseline tier).
-- Kept edge prefetch as fallback:
-  - if no hot triplet trigger occurs, edge hotness still drives compile.
-- Added runtime control:
-  - `?jittrace3hot=N` sets triplet hot threshold.
+- Added compile scheduler in `jit_manager.js`:
+  - priority queue with bounded depth (`compileQueueMax`),
+  - compile token budget per second (`compileBudgetPerSecond`),
+  - task priority based on `confidence * missCost`.
+- Upgraded predictor to weighted Markov:
+  - first-order transitions (`A -> B`) + second-order contexts (`A:B -> C`),
+  - predicts top-`K` likely next regions (default 2) when confidence exceeds threshold,
+  - keeps probabilities (transition totals), not just raw edge counts.
+- Added adaptive thresholds:
+  - lowers confidence/hot thresholds when region miss rate is high,
+  - raises thresholds when compile queue pressure is high.
+- Added failure cooldown + stale pruning:
+  - failed regions get exponential compile backoff,
+  - invalidation prunes queued tasks and trace/Markov entries touching dirty regions.
+- Added UX telemetry:
+  - browser "JIT Warmup" HUD (compiled regions, queue depth, miss rate, predictor hit rate),
+  - worker periodically posts JIT stats to main thread for debugging and benchmarks.
+- Added runtime controls:
+  - `?jittrace3hot=N` triplet hot threshold,
+  - `?nojitmarkov` disables Markov predictor,
+  - `?nojittriplet` disables triplet predictor,
+  - `?jitbudget=N` compile budget per second,
+  - `?jitqmax=N` compile queue bound,
+  - `?jitpredk=N` Markov top-K width,
+  - `?jitpredconf=X` predictor base confidence threshold,
+  - `?nojithud` disables warmup HUD.
 
 ### 6.3 Required Verification Proof
 
@@ -131,6 +147,22 @@ Pass criteria:
 - semantic Claude version present,
 - guest exit code `0`,
 - no runtime/module errors.
+
+Comparative latency benchmark:
+
+```bash
+bash ./tests/bench_browser_claude_predictor_modes.sh --runs 3
+```
+
+This compares:
+- no predictor (`nojittrace`),
+- edge-only predictor,
+- edge + triplet + Markov predictor,
+
+and records:
+- first output latency,
+- completion latency,
+- misses before steady-state.
 
 ---
 

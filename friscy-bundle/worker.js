@@ -21,9 +21,14 @@ let jitManager = {
     recordExecution() {},
     recordTraceTransition() {},
     configureTiering() {},
+    configureScheduler() {},
+    configurePredictor() {},
     configureTrace() {},
+    getStats() { return null; },
 };
 let installInvalidationHook = () => {};
+let lastJitStatsPostMs = 0;
+const JIT_STATS_POST_INTERVAL_MS = 250;
 
 // Control SAB layout (4KB):
 //   [0]   i32: command   (0=idle, 1=stdout, 2=stdin_request, 3=stdin_ready,
@@ -229,6 +234,21 @@ function signalExit(exitCode) {
     Atomics.notify(controlView, 0);
 }
 
+function maybePostJitStats(force = false) {
+    if (!jitManager || typeof jitManager.getStats !== 'function') return;
+    const now = Date.now();
+    if (!force && now - lastJitStatsPostMs < JIT_STATS_POST_INTERVAL_MS) return;
+    lastJitStatsPostMs = now;
+    try {
+        const stats = jitManager.getStats();
+        if (stats) {
+            self.postMessage({ type: 'jit_stats', stats, ts: now });
+        }
+    } catch (e) {
+        // Non-fatal telemetry path.
+    }
+}
+
 /**
  * Run the resume loop: call friscy_resume() while machine is stopped for stdin.
  * Between each resume, block on Atomics.wait() for the main thread to provide stdin.
@@ -244,6 +264,7 @@ function runResumeLoop() {
     while (friscy_stopped()) {
         // Request stdin from main thread (blocks until data arrives)
         const stdinData = requestStdin(4096);
+        maybePostJitStats();
 
         // Push received bytes into the Module's stdin buffer
         if (stdinData.length > 0) {
@@ -300,6 +321,7 @@ function runResumeLoop() {
 
         // Resume interpreter
         const stillStopped = friscy_resume();
+        maybePostJitStats();
         if (!stillStopped) {
             // Machine finished (guest called exit)
             return;
@@ -331,6 +353,17 @@ self.onmessage = async function(e) {
         const jitHotThreshold = Number.isFinite(msg.jitHotThreshold) ? msg.jitHotThreshold : null;
         const jitTierEnabled = msg.jitTierEnabled !== false;
         const jitOptimizeThreshold = Number.isFinite(msg.jitOptimizeThreshold) ? msg.jitOptimizeThreshold : null;
+        const jitSchedulerBudget = Number.isFinite(msg.jitSchedulerBudget) ? msg.jitSchedulerBudget : null;
+        const jitSchedulerConcurrency = Number.isFinite(msg.jitSchedulerConcurrency)
+            ? msg.jitSchedulerConcurrency
+            : null;
+        const jitSchedulerQueueMax = Number.isFinite(msg.jitSchedulerQueueMax)
+            ? msg.jitSchedulerQueueMax
+            : null;
+        const jitPredictTopK = Number.isFinite(msg.jitPredictTopK) ? msg.jitPredictTopK : null;
+        const jitPredictConfidence = Number.isFinite(msg.jitPredictConfidence) ? msg.jitPredictConfidence : null;
+        const jitMarkovEnabled = msg.jitMarkovEnabled !== false;
+        const jitTripletEnabled = msg.jitTripletEnabled !== false;
         const jitTraceEnabled = msg.jitTraceEnabled !== false;
         const jitEdgeHotThreshold = Number.isFinite(msg.jitEdgeHotThreshold) ? msg.jitEdgeHotThreshold : null;
         const jitTraceTripletHotThreshold = Number.isFinite(msg.jitTraceTripletHotThreshold)
@@ -415,6 +448,17 @@ self.onmessage = async function(e) {
                     enabled: jitTierEnabled,
                     optimizeThreshold: jitOptimizeThreshold,
                 });
+                jitManager.configureScheduler({
+                    compileBudgetPerSecond: jitSchedulerBudget,
+                    maxConcurrentCompiles: jitSchedulerConcurrency,
+                    compileQueueMax: jitSchedulerQueueMax,
+                    predictorTopK: jitPredictTopK,
+                    predictorBaseConfidenceThreshold: jitPredictConfidence,
+                });
+                jitManager.configurePredictor({
+                    markovEnabled: jitMarkovEnabled,
+                    tripletEnabled: jitTripletEnabled,
+                });
                 jitManager.configureTrace({
                     enabled: jitTraceEnabled,
                     edgeHotThreshold: jitEdgeHotThreshold,
@@ -425,7 +469,13 @@ self.onmessage = async function(e) {
                     `(hotThreshold=${jitManager.hotThreshold ?? 'default'}, ` +
                     `tiering=${jitManager.tieringEnabled ? 'on' : 'off'}, ` +
                     `optHot=${jitManager.optimizeThreshold ?? 'default'}, ` +
+                    `budget=${jitManager.compileBudgetPerSecond ?? 'default'}, ` +
+                    `qmax=${jitManager.compileQueueMax ?? 'default'}, ` +
+                    `markov=${jitManager.markovEnabled ? 'on' : 'off'}, ` +
+                    `topK=${jitManager.predictorTopK ?? 'default'}, ` +
+                    `pconf=${jitManager.predictorBaseConfidenceThreshold ?? 'default'}, ` +
                     `trace=${jitManager.traceEnabled ? 'on' : 'off'}, ` +
+                    `triplet=${jitManager.tripletEnabled ? 'on' : 'off'}, ` +
                     `edgeHot=${jitManager.traceEdgeHotThreshold ?? 'default'}, ` +
                     `tripletHot=${jitManager.traceTripletHotThreshold ?? 'default'})`
                 );
@@ -528,9 +578,11 @@ self.onmessage = async function(e) {
             }
 
             // Machine finished — signal exit
+            maybePostJitStats(true);
             signalExit(0);
         } catch (e) {
             writeStdoutRing(encoder.encode(`\r\n[worker] Error: ${e.message}\r\n`));
+            maybePostJitStats(true);
             signalExit(1);
         }
     }

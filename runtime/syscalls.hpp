@@ -3508,16 +3508,7 @@ static void sys_tkill(Machine& m) {
         static bool dumped = false;
         if (!dumped) {
             dumped = true;
-            fprintf(stderr, "[ABORT] Last 32 syscalls before abort:\n");
-            int idx = riscv::g_syscall_ring_idx;
-            for (int i = 0; i < 32; i++) {
-                int j = (idx - 32 + i) % 32;
-                if (j < 0) j += 32;
-                auto& e = riscv::g_syscall_ring[j];
-                if (e.sysnum == 0 && e.pc == 0) continue;
-                fprintf(stderr, "  [%d] sys#%zu a0=0x%lx a1=0x%lx a2=0x%lx => %ld (PC=0x%lx)\n",
-                    i, e.sysnum, (long)e.a0, (long)e.a1, (long)e.a2, (long)e.result, (long)e.pc);
-            }
+            fprintf(stderr, "[ABORT] Syscall ring unavailable in current libriscv build\n");
         }
         fprintf(stderr, "[ABORT] tkill(SIGABRT)! PC=0x%lx RA=0x%lx SP=0x%lx\n",
                 (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2));

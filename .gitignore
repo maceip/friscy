@@ -9,6 +9,12 @@ target/
 
 # Emscripten SDK (if installed locally)
 tools/emsdk/
+runtime/emsdk/
+
+# Local package installs / generated benchmark artifacts
+node_modules/
+tests/perf/
+tmp/
 
 # Go artifacts
 proxy/go.sum
@@ -21,6 +27,7 @@ proxy/key.pem
 
 # Rust artifacts
 aot/target/
+target/
 aot/Cargo.lock
 
 # Test binaries

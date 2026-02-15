@@ -166,15 +166,18 @@ node friscy-bundle/serve.js 9000
 
 Requires COOP/COEP headers for SharedArrayBuffer (serve.js handles this).
 
-### Build Emscripten (Docker)
+### Build Emscripten (Reproducible)
 
 ```bash
-docker run --rm -v $(pwd):/src emscripten/emsdk:latest bash -c "
-  cd /src && mkdir -p build-wasm && cd build-wasm
-  emcmake cmake ../runtime
-  emmake make -j\$(nproc)
-"
-cp build-wasm/friscy.{js,wasm} friscy-bundle/
+# Uses pinned versions from tools/build-lock.env.
+# Docker if available:
+bash tools/harness.sh
+
+# Force native emsdk (no Docker):
+bash tools/harness.sh --native
+
+# Sync built artifacts into browser bundle:
+cp runtime/build/friscy.{js,wasm} friscy-bundle/
 ```
 
 ### Build Native
@@ -183,6 +186,34 @@ cp build-wasm/friscy.{js,wasm} friscy-bundle/
 mkdir -p build-native && cd build-native
 cmake ../runtime && make -j$(nproc)
 ./friscy --rootfs ../friscy-bundle/rootfs.tar /bin/sh
+```
+
+### Reproducible Build + Test
+
+```bash
+# Run claude --version smoke against checked-in stable bundle runtime
+bash tools/build_and_test.sh
+
+# Attempt runtime rebuild first, then smoke test (restores stable bundle on failure):
+bash tools/build_and_test.sh --rebuild-runtime --native
+
+# Include haiku attempt in the same run:
+bash tools/build_and_test.sh --haiku
+
+# Run synthetic Claude-like workload (large JS parse + streamed API response):
+bash tools/build_and_test.sh --synthetic-stream --synthetic-bundle-mb 6
+
+# Validate the local mock streaming API service directly:
+node --experimental-default-type=module ./tests/test_mock_stream_service.js
+
+# Sweep emsdk/libriscv compatibility for runtime rebuild debugging:
+bash tools/runtime_compat_sweep.sh --emsdk 5.0.1 4.0.23 4.0.20
+
+# Sweep across historical source refs (isolated worktrees) as well:
+bash tools/runtime_source_ref_sweep.sh --source-ref HEAD bb8b6f1 1cc5c80 --emsdk 5.0.1 --libriscv 396f8c206515cbec404677bbce23a211d7959216
+
+# Override workload/query under test (example: no-JIT version smoke):
+bash tools/runtime_compat_sweep.sh --test-query '?noproxy&nojit=1'
 ```
 
 ### Build Claude Rootfs

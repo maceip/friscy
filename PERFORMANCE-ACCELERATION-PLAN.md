@@ -226,6 +226,43 @@ Pass criteria:
 - guest exits cleanly (`guest_exit_code=0`),
 - non-zero JIT activity on target path (for example non-zero misses or queue activity).
 
+#### 7.4 Runtime Rebuild Blocker Isolation (2026-02-15)
+
+The runtime rebuild crash signature has been isolated to machine construction,
+before interpreter mapping and before any JIT dispatch logic:
+
+- Last successful marker: `[friscy-debug] Constructing Machine (...)`
+- Missing marker on crash path: `[friscy-debug] Machine constructed (...)`
+- Browser stack consistently reports trap in `wasm-function[55]` during `callMain`.
+
+Targeted A/B constructor experiments:
+
+- `FRISCY_EXPERIMENT_NO_PROGRAM_LOAD=1`:
+  still crashes before constructor returns (rules out ELF load as primary trigger).
+- `FRISCY_EXPERIMENT_EMPTY_MACHINE=1`:
+  still crashes before constructor returns (binary-independent crash).
+- `FRISCY_EXPERIMENT_DISABLE_ARENA=1`:
+  constructor returns; crash mode shifts later to execution/protection faults.
+- `RISCV_ENCOMPASSING_ARENA_BITS` sweep:
+  - `31`: constructor-time `memory access out of bounds`
+  - `30/29`: constructor succeeds, then `Illegal opcode executed`
+  - `28`: process starts but shared-library/TLS out-of-memory (guest exit 127)
+
+Current inference:
+
+- The OOB trap is in the libriscv machine memory constructor path when
+  encompassing arena semantics are enabled for rebuilt runtime.
+- This points at the arena initialization strategy as the immediate blocker
+  (not JIT scheduler/predictor logic and not Claude command path behavior).
+
+Next runtime-side isolation/mitigation targets:
+
+- test wasm-specific arena allocation behavior in the libriscv constructor path
+  to avoid constructor-time OOB while preserving enough address space for Node.
+- validate a constructor path that avoids both:
+  1) 31-bit constructor OOB, and
+  2) sub-31-bit address-space aliasing/illegal-opcode regressions.
+
 ### Phase 8: Process/Resource Reliability for Claude Prompt Path
 
 Status: PLANNED

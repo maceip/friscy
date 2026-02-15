@@ -46,6 +46,7 @@ const MSG = {
 // Socket types
 const SOCK_STREAM = 1;
 const SOCK_DGRAM = 2;
+const MAX_PENDING_SENDS_PER_CONN = 64;
 
 /**
  * Main network bridge class using WebTransport
@@ -135,6 +136,7 @@ export class FriscyNetworkBridge {
         connected: false,
         isListener: false,
         recvBuffer: [],
+        pendingSends: [],
       });
     };
 
@@ -196,6 +198,7 @@ export class FriscyNetworkBridge {
     const connID = this.fdToConnID.get(fd);
     const conn = this.connections.get(connID);
     if (!conn) return -88; // ENOTSOCK
+    if (!this.connected || !this.transport) return -101; // ENETUNREACH
 
     const { host, port, family } = this.parseAddress(addrData);
     if (!host) return -97; // EAFNOSUPPORT
@@ -227,6 +230,7 @@ export class FriscyNetworkBridge {
     const connID = this.fdToConnID.get(fd);
     const conn = this.connections.get(connID);
     if (!conn) return -88;
+    if (!this.connected || !this.transport) return -101; // ENETUNREACH
 
     const { port, family } = this.parseAddress(addrData);
     const sockType = conn.type === 1 ? SOCK_STREAM : SOCK_DGRAM;
@@ -251,6 +255,7 @@ export class FriscyNetworkBridge {
     const connID = this.fdToConnID.get(fd);
     const conn = this.connections.get(connID);
     if (!conn) return -88;
+    if (!this.connected || !this.transport) return -101; // ENETUNREACH
 
     conn.isListener = true;
     this.acceptQueues.set(connID, []);
@@ -293,8 +298,22 @@ export class FriscyNetworkBridge {
     const connID = this.fdToConnID.get(fd);
     const conn = this.connections.get(connID);
     if (!conn) return -88;
-    if (!conn.connected && conn.type === 1) return -107; // ENOTCONN
+    if (!data || data.length === 0) return 0;
+    if (!this.connected || !this.transport) return -101; // ENETUNREACH
+    if (!conn.connected) {
+      const pending = conn.pendingSends || (conn.pendingSends = []);
+      if (pending.length >= MAX_PENDING_SENDS_PER_CONN) {
+        return -11; // EAGAIN
+      }
+      pending.push(Uint8Array.from(data));
+      return data.length;
+    }
 
+    this.sendDataMessage(connID, data);
+    return data.length;
+  }
+
+  sendDataMessage(connID, data) {
     // Build send message: msgType(1) + connID(4) + dataLen(4) + data
     const msg = new Uint8Array(1 + 4 + 4 + data.length);
     const view = new DataView(msg.buffer);
@@ -305,7 +324,14 @@ export class FriscyNetworkBridge {
     msg.set(data, 9);
 
     this.sendMessage(msg);
-    return data.length;
+  }
+
+  flushPendingSends(connID, conn) {
+    if (!conn || !conn.pendingSends || conn.pendingSends.length === 0) return;
+    const queue = conn.pendingSends.splice(0);
+    for (const payload of queue) {
+      this.sendDataMessage(connID, payload);
+    }
   }
 
   /**
@@ -441,7 +467,8 @@ export class FriscyNetworkBridge {
 
         // Format: msgType(1) + connID(4) + data
         if (value.length >= 5) {
-          const connID = new DataView(value.buffer).getUint32(1, false);
+          const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+          const connID = view.getUint32(1, false);
           const payload = value.slice(5);
 
           const conn = this.connections.get(connID);
@@ -475,6 +502,7 @@ export class FriscyNetworkBridge {
       case MSG.CONNECTED:
         if (conn) {
           conn.connected = true;
+          this.flushPendingSends(connID, conn);
           console.log(`[friscy-net] Connection ${connID} established`);
         }
         break;
@@ -482,6 +510,7 @@ export class FriscyNetworkBridge {
       case MSG.CONNECT_ERROR:
         if (conn) {
           conn.connected = false;
+          conn.pendingSends = [];
           const errorMsg = new TextDecoder().decode(payload);
           console.error(`[friscy-net] Connection ${connID} failed: ${errorMsg}`);
         }
@@ -500,6 +529,7 @@ export class FriscyNetworkBridge {
       case MSG.CLOSED:
         if (conn) {
           conn.connected = false;
+          conn.pendingSends = [];
           console.log(`[friscy-net] Connection ${connID} closed by remote`);
         }
         break;
@@ -540,6 +570,7 @@ export class FriscyNetworkBridge {
       connected: true,
       isListener: false,
       recvBuffer: [],
+      pendingSends: [],
     });
 
     // Add to accept queue

@@ -152,15 +152,22 @@ const (
 	SOCK_DGRAM  = 2
 )
 
+const (
+	maxPendingWritesPerConn = 64
+	maxPendingWriteBytes    = 512 * 1024
+)
+
 // Connection represents a virtual socket
 type Connection struct {
-	id       uint32
-	sockType int
-	conn     net.Conn
-	listener net.Listener
-	udpConn  *net.UDPConn
-	closed   atomic.Bool
-	mu       sync.Mutex
+	id            uint32
+	sockType      int
+	conn          net.Conn
+	listener      net.Listener
+	udpConn       *net.UDPConn
+	pendingWrites [][]byte
+	pendingBytes  int
+	closed        atomic.Bool
+	mu            sync.Mutex
 }
 
 // Session represents a WebTransport client session
@@ -369,6 +376,11 @@ func (sess *Session) handleConnect(stream webtransport.Stream) {
 	}
 
 	// Create connection
+	if existing, ok := sess.connections.Load(connID); ok {
+		if prev, ok := existing.(*Connection); ok {
+			prev.Close()
+		}
+	}
 	conn := &Connection{
 		id:       connID,
 		sockType: sockType,
@@ -400,10 +412,20 @@ func (sess *Session) handleConnect(stream webtransport.Stream) {
 			return
 		}
 		conn.conn = netConn
+		pendingWrites := conn.pendingWrites
+		conn.pendingWrites = nil
+		conn.pendingBytes = 0
 		conn.mu.Unlock()
 
 		log.Printf("[%d] Connected to %s", connID, addr)
 		sess.sendEvent(MsgConnected, connID, nil)
+
+		for _, queued := range pendingWrites {
+			if _, writeErr := netConn.Write(queued); writeErr != nil {
+				log.Printf("[%d] Flush queued send error: %v", connID, writeErr)
+				break
+			}
+		}
 
 		// Start reading from connection
 		go sess.readLoop(conn)
@@ -537,11 +559,21 @@ func (sess *Session) handleSend(stream webtransport.Stream) {
 
 	conn.mu.Lock()
 	netConn := conn.conn
-	conn.mu.Unlock()
-
 	if netConn == nil {
+		if len(conn.pendingWrites) >= maxPendingWritesPerConn ||
+			conn.pendingBytes+len(data) > maxPendingWriteBytes {
+			conn.mu.Unlock()
+			log.Printf("[%d] Send queue full; dropping %d bytes", connID, len(data))
+			return
+		}
+		queued := make([]byte, len(data))
+		copy(queued, data)
+		conn.pendingWrites = append(conn.pendingWrites, queued)
+		conn.pendingBytes += len(queued)
+		conn.mu.Unlock()
 		return
 	}
+	conn.mu.Unlock()
 
 	if _, err := netConn.Write(data); err != nil {
 		log.Printf("[%d] Send error: %v", connID, err)

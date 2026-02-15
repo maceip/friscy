@@ -89,6 +89,7 @@ const RING_SIZE = 65528;
 
 const NET_HEADER = 64;
 const NET_DATA_SIZE = 65472;
+const NET_RPC_TIMEOUT_MS = 5000;
 
 let controlView = null;
 let controlBytes = null;
@@ -97,6 +98,7 @@ let stdoutBytes = null;
 let netView = null;
 let netBytes = null;
 let emModule = null;
+let netRpcTimeoutWarned = false;
 
 const encoder = new TextEncoder();
 
@@ -201,9 +203,19 @@ function networkRPC(op, fd, arg1, arg2, data) {
     Atomics.notify(netView, 0);
 
     // Block until main thread sets lock = 2 (response ready)
+    const deadline = Date.now() + NET_RPC_TIMEOUT_MS;
     while (true) {
         const lock = Atomics.load(netView, 0);
         if (lock === 2) break;
+        if (Date.now() >= deadline) {
+            // Avoid deadlocks when the main thread never started network RPC host.
+            if (!netRpcTimeoutWarned) {
+                console.warn('[worker] network RPC timeout: network bridge host unavailable');
+                netRpcTimeoutWarned = true;
+            }
+            Atomics.store(netView, 0, 0);
+            return { result: -101, data: null }; // ENETUNREACH
+        }
         Atomics.wait(netView, 0, lock, 100); // 100ms timeout, retry
     }
 

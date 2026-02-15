@@ -668,6 +668,8 @@ inline void sys_sendto(Machine& m) {
     uint64_t buf_ptr = m.template sysarg<uint64_t>(1);
     size_t len = m.template sysarg<size_t>(2);
     int flags = m.template sysarg<int>(3);
+    uint64_t dest_addr_ptr = m.template sysarg<uint64_t>(4);
+    uint32_t dest_addrlen = m.template sysarg<uint32_t>(5);
     (void)flags;
 
     auto* sock = get_network_ctx().get_socket(sockfd);
@@ -686,6 +688,31 @@ inline void sys_sendto(Machine& m) {
     m.memory.memcpy_out(data.data(), buf_ptr, len);
 
 #ifdef __EMSCRIPTEN__
+    // UDP in guest workloads (including DNS resolvers) commonly uses
+    // sendto()/recvfrom() without a prior connect(). Bridge that by issuing
+    // an implicit connect when a destination sockaddr is provided.
+    if (sock->type == sock::DGRAM && dest_addr_ptr != 0 && dest_addrlen > 0) {
+        std::vector<uint8_t> addr_data(dest_addrlen);
+        m.memory.memcpy_out(addr_data.data(), dest_addr_ptr, dest_addrlen);
+        int connect_result = EM_ASM_INT({
+            if (typeof Module.onSocketConnect === 'function') {
+                const addr = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                return Module.onSocketConnect($0, addr);
+            }
+            return -38;  // ENOSYS
+        }, sockfd, addr_data.data(), dest_addrlen);
+
+        if (connect_result == 0 || connect_result == -115) {
+            sock->connected = true;
+        } else if (connect_result < 0) {
+            m.set_result(connect_result);
+            return;
+        }
+    } else if (sock->type == sock::DGRAM && !sock->connected && dest_addr_ptr == 0) {
+        m.set_result(err::DESTADDRREQ);
+        return;
+    }
+
     int result = EM_ASM_INT({
         if (typeof Module.onSocketSend === 'function') {
             const data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
@@ -696,8 +723,19 @@ inline void sys_sendto(Machine& m) {
 
     m.set_result(result >= 0 ? (int64_t)len : result);
 #else
-    // Native: use real send
-    ssize_t result = ::send(sock->native_fd, data.data(), len, 0);
+    // Native: use real sendto when destination is provided.
+    ssize_t result = -1;
+    if (dest_addr_ptr != 0 && dest_addrlen > 0) {
+        std::vector<uint8_t> addr_data(dest_addrlen);
+        m.memory.memcpy_out(addr_data.data(), dest_addr_ptr, dest_addrlen);
+        struct ::sockaddr_storage native_addr {};
+        std::memcpy(&native_addr, addr_data.data(),
+                    std::min(addr_data.size(), sizeof(native_addr)));
+        result = ::sendto(sock->native_fd, data.data(), len, 0,
+                          (struct sockaddr*)&native_addr, dest_addrlen);
+    } else {
+        result = ::send(sock->native_fd, data.data(), len, 0);
+    }
     if (result >= 0) {
         m.set_result(result);
     } else {

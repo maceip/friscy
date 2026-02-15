@@ -20,6 +20,8 @@ const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '?proxy=https://78.141.219.1
 const CLAUDE_CMD = process.env.FRISCY_TEST_CLAUDE_CMD || 'claude -p "write me a haiku"';
 const WAIT_FOR_EXIT = process.env.FRISCY_TEST_WAIT_FOR_EXIT !== '0';
 const METRIC_WAIT_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_METRIC_WAIT_TIMEOUT_MS || '180000', 10);
+const REQUIRE_NETWORK = process.env.FRISCY_TEST_REQUIRE_NETWORK !== '0';
+const NETWORK_READY_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_NETWORK_READY_TIMEOUT_MS || '30000', 10);
 
 function forwardEnv() {
     const env = [
@@ -187,6 +189,7 @@ async function main() {
         let lastLog = 0;
         let sawPromptOutput = false;
         let sawPromptAt = null;
+        let netWaitLogged = false;
 
         while (Date.now() - start < 1800000) {
             let status = '';
@@ -213,6 +216,18 @@ async function main() {
             if (!sawPromptOutput && /[A-Za-z]/.test(content)) {
                 sawPromptOutput = true;
                 sawPromptAt = Date.now();
+            }
+
+            const netOn = /wasmnet:\s*on/i.test(status);
+            if (REQUIRE_NETWORK && !netOn) {
+                const netElapsed = Date.now() - start;
+                if (!netWaitLogged && netElapsed >= 5000) {
+                    netWaitLogged = true;
+                    console.log('[test] waiting for proxy/network to become available...');
+                }
+                if (netElapsed >= NETWORK_READY_TIMEOUT_MS) {
+                    throw new Error(`network did not come online within ${NETWORK_READY_TIMEOUT_MS}ms (status="${status}")`);
+                }
             }
 
             if (WAIT_FOR_EXIT && sawPromptOutput) {

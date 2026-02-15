@@ -205,6 +205,9 @@ bash tools/runtime_compat_sweep.sh --emsdk 5.0.1 4.0.23 4.0.20
 
 # Sweep across historical source refs (isolated worktrees) as well:
 bash tools/runtime_source_ref_sweep.sh --source-ref HEAD bb8b6f1 1cc5c80 --emsdk 5.0.1 --libriscv 396f8c206515cbec404677bbce23a211d7959216
+
+# Override workload/query under test (example: no-JIT version smoke):
+bash tools/runtime_compat_sweep.sh --test-query '?noproxy&nojit=1'
 ```
 
 ### Build Claude Rootfs

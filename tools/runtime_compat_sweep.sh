@@ -30,6 +30,11 @@ ROOTFS_URL="./nodejs-claude.tar"
 SMOKE_TIMEOUT_SEC=120
 BUILD_TIMEOUT_SEC=900
 OUT_FILE="$PROJECT_DIR/tests/perf/runtime_compat_sweep.latest.json"
+TEST_SCRIPT="$PROJECT_DIR/tests/test_claude_version.js"
+TEST_QUERY=""
+TEST_CMD=""
+TEST_EXPECTED=""
+TEST_WAIT_FOR_EXIT=""
 
 declare -a EMSDK_VERSIONS
 declare -a LIBRISCV_REFS
@@ -74,9 +79,29 @@ while [[ $# -gt 0 ]]; do
             OUT_FILE="${2:-}"
             shift 2
             ;;
+        --test-script)
+            TEST_SCRIPT="${2:-}"
+            shift 2
+            ;;
+        --test-query)
+            TEST_QUERY="${2:-}"
+            shift 2
+            ;;
+        --test-cmd)
+            TEST_CMD="${2:-}"
+            shift 2
+            ;;
+        --test-expected)
+            TEST_EXPECTED="${2:-}"
+            shift 2
+            ;;
+        --test-wait-for-exit)
+            TEST_WAIT_FOR_EXIT="${2:-}"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--emsdk V1 V2 ...] [--libriscv REF1 REF2 ...] [--rootfs-url URL] [--smoke-timeout-sec N] [--build-timeout-sec N] [--out PATH]"
+            echo "Usage: $0 [--emsdk V1 V2 ...] [--libriscv REF1 REF2 ...] [--rootfs-url URL] [--smoke-timeout-sec N] [--build-timeout-sec N] [--test-script PATH] [--test-query QUERY] [--test-cmd CMD] [--test-expected TEXT] [--test-wait-for-exit 0|1] [--out PATH]"
             exit 1
             ;;
     esac
@@ -104,6 +129,11 @@ fi
 
 if [[ ! -d "$EMSDK_DIR" ]]; then
     echo "[compat-sweep] ERROR: emsdk not found at $EMSDK_DIR"
+    exit 1
+fi
+
+if [[ ! -f "$TEST_SCRIPT" ]]; then
+    echo "[compat-sweep] ERROR: test script not found: $TEST_SCRIPT"
     exit 1
 fi
 
@@ -185,7 +215,23 @@ for emsdk_version in "${EMSDK_VERSIONS[@]}"; do
         if [[ "$status" == "unknown" ]]; then
             cp "$RUNTIME_DIR/build/friscy.js" "$BUNDLE_JS"
             cp "$RUNTIME_DIR/build/friscy.wasm" "$BUNDLE_WASM"
-            if timeout "${SMOKE_TIMEOUT_SEC}s" env FRISCY_TEST_ROOTFS_URL="$ROOTFS_URL" node --experimental-default-type=module "$PROJECT_DIR/tests/test_claude_version.js" >"$smoke_log" 2>&1; then
+
+            smoke_cmd=(env FRISCY_TEST_ROOTFS_URL="$ROOTFS_URL")
+            if [[ -n "$TEST_QUERY" ]]; then
+                smoke_cmd+=(FRISCY_TEST_QUERY="$TEST_QUERY")
+            fi
+            if [[ -n "$TEST_CMD" ]]; then
+                smoke_cmd+=(FRISCY_TEST_CLAUDE_CMD="$TEST_CMD")
+            fi
+            if [[ -n "$TEST_EXPECTED" ]]; then
+                smoke_cmd+=(FRISCY_TEST_EXPECTED_OUTPUT="$TEST_EXPECTED")
+            fi
+            if [[ -n "$TEST_WAIT_FOR_EXIT" ]]; then
+                smoke_cmd+=(FRISCY_TEST_WAIT_FOR_EXIT="$TEST_WAIT_FOR_EXIT")
+            fi
+            smoke_cmd+=(node --experimental-default-type=module "$TEST_SCRIPT")
+
+            if timeout "${SMOKE_TIMEOUT_SEC}s" "${smoke_cmd[@]}" >"$smoke_log" 2>&1; then
                 status="pass"
                 reason="ok"
                 smoke_exit_code=0
@@ -219,6 +265,11 @@ git_commit="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
     echo "  \"commit\": \"$git_commit\","
     echo "  \"timestampUtc\": \"$timestamp_utc\","
     echo "  \"rootfsUrl\": \"${ROOTFS_URL}\","
+    echo "  \"testScript\": \"${TEST_SCRIPT}\","
+    echo "  \"testQuery\": $(printf '%s' "$TEST_QUERY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),"
+    echo "  \"testCommand\": $(printf '%s' "$TEST_CMD" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),"
+    echo "  \"testExpected\": $(printf '%s' "$TEST_EXPECTED" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),"
+    echo "  \"testWaitForExit\": $(printf '%s' "$TEST_WAIT_FOR_EXIT" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.dumps(s if s else None))'),"
     echo "  \"results\": ["
     for i in "${!RESULTS[@]}"; do
         if [[ "$i" -gt 0 ]]; then

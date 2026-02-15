@@ -433,6 +433,84 @@ int main(int argc, char** argv) {
             setup_virtual_files();
         }
 
+        // Handle shebang scripts: if entry is not ELF, check for #! line
+        // and rewrite entry/args to use the interpreter (e.g. #!/usr/bin/env node)
+        if (binary.size() >= 2 && binary[0] == '#' && binary[1] == '!') {
+            // Extract shebang line
+            std::string shebang;
+            for (size_t j = 2; j < binary.size() && j < 256; j++) {
+                if (binary[j] == '\n' || binary[j] == '\r') break;
+                shebang += static_cast<char>(binary[j]);
+            }
+            // Trim leading whitespace
+            size_t start = shebang.find_first_not_of(" \t");
+            if (start != std::string::npos) shebang = shebang.substr(start);
+
+            std::cout << "[friscy] Shebang detected: #!" << shebang << "\n";
+
+            // Parse interpreter and optional arg: "interpreter [arg]"
+            std::string interp_path, interp_arg;
+            auto sp = shebang.find(' ');
+            if (sp != std::string::npos) {
+                interp_path = shebang.substr(0, sp);
+                interp_arg = shebang.substr(sp + 1);
+                // Trim arg
+                auto a = interp_arg.find_first_not_of(" \t");
+                if (a != std::string::npos) interp_arg = interp_arg.substr(a);
+                else interp_arg.clear();
+            } else {
+                interp_path = shebang;
+            }
+
+            // Handle /usr/bin/env: resolve the command via VFS PATH
+            if (interp_path == "/usr/bin/env" && !interp_arg.empty()) {
+                // interp_arg is the actual command (e.g. "node")
+                std::string cmd = interp_arg;
+                auto cmd_sp = cmd.find(' ');
+                if (cmd_sp != std::string::npos) cmd = cmd.substr(0, cmd_sp);
+
+                // Search common PATH locations
+                std::vector<std::string> search_dirs = {
+                    "/usr/local/bin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/sbin", "/sbin"
+                };
+                std::string resolved;
+                for (const auto& dir : search_dirs) {
+                    std::string candidate = dir + "/" + cmd;
+                    try {
+                        load_from_vfs(candidate);
+                        resolved = candidate;
+                        break;
+                    } catch (...) {}
+                }
+                if (resolved.empty()) {
+                    std::cerr << "Error: Could not resolve '" << cmd << "' from shebang\n";
+                    return 1;
+                }
+                interp_path = resolved;
+                interp_arg.clear();  // env consumed the arg
+                std::cout << "[friscy] Resolved env " << cmd << " -> " << resolved << "\n";
+            }
+
+            // Rewrite: entry becomes the interpreter, script becomes first arg
+            std::string script_path = entry_path;
+            entry_path = interp_path;
+
+            // Rebuild guest_args: [interp, [interp_arg], script, original_args...]
+            std::vector<std::string> new_args;
+            new_args.push_back(interp_path);
+            if (!interp_arg.empty()) new_args.push_back(interp_arg);
+            new_args.push_back(script_path);
+            for (size_t j = 1; j < guest_args.size(); j++) {
+                new_args.push_back(guest_args[j]);
+            }
+            guest_args = new_args;
+
+            // Reload binary (now the actual ELF interpreter)
+            binary = load_from_vfs(entry_path);
+            std::cout << "[friscy] Reloaded interpreter: " << entry_path
+                      << " (" << binary.size() << " bytes)\n";
+        }
+
         // Verify it's a RISC-V ELF
         if (binary.size() < 64 ||
             binary[0] != 0x7f || binary[1] != 'E' || binary[2] != 'L' || binary[3] != 'F') {

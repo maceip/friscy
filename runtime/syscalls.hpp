@@ -290,6 +290,7 @@ namespace nr {
     constexpr int symlinkat     = 36;
     constexpr int linkat        = 37;
     constexpr int renameat      = 38;
+    constexpr int renameat2     = 276;
     constexpr int ftruncate     = 46;
     constexpr int faccessat     = 48;
     constexpr int chdir         = 49;
@@ -1457,7 +1458,7 @@ static void sys_write(Machine& m) {
                 return Module.onSocketSend($0, data);
             }
             return -38;  // ENOSYS
-        }, fd, buf.data(), count);
+        }, fd, buf.data(), (int)count);
         m.set_result(result >= 0 ? (int64_t)count : result);
         return;
 #else
@@ -1534,7 +1535,7 @@ static void sys_writev(Machine& m) {
                         return Module.onSocketSend($0, data);
                     }
                     return -38;  // ENOSYS
-                }, fd, buf.data(), len);
+                }, fd, buf.data(), (int)len);
                 if (n < 0) {
                     m.set_result(total > 0 ? (int64_t)total : n);
                     return;
@@ -2702,6 +2703,13 @@ static void sys_renameat(Machine& m) {
     m.set_result(fs.rename(oldpath, newpath));
 }
 
+static void sys_renameat2(Machine& m) {
+    // int renameat2(int olddirfd, const char *oldpath,
+    //               int newdirfd, const char *newpath, unsigned int flags)
+    // We currently ignore flags and apply renameat semantics.
+    sys_renameat(m);
+}
+
 static void sys_sysinfo(Machine& m) {
     auto info_addr = m.sysarg(0);
 
@@ -2788,6 +2796,41 @@ static void sys_ppoll(Machine& m) {
                 revents |= 0x0004;
                 ready++;
             }
+        } else if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+            int sock_status = EM_ASM_INT({
+                var status = 0;
+                if (typeof Module.hasSocketData === 'function' && Module.hasSocketData($0))
+                    status |= 1;
+                if (typeof Module.hasPendingAccept === 'function' && Module.hasPendingAccept($0))
+                    status |= 2;
+                return status;
+            }, fd);
+            if ((events & 0x0004 /*POLLOUT*/)) {
+                revents |= 0x0004;
+            }
+            if ((sock_status & 1) && (events & 0x0001 /*POLLIN*/)) {
+                revents |= 0x0001;
+            }
+            if ((sock_status & 2) && (events & 0x0001 /*POLLIN*/)) {
+                revents |= 0x0001;
+            }
+#else
+            int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
+            if (native_fd >= 0) {
+                struct pollfd pfd;
+                pfd.fd = native_fd;
+                pfd.events = 0;
+                if (events & 0x0001) pfd.events |= POLLIN;
+                if (events & 0x0004) pfd.events |= POLLOUT;
+                pfd.revents = 0;
+                if (::poll(&pfd, 1, 0) > 0) {
+                    if (pfd.revents & POLLIN) revents |= 0x0001;
+                    if (pfd.revents & POLLOUT) revents |= 0x0004;
+                }
+            }
+#endif
+            if (revents) ready++;
         } else if (fd >= 0) {
             // VFS file descriptors are always ready
             revents |= (events & 0x0001); // POLLIN if requested
@@ -3797,7 +3840,7 @@ static void sys_sendmsg(Machine& m) {
                     return Module.onSocketSend($0, data);
                 }
                 return -38;  // ENOSYS
-            }, fd, buf.data(), len);
+            }, fd, buf.data(), (int)len);
             if (n < 0) {
                 m.set_result(total > 0 ? (int64_t)total : n);
                 return;
@@ -3991,6 +4034,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::symlinkat, sys_symlinkat);
     machine.install_syscall_handler(nr::linkat, sys_linkat);
     machine.install_syscall_handler(nr::renameat, sys_renameat);
+    machine.install_syscall_handler(nr::renameat2, sys_renameat2);
     machine.install_syscall_handler(nr::sysinfo, sys_sysinfo);
 
     // epoll — libuv event loop

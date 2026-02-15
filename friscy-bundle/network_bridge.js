@@ -165,7 +165,7 @@ export class FriscyNetworkBridge {
     };
 
     Module.onSocketShutdown = (fd, how) => {
-      return this.handleClose(fd);
+      return this.handleShutdown(fd, how);
     };
 
     // Methods for reading data
@@ -355,6 +355,13 @@ export class FriscyNetworkBridge {
     this.fdToConnID.delete(fd);
     this.acceptQueues.delete(connID);
 
+    return 0;
+  }
+
+  handleShutdown(fd, how) {
+    // For now, treat shutdown as a soft state change. Closing the socket here
+    // breaks clients that issue SHUT_WR and still expect to read a response.
+    // We keep the connection alive until an explicit close().
     return 0;
   }
 

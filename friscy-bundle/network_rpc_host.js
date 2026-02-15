@@ -199,7 +199,11 @@ export class NetworkRPCHost {
                 }
 
                 case NET_OP_SHUTDOWN:
-                    result = this.bridge.handleClose(fd);
+                    if (typeof this.bridge.handleShutdown === 'function') {
+                        result = this.bridge.handleShutdown(fd, arg1);
+                    } else {
+                        result = 0;
+                    }
                     break;
 
                 case NET_OP_SETSOCKOPT:

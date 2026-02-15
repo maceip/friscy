@@ -29,6 +29,9 @@ let jitManager = {
 let installInvalidationHook = () => {};
 let lastJitStatsPostMs = 0;
 const JIT_STATS_POST_INTERVAL_MS = 250;
+const FRISCY_STOP_NONE = 0;
+const FRISCY_STOP_STDIN = 1;
+const FRISCY_STOP_TIMESLICE = 2;
 
 // Control SAB layout (4KB):
 //   [0]   i32: command   (0=idle, 1=stdout, 2=stdin_request, 3=stdin_ready,
@@ -256,20 +259,47 @@ function maybePostJitStats(force = false) {
  */
 function runResumeLoop() {
     const friscy_stopped = emModule._friscy_stopped;
+    const friscy_stop_reason = emModule._friscy_stop_reason;
     const friscy_resume = emModule._friscy_resume;
     const friscy_get_pc = emModule._friscy_get_pc;
     const friscy_set_pc = emModule._friscy_set_pc;
     const friscy_get_state_ptr = emModule._friscy_get_state_ptr;
+    const getStopReason = () => {
+        if (typeof friscy_stop_reason === 'function') {
+            return friscy_stop_reason() >>> 0;
+        }
+        return friscy_stopped() ? FRISCY_STOP_STDIN : FRISCY_STOP_NONE;
+    };
 
-    while (friscy_stopped()) {
-        // Request stdin from main thread (blocks until data arrives)
-        const stdinData = requestStdin(4096);
-        maybePostJitStats();
+    while (true) {
+        const stopReason = getStopReason();
+        if (stopReason === FRISCY_STOP_NONE) {
+            // Machine is no longer stopped (either finished or resumed internally).
+            return;
+        }
 
-        // Push received bytes into the Module's stdin buffer
-        if (stdinData.length > 0) {
-            for (let i = 0; i < stdinData.length; i++) {
-                emModule._stdinBuffer.push(stdinData[i]);
+        if (stopReason === FRISCY_STOP_STDIN) {
+            // Request stdin from main thread (blocks until data arrives)
+            const stdinData = requestStdin(4096);
+            maybePostJitStats();
+
+            // Push received bytes into the Module's stdin buffer
+            if (stdinData.length > 0) {
+                for (let i = 0; i < stdinData.length; i++) {
+                    emModule._stdinBuffer.push(stdinData[i]);
+                }
+            }
+        } else if (stopReason === FRISCY_STOP_TIMESLICE) {
+            // Cooperative yield: no stdin handshake required.
+            maybePostJitStats();
+        } else {
+            // Unknown stop reason; keep legacy stdin behavior for safety.
+            const stdinData = requestStdin(4096);
+            maybePostJitStats();
+            if (stdinData.length > 0) {
+                for (let i = 0; i < stdinData.length; i++) {
+                    emModule._stdinBuffer.push(stdinData[i]);
+                }
             }
         }
 

@@ -485,7 +485,19 @@ int main(int argc, char** argv) {
         // allowing JS to call friscy_resume() for stdin polling.
         std::cout << "[friscy-debug] Constructing Machine (binary bytes="
                   << binary.size() << ")\n";
-#if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD) || defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+#if defined(FRISCY_EXPERIMENT_EMPTY_MACHINE)
+        riscv::MachineOptions<riscv::RISCV64> machine_opts{};
+#if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+        machine_opts.use_memory_arena = false;
+        machine_opts.memory_max = 1024ULL << 20; // 1GiB page-backed budget
+#endif
+        std::cout << "[friscy-debug] Machine options: empty_machine"
+#if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+                  << " no_arena"
+#endif
+                  << "\n";
+        machine_ptr = std::make_unique<Machine>(machine_opts);
+#elif defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD) || defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
         riscv::MachineOptions<riscv::RISCV64> machine_opts{};
 #if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
         machine_opts.load_program = false;

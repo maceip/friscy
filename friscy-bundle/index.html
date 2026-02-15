@@ -584,6 +584,7 @@
                 jitPredictConfidence: parseFloatParam('jitpredconf'),
                 jitMarkovEnabled: !params.has('nojitmarkov') && !noPredict,
                 jitTripletEnabled: !params.has('nojittriplet') && !noPredict,
+                jitAwaitCompiler: params.has('jitawait'),
                 jitHudEnabled: !params.has('nojithud'),
             };
             return cfg;
@@ -1328,6 +1329,7 @@
                 jitPredictConfidence: jitCfg.jitPredictConfidence,
                 jitMarkovEnabled: jitCfg.jitMarkovEnabled,
                 jitTripletEnabled: jitCfg.jitTripletEnabled,
+                jitAwaitCompiler: jitCfg.jitAwaitCompiler,
             });
 
             await workerReady;
@@ -1798,6 +1800,7 @@
                 jitPredictConfidence: jitCfg.jitPredictConfidence,
                 jitMarkovEnabled: jitCfg.jitMarkovEnabled,
                 jitTripletEnabled: jitCfg.jitTripletEnabled,
+                jitAwaitCompiler: jitCfg.jitAwaitCompiler,
             });
             await workerReady;
             installWorkerRuntimeHandler();

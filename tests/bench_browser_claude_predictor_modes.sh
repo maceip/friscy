@@ -18,9 +18,9 @@ CLAUDE_CMD='/usr/bin/node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js
 EXPECTED_OUTPUT='Claude Code'
 OUT_FILE="$PROJECT_DIR/tests/perf/browser_claude_predictor_modes.latest.json"
 
-NO_PRED_QUERY='?noproxy&jithot=20&nojittrace=1&nojitmarkov=1&nojittriplet=1&jitbudget=6&jitqmax=96'
-EDGE_QUERY='?noproxy&jithot=20&jitedgehot=4&nojitmarkov=1&nojittriplet=1&jitbudget=6&jitqmax=96'
-EDGE_TRIPLET_QUERY='?noproxy&jithot=20&jitedgehot=4&jittrace3hot=3&jitpredk=2&jitpredconf=0.55&jitbudget=6&jitqmax=96'
+NO_PRED_QUERY='?noproxy&jithot=1&jitawait=1&nojittrace=1&nojitmarkov=1&nojittriplet=1&jitbudget=6&jitqmax=96'
+EDGE_QUERY='?noproxy&jithot=1&jitawait=1&jitedgehot=3&nojitmarkov=1&nojittriplet=1&jitbudget=6&jitqmax=96'
+EDGE_TRIPLET_QUERY='?noproxy&jithot=1&jitawait=1&jitedgehot=3&jittrace3hot=2&jitpredk=2&jitpredconf=0.5&jitbudget=6&jitqmax=96'
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

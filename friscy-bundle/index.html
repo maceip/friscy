@@ -1181,6 +1181,10 @@
             const jitEdgeHotThreshold = jitEdgeHotThresholdRaw !== null
                 ? Number.parseInt(jitEdgeHotThresholdRaw, 10)
                 : null;
+            const jitTraceTripletHotThresholdRaw = params.get('jittrace3hot');
+            const jitTraceTripletHotThreshold = jitTraceTripletHotThresholdRaw !== null
+                ? Number.parseInt(jitTraceTripletHotThresholdRaw, 10)
+                : null;
 
             // Send init message with SABs
             worker.postMessage({
@@ -1194,6 +1198,9 @@
                 jitOptimizeThreshold: Number.isFinite(jitOptimizeThreshold) ? jitOptimizeThreshold : null,
                 jitTraceEnabled,
                 jitEdgeHotThreshold: Number.isFinite(jitEdgeHotThreshold) ? jitEdgeHotThreshold : null,
+                jitTraceTripletHotThreshold: Number.isFinite(jitTraceTripletHotThreshold)
+                    ? jitTraceTripletHotThreshold
+                    : null,
             });
 
             await workerReady;

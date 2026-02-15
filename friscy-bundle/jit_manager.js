@@ -35,9 +35,14 @@ class JITManager {
         this.tieringEnabled = true;
         this.traceEnabled = true;
         this.traceEdgeHotThreshold = 8;
+        this.traceTripletHotThreshold = 6;
         this.traceMaxEdges = 4096;
+        this.traceMaxTriplets = 8192;
         // Map<"from_region:to_region", count>
         this.traceEdgeHits = new Map();
+        // Map<"a_region:b_region:c_region", count>
+        this.traceTripletHits = new Map();
+        this.lastTraceEdge = null;
 
         // Region size for compilation (16KB)
         this.regionSize = 16384;
@@ -65,6 +70,8 @@ class JITManager {
             regionMisses: 0,
             traceEdgesObserved: 0,
             traceCompilesTriggered: 0,
+            traceTripletsObserved: 0,
+            traceTripletCompilesTriggered: 0,
         };
 
         // Invalidation bitmap (1 bit per 4KB page)
@@ -94,12 +101,18 @@ class JITManager {
     /**
      * Configure trace-based hot-path promotion controls.
      */
-    configureTrace({ enabled, edgeHotThreshold } = {}) {
+    configureTrace({ enabled, edgeHotThreshold, tripletHotThreshold } = {}) {
         if (typeof enabled === 'boolean') {
             this.traceEnabled = enabled;
+            if (!enabled) {
+                this.lastTraceEdge = null;
+            }
         }
         if (Number.isInteger(edgeHotThreshold) && edgeHotThreshold > 0) {
             this.traceEdgeHotThreshold = edgeHotThreshold;
+        }
+        if (Number.isInteger(tripletHotThreshold) && tripletHotThreshold > 0) {
+            this.traceTripletHotThreshold = tripletHotThreshold;
         }
     }
 
@@ -204,6 +217,9 @@ class JITManager {
         const toRegion = (toPc >>> 0) & ~(this.regionSize - 1);
         if (fromRegion === toRegion) return;
 
+        const prevEdge = this.lastTraceEdge;
+        this.lastTraceEdge = { from: fromRegion, to: toRegion };
+
         const key = `${fromRegion.toString(16)}:${toRegion.toString(16)}`;
         if (!this.traceEdgeHits.has(key) && this.traceEdgeHits.size >= this.traceMaxEdges) {
             // Drop the oldest edge to keep memory bounded.
@@ -217,17 +233,60 @@ class JITManager {
         this.traceEdgeHits.set(key, count);
         this.stats.traceEdgesObserved++;
 
-        if (count < this.traceEdgeHotThreshold || !this.jitCompiler) return;
-        if (this.compiledRegions.has(toRegion) || this.compilingRegions.has(toRegion)) return;
+        // Build second-order trace signal:
+        // if we observed A->B and now see B->C, count triplet A->B->C.
+        let scheduledCompile = false;
+        const canCompileRegion =
+            this.jitCompiler &&
+            !this.compiledRegions.has(toRegion) &&
+            !this.compilingRegions.has(toRegion);
 
-        this.stats.traceCompilesTriggered++;
-        this.compileRegion(toRegion, 'trace-hot-edge', 'baseline').catch(e => {
-            console.warn(
-                `[JIT] Trace compile failed for 0x${toRegion.toString(16)} ` +
-                `(from 0x${fromRegion.toString(16)}):`,
-                e.message
-            );
-        });
+        if (prevEdge && prevEdge.to === fromRegion) {
+            const tripletKey = `${prevEdge.from.toString(16)}:${fromRegion.toString(16)}:${toRegion.toString(16)}`;
+            if (
+                !this.traceTripletHits.has(tripletKey) &&
+                this.traceTripletHits.size >= this.traceMaxTriplets
+            ) {
+                const oldest = this.traceTripletHits.keys().next().value;
+                if (oldest !== undefined) {
+                    this.traceTripletHits.delete(oldest);
+                }
+            }
+
+            const tripletCount = (this.traceTripletHits.get(tripletKey) || 0) + 1;
+            this.traceTripletHits.set(tripletKey, tripletCount);
+            this.stats.traceTripletsObserved++;
+
+            if (
+                tripletCount >= this.traceTripletHotThreshold &&
+                canCompileRegion
+            ) {
+                this.stats.traceTripletCompilesTriggered++;
+                scheduledCompile = true;
+                this.compileRegion(toRegion, 'trace-hot-triplet', 'baseline').catch(e => {
+                    console.warn(
+                        `[JIT] Triplet-trace compile failed for 0x${toRegion.toString(16)} ` +
+                        `(pattern ${prevEdge.from.toString(16)}->${fromRegion.toString(16)}->${toRegion.toString(16)}):`,
+                        e.message
+                    );
+                });
+            }
+        }
+
+        if (
+            !scheduledCompile &&
+            count >= this.traceEdgeHotThreshold &&
+            canCompileRegion
+        ) {
+            this.stats.traceCompilesTriggered++;
+            this.compileRegion(toRegion, 'trace-hot-edge', 'baseline').catch(e => {
+                console.warn(
+                    `[JIT] Trace compile failed for 0x${toRegion.toString(16)} ` +
+                    `(from 0x${fromRegion.toString(16)}):`,
+                    e.message
+                );
+            });
+        }
     }
 
     /**
@@ -414,6 +473,7 @@ class JITManager {
             hotPages: this.pageHitCounts.size,
             dirtyPages: this.dirtyPages.size,
             traceEdgesTracked: this.traceEdgeHits.size,
+            traceTripletsTracked: this.traceTripletHits.size,
         };
     }
 
@@ -427,6 +487,8 @@ class JITManager {
         this.regionHitCounts.clear();
         this.dirtyPages.clear();
         this.traceEdgeHits.clear();
+        this.traceTripletHits.clear();
+        this.lastTraceEdge = null;
         this.stats = {
             regionsCompiled: 0,
             baselineCompiles: 0,
@@ -439,6 +501,8 @@ class JITManager {
             regionMisses: 0,
             traceEdgesObserved: 0,
             traceCompilesTriggered: 0,
+            traceTripletsObserved: 0,
+            traceTripletCompilesTriggered: 0,
         };
     }
 }

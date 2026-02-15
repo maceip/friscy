@@ -202,6 +202,281 @@ static std::vector<uint8_t> load_from_vfs(const std::string& path) {
     return data;
 }
 
+// Node.js fetch shim for --jitless mode.
+// In Node 22+/24+, --jitless disables WebAssembly, which breaks undici-based
+// fetch initialization. We disable built-in fetch and provide a lightweight
+// http/https-backed implementation that supports common request/response usage.
+static const char* kNodeFetchShim = R"JS('use strict';
+
+(() => {
+  if (typeof globalThis.fetch === 'function') return;
+
+  const http = require('http');
+  const https = require('https');
+  const { Readable } = require('stream');
+
+  function makeAbortError(message = 'The operation was aborted') {
+    const err = new Error(message);
+    err.name = 'AbortError';
+    return err;
+  }
+
+  class Headers {
+    constructor(init) {
+      this._map = new Map();
+      if (!init) return;
+      if (init instanceof Headers) {
+        init.forEach((value, key) => this.append(key, value));
+        return;
+      }
+      if (Array.isArray(init)) {
+        for (const pair of init) {
+          if (!Array.isArray(pair) || pair.length < 2) continue;
+          this.append(pair[0], pair[1]);
+        }
+        return;
+      }
+      if (typeof init.forEach === 'function') {
+        init.forEach((value, key) => this.append(key, value));
+        return;
+      }
+      if (typeof init === 'object') {
+        for (const [key, value] of Object.entries(init)) {
+          if (Array.isArray(value)) {
+            for (const v of value) this.append(key, v);
+          } else if (value != null) {
+            this.append(key, value);
+          }
+        }
+      }
+    }
+
+    _normalizeName(name) {
+      return String(name).trim().toLowerCase();
+    }
+
+    append(name, value) {
+      const key = this._normalizeName(name);
+      if (!key) return;
+      const entry = this._map.get(key);
+      const str = String(value);
+      if (entry) {
+        entry.value = `${entry.value}, ${str}`;
+      } else {
+        this._map.set(key, { name: String(name), value: str });
+      }
+    }
+
+    set(name, value) {
+      const key = this._normalizeName(name);
+      if (!key) return;
+      this._map.set(key, { name: String(name), value: String(value) });
+    }
+
+    get(name) {
+      const key = this._normalizeName(name);
+      const entry = this._map.get(key);
+      return entry ? entry.value : null;
+    }
+
+    has(name) {
+      return this._map.has(this._normalizeName(name));
+    }
+
+    delete(name) {
+      this._map.delete(this._normalizeName(name));
+    }
+
+    forEach(cb, thisArg) {
+      for (const entry of this._map.values()) {
+        cb.call(thisArg, entry.value, entry.name, this);
+      }
+    }
+
+    *entries() {
+      for (const entry of this._map.values()) {
+        yield [entry.name, entry.value];
+      }
+    }
+
+    *keys() {
+      for (const entry of this._map.values()) {
+        yield entry.name;
+      }
+    }
+
+    *values() {
+      for (const entry of this._map.values()) {
+        yield entry.value;
+      }
+    }
+
+    [Symbol.iterator]() {
+      return this.entries();
+    }
+  }
+
+  function toBuffer(body) {
+    if (body == null) return null;
+    if (Buffer.isBuffer(body)) return body;
+    if (typeof body === 'string') return Buffer.from(body);
+    if (body instanceof URLSearchParams) return Buffer.from(body.toString());
+    if (body instanceof ArrayBuffer) return Buffer.from(new Uint8Array(body));
+    if (ArrayBuffer.isView(body)) {
+      return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    }
+    if (typeof body === 'object' && typeof body.toString === 'function') {
+      return Buffer.from(String(body));
+    }
+    throw new TypeError('Unsupported fetch body type for shim');
+  }
+
+  function buildRequest(input, init = {}) {
+    const sourceReq = (input && typeof input === 'object' && 'url' in input) ? input : null;
+    const urlValue = sourceReq ? sourceReq.url : input;
+    const url = new URL(String(urlValue));
+
+    const method = String(init.method || (sourceReq && sourceReq.method) || 'GET').toUpperCase();
+    const headers = new Headers(sourceReq ? sourceReq.headers : undefined);
+    if (init.headers !== undefined) {
+      const initHeaders = new Headers(init.headers);
+      initHeaders.forEach((value, key) => headers.set(key, value));
+    }
+
+    const body = (init.body !== undefined) ? init.body : (sourceReq ? sourceReq.body : undefined);
+    const signal = init.signal || (sourceReq && sourceReq.signal) || null;
+
+    return { url, method, headers, body, signal };
+  }
+
+  class Response {
+    constructor(nodeStream, options = {}) {
+      this.status = options.status || 200;
+      this.statusText = options.statusText || '';
+      this.ok = this.status >= 200 && this.status < 300;
+      this.headers = new Headers(options.headers || {});
+      this.url = options.url || '';
+      this.redirected = false;
+      this.type = 'basic';
+      this.bodyUsed = false;
+      this._nodeStream = nodeStream || null;
+      this.body = (this._nodeStream && Readable && typeof Readable.toWeb === 'function')
+        ? Readable.toWeb(this._nodeStream)
+        : null;
+    }
+
+    _consume() {
+      if (this.bodyUsed) {
+        return Promise.reject(new TypeError('Body is unusable: already read'));
+      }
+      this.bodyUsed = true;
+      if (!this._nodeStream) return Promise.resolve(Buffer.alloc(0));
+
+      return new Promise((resolve, reject) => {
+        const chunks = [];
+        this._nodeStream.on('data', (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        this._nodeStream.on('end', () => resolve(Buffer.concat(chunks)));
+        this._nodeStream.on('error', reject);
+      });
+    }
+
+    async arrayBuffer() {
+      const buf = await this._consume();
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    }
+
+    async text() {
+      const buf = await this._consume();
+      return buf.toString('utf8');
+    }
+
+    async json() {
+      return JSON.parse(await this.text());
+    }
+  }
+
+  class Request {
+    constructor(input, init = {}) {
+      const req = buildRequest(input, init);
+      this.url = req.url.toString();
+      this.method = req.method;
+      this.headers = req.headers;
+      this.body = req.body;
+      this.signal = req.signal;
+    }
+  }
+
+  function fetchShim(input, init = {}) {
+    const req = buildRequest(input, init);
+    if (req.signal && req.signal.aborted) {
+      return Promise.reject(makeAbortError());
+    }
+    if (req.body != null && (req.method === 'GET' || req.method === 'HEAD')) {
+      return Promise.reject(new TypeError('Request with GET/HEAD cannot have body'));
+    }
+
+    const bodyBuffer = toBuffer(req.body);
+    if (bodyBuffer && !req.headers.has('content-length')) {
+      req.headers.set('content-length', String(bodyBuffer.length));
+    }
+
+    const headersObject = {};
+    req.headers.forEach((value, key) => {
+      headersObject[key] = value;
+    });
+
+    const transport = (req.url.protocol === 'https:') ? https : http;
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const options = {
+        protocol: req.url.protocol,
+        hostname: req.url.hostname,
+        port: req.url.port || undefined,
+        path: `${req.url.pathname}${req.url.search}`,
+        method: req.method,
+        headers: headersObject,
+      };
+
+      const request = transport.request(options, (res) => {
+        if (done) return;
+        done = true;
+        resolve(new Response(res, {
+          status: res.statusCode || 0,
+          statusText: res.statusMessage || '',
+          headers: res.headers || {},
+          url: req.url.toString(),
+        }));
+      });
+
+      request.on('error', (err) => {
+        if (done) return;
+        done = true;
+        reject(err);
+      });
+
+      if (req.signal) {
+        req.signal.addEventListener('abort', () => {
+          if (done) return;
+          done = true;
+          request.destroy(makeAbortError());
+          reject(makeAbortError());
+        }, { once: true });
+      }
+
+      if (bodyBuffer) request.write(bodyBuffer);
+      request.end();
+    });
+  }
+
+  globalThis.Headers = globalThis.Headers || Headers;
+  globalThis.Request = globalThis.Request || Request;
+  globalThis.Response = globalThis.Response || Response;
+  globalThis.fetch = fetchShim;
+})();
+)JS";
+
 // Setup virtual /proc and /dev entries
 static void setup_virtual_files() {
     // /dev/null
@@ -293,6 +568,7 @@ static void setup_virtual_files() {
     // Node.js will create cache files here; persist via --export-tar
     g_vfs.mkdir("/tmp", 0777);
     g_vfs.mkdir("/tmp/node-compile-cache", 0777);
+    g_vfs.add_virtual_file("/tmp/friscy-fetch-shim.cjs", kNodeFetchShim);
 }
 
 // ============================================================================
@@ -712,9 +988,10 @@ int main(int argc, char** argv) {
             "LANG=C.UTF-8",
             "HOSTNAME=friscy",
             "TZ=UTC",
-            // Keep memory bounded, but do not force --jitless:
-            // undici/fetch in this Node build requires WebAssembly support.
-            "NODE_OPTIONS=--max-old-space-size=256",
+            // Keep jitless for CPU-bound stability/perf, but disable built-in
+            // undici fetch (requires WebAssembly under this Node build) and
+            // install a shim that provides fetch over http/https.
+            "NODE_OPTIONS=--jitless --no-experimental-fetch --max-old-space-size=256 --require=/tmp/friscy-fetch-shim.cjs",
             "NODE_COMPILE_CACHE=/tmp/node-compile-cache",
         };
         syscalls::g_exec_ctx.env = env;
@@ -726,8 +1003,8 @@ int main(int argc, char** argv) {
             guest_args.insert(guest_args.begin(), entry_path);
         }
 
-        // Note: --jitless can be faster for some pure-CPU JS in emulation, but it
-        // disables WebAssembly in this guest runtime, which breaks undici/fetch.
+        // Note: --jitless remains the fastest stable mode in emulation for
+        // JS-heavy workloads. Fetch compatibility is restored by a runtime shim.
 
         // Set up program arguments and environment
         if (use_dynamic_linker) {

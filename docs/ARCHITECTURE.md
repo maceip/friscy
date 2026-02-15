@@ -1,347 +1,337 @@
-# friscy: Docker Container → WebAssembly via libriscv
+# friscy Architecture
 
 ## Overview
 
-friscy converts OCI/Docker containers to WebAssembly by:
+friscy runs Docker containers in the browser by:
 1. Cross-compiling the container to RISC-V 64-bit
-2. Extracting the rootfs
-3. Running the entrypoint in libriscv (userland emulator)
-4. Compiling the whole thing to WebAssembly via Emscripten
+2. Extracting the rootfs as a tar
+3. Running the entrypoint in libriscv (userland RISC-V emulator)
+4. Compiling the emulator to WebAssembly via Emscripten
+5. JIT-compiling hot code regions to native Wasm at runtime
 
-This is the **CheerpX model**: userland-only emulation, no kernel boot.
-
----
-
-## Current Status (February 2025)
-
-| Layer | Status | Notes |
-|-------|--------|-------|
-| Interpreter (libriscv) | ✅ Complete | RV64GC, ~40% native speed |
-| Syscall Layer | ✅ ~50 syscalls | File, process, network, memory |
-| VFS (tar-backed) | ✅ Complete | Read-only, symlinks work |
-| Dynamic Linker | ✅ Complete | ld-musl, aux vector |
-| Networking | ✅ Complete | TCP/UDP via WebSocket proxy |
-| AOT Compiler (rv2wasm) | 🟡 70% | Disasm done, translation partial |
-| Wizer Snapshots | ⬜ Not started | For instant startup |
-
-**Next 3 Action Items**:
-1. **Test rv2wasm** - Build with `cargo build`, run on simple RISC-V ELF
-2. **Test dynamic linking** - Run Alpine busybox via `./friscy --rootfs alpine.tar /bin/busybox ls`
-3. **Complete rv2wasm dispatch** - Implement br_table in `wasm_builder.rs`
+This is userland-only emulation — no kernel boot, syscalls handled by the host.
 
 ---
 
-## Component Status Map
+## Runtime Architecture
 
 ```
-Legend:  [✓] Done   [~] Partial/Testing   [ ] Not Started   [○] Skeleton
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            BUILD-TIME TOOLS                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐     │
-│   │  friscy-pack    │ ───▶ │    rv2wasm      │ ───▶ │  Wizer          │     │
-│   │ [✓] CLI tool    │      │ [~] AOT compiler│      │ [ ] Pre-init    │     │
-│   │                 │      │                 │      │                 │     │
-│   │ • Docker export │      │ • ELF parsing   │      │ • Snapshot VFS  │     │
-│   │ • Rootfs tar    │      │ • RISC-V disasm │      │ • Snapshot mem  │     │
-│   │ • Manifest gen  │      │ • CFG builder   │      │ • Instant start │     │
-│   │ • index.html    │      │ • Wasm codegen  │      │                 │     │
-│   └────────┬────────┘      └────────┬────────┘      └─────────────────┘     │
-│            │                        │                                        │
-│            │    ┌───────────────────┘                                        │
-│            │    │                                                            │
-│            ▼    ▼                                                            │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                        Output Bundle                                  │   │
-│   │   friscy.wasm + friscy.js + rootfs.tar + manifest.json + index.html  │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              RUNTIME (Browser)                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                        friscy.wasm (Emscripten)                      │   │
-│   │  ┌───────────────────────────────────────────────────────────────┐  │   │
-│   │  │                   libriscv RV64GC Core                         │  │   │
-│   │  │  [✓] Threaded dispatch (computed goto → br_table)             │  │   │
-│   │  │  [✓] 512MB arena memory                                       │  │   │
-│   │  │  [✓] RV64IMAFDC instruction set                               │  │   │
-│   │  │  [✓] SIMD + bulk-memory enabled                               │  │   │
-│   │  └───────────────────────────────────────────────────────────────┘  │   │
-│   │                              │                                       │   │
-│   │  ┌───────────────────────────▼───────────────────────────────────┐  │   │
-│   │  │                    Syscall Layer (~50 syscalls)                │  │   │
-│   │  │  [✓] syscalls.hpp - file, process, memory, time               │  │   │
-│   │  │  [✓] network.hpp  - socket, connect, send, recv               │  │   │
-│   │  └───────────────────────────────────────────────────────────────┘  │   │
-│   │                              │                                       │   │
-│   │  ┌───────────────────────────▼───────────────────────────────────┐  │   │
-│   │  │                  Dynamic Linker Support                        │  │   │
-│   │  │  [✓] elf_loader.hpp - PT_INTERP detection                     │  │   │
-│   │  │  [✓] Aux vector setup (AT_PHDR, AT_ENTRY, AT_BASE, etc.)     │  │   │
-│   │  │  [✓] Load ld-musl-riscv64.so.1 at 0x40000000                 │  │   │
-│   │  │  [~] Integration testing with real containers                  │  │   │
-│   │  └───────────────────────────────────────────────────────────────┘  │   │
-│   │                              │                                       │   │
-│   │  ┌───────────────────────────▼───────────────────────────────────┐  │   │
-│   │  │                   Virtual File System                          │  │   │
-│   │  │  [✓] vfs.hpp - tar loading, dir tree, symlinks                │  │   │
-│   │  │  [ ] Lazy loading (on-demand from tar)                        │  │   │
-│   │  │  [ ] Write support (IndexedDB/OPFS backed)                    │  │   │
-│   │  └───────────────────────────────────────────────────────────────┘  │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                   │                                          │
-│   ┌───────────────────────────────▼─────────────────────────────────────┐   │
-│   │                      JavaScript Bridge Layer                         │   │
-│   │  [✓] network_bridge.js - WebSocket ↔ socket syscalls                │   │
-│   │  [~] Terminal I/O - xterm.js integration (in index.html)            │   │
-│   │  [ ] Storage bridge - IndexedDB/OPFS for persistence                │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                   │                                          │
-└───────────────────────────────────┼──────────────────────────────────────────┘
-                                    │ WebSocket
-┌───────────────────────────────────▼──────────────────────────────────────────┐
-│                              HOST MACHINE                                     │
-│   ┌─────────────────────────────────────────────────────────────────────┐    │
-│   │                     host_proxy (Go)                                  │    │
-│   │  [✓] WebSocket server → real TCP/UDP sockets                        │    │
-│   │  [ ] gvisor-tap-vsock integration (advanced networking)             │    │
-│   └─────────────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Browser — Main Thread                                │
+│                                                                          │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────────┐    │
+│  │  xterm.js    │  │ network_rpc      │  │ network_bridge.js      │    │
+│  │  terminal    │  │ _host.js         │  │ (WebTransport → TCP)   │    │
+│  └──────┬───────┘  └────────┬─────────┘  └────────────────────────┘    │
+│         │                    │                                           │
+│         │  stdin/stdout      │  Network RPC responses                    │
+│         ▼                    ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                SharedArrayBuffer Communication                    │   │
+│  │                                                                    │   │
+│  │  control_sab (4KB)        stdout_sab (64KB)      net_sab (64KB)   │   │
+│  │  ┌─────────────────┐     ┌──────────────────┐   ┌─────────────┐  │   │
+│  │  │ [0] command      │     │ [0] write_head   │   │ [0] lock    │  │   │
+│  │  │ [4] status       │     │ [4] read_tail    │   │ [4] op      │  │   │
+│  │  │ [8] length       │     │ [8+] ring data   │   │ [8] fd      │  │   │
+│  │  │ [12] fd          │     │     (65528 bytes) │   │ [64+] data  │  │   │
+│  │  │ [16] result      │     └──────────────────┘   └─────────────┘  │   │
+│  │  │ [20] exit_code   │                                              │   │
+│  │  │ [24] cols/rows   │     Atomics.wait / Atomics.notify            │   │
+│  │  │ [64+] payload    │                                              │   │
+│  │  └─────────────────┘                                               │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                              │                                           │
+└──────────────────────────────┼───────────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼───────────────────────────────────────────┐
+│                     Web Worker                                            │
+│                                                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │                   friscy.wasm (Emscripten)                         │   │
+│  │                                                                     │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐  │   │
+│  │  │               libriscv RV64GC Interpreter Core               │  │   │
+│  │  │                                                               │  │   │
+│  │  │  Dispatch: threaded (computed goto → br_table in Wasm)       │  │   │
+│  │  │  Memory:   31-bit flat arena (2GB), O(1) read/write          │  │   │
+│  │  │  ISA:      RV64IMAFDC (integer, multiply, atomic, FP, comp)  │  │   │
+│  │  │  Segments: up to 1024 execute segments (for V8 JIT regions)  │  │   │
+│  │  └─────────────────────────────────────────────────────────────┘  │   │
+│  │                                │                                    │   │
+│  │  ┌─────────────────────────────▼───────────────────────────────┐  │   │
+│  │  │              Syscall Layer (~80 handlers)                     │  │   │
+│  │  │                                                               │  │   │
+│  │  │  syscalls.hpp:  file I/O, mmap, mprotect, brk, clone,       │  │   │
+│  │  │                 futex, signals, execve, fork, ioctl,          │  │   │
+│  │  │                 epoll, pipe, eventfd, prctl, uname            │  │   │
+│  │  │  network.hpp:   socket, bind, listen, accept4, connect,      │  │   │
+│  │  │                 send, recv, getsockname, setsockopt,          │  │   │
+│  │  │                 epoll_pwait (socket polling)                   │  │   │
+│  │  │  vfs.hpp:       tar-backed VFS, /proc/self/*, /dev/tty,      │  │   │
+│  │  │                 /dev/null, /dev/urandom emulation              │  │   │
+│  │  │  elf_loader.hpp: ELF loading, dynamic linker, aux vector,    │  │   │
+│  │  │                  execve with interpreter reload                │  │   │
+│  │  └─────────────────────────────────────────────────────────────┘  │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │               rv2wasm_jit.wasm (Runtime JIT Compiler)              │   │
+│  │                                                                     │   │
+│  │  • Rust AOT compiler compiled to wasm32 (via wasm-bindgen)         │   │
+│  │  • compile_region(code_ptr, code_len, base_addr) → Wasm bytes      │   │
+│  │  • JIT'd modules share WebAssembly.Memory with interpreter         │   │
+│  │  • Managed by jit_manager.js (hot-region detection, invalidation)  │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │               worker.js (Orchestrator)                              │   │
+│  │                                                                     │   │
+│  │  • Loads Emscripten module + JIT compiler                           │   │
+│  │  • Resume loop: check JIT map → call compiled func or interpreter   │   │
+│  │  • stdin: Atomics.wait() blocks until main thread provides data     │   │
+│  │  • stdout: ring buffer writes + Atomics.notify()                    │   │
+│  │  • network: RPC via net_sab + Atomics.wait() for response           │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────────────┘
+                               │ WebTransport (HTTPS)
+┌──────────────────────────────▼───────────────────────────────────────────┐
+│                      Host Machine (Optional)                               │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │                    Network Proxy (Go)                               │   │
+│  │  • Accepts WebTransport connections                                 │   │
+│  │  • Creates real TCP sockets on behalf of guest                      │   │
+│  │  • Forwards data bidirectionally                                    │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Data Flow: Docker Image → Running in Browser
+## Memory Model
+
+### Flat Arena (31-bit)
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Docker     │     │  friscy-pack │     │    Deploy    │     │   Browser    │
-│   Image      │ ──▶ │  CLI Tool    │ ──▶ │   to CDN     │ ──▶ │   Runtime    │
-│              │     │              │     │              │     │              │
-│ myapp:latest │     │ Extract RV64 │     │ friscy.wasm  │     │ libriscv +   │
-│              │     │ rootfs + ELF │     │ rootfs.tar   │     │ syscalls +   │
-│              │     │              │     │ index.html   │     │ VFS          │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+Wasm Linear Memory (3-4 GB):
+┌─────────────────────────────────────────────────────────────────┐
+│ Emscripten heap (stack, malloc, C++ objects)                     │
+│ ...                                                              │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │            RISC-V Guest Arena (2 GB)                         │ │
+│ │                                                               │ │
+│ │  0x00000000 ┬─────────────────────────────────┐              │ │
+│ │             │ ELF segments (text, data, BSS)   │              │ │
+│ │  0x00400000 ┤                                  │              │ │
+│ │             │ Heap (brk / mmap)                │              │ │
+│ │             │                                  │              │ │
+│ │  0x18000000 │ Dynamic linker (ld-musl)         │              │ │
+│ │             │                                  │              │ │
+│ │  0x40000000+│ mmap'd regions (V8 code, etc.)   │              │ │
+│ │             │                                  │              │ │
+│ │  0x7FFFF000 │ Stack (grows down)               │              │ │
+│ │  0x7FFFFFFF ┴─────────────────────────────────┘              │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 
-Optional AOT path (future):
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  RISC-V ELF  │     │   rv2wasm    │     │  Native Wasm │
-│  binaries    │ ──▶ │  AOT Compile │ ──▶ │  (no interp) │
-│  from rootfs │     │  RV64→Wasm   │     │  5-20x faster│
-└──────────────┘     └──────────────┘     └──────────────┘
+Access: arena[guest_addr & 0x7FFFFFFF]  — single Wasm i32.load/i32.store
+No TLB, no page table walk. Page faults handled via exception + retry.
+```
+
+### Register Layout (at arena offset 0)
+
+```
+Offset    Content
+0x000     x0-x31: 32 integer registers × 8 bytes = 256 bytes
+0x100     f0-f31: 32 float32 registers × 4 bytes = 128 bytes
+0x180     f0-f31: 32 float64 registers × 8 bytes = 256 bytes
 ```
 
 ---
 
-## Architecture (Runtime)
+## JIT Tier
 
-## Pipeline
-
-### Step 1: Build Container for RISC-V
-
-```bash
-# Use docker buildx with RISC-V target
-docker buildx build --platform linux/riscv64 -t myapp:riscv64 .
-
-# Or pull existing multi-arch image
-docker pull --platform linux/riscv64 alpine:latest
-```
-
-### Step 2: Extract Rootfs
-
-```bash
-# Create container (don't run)
-docker create --platform linux/riscv64 --name temp myapp:riscv64
-
-# Export filesystem
-docker export temp > rootfs.tar
-
-# Get entrypoint/cmd
-docker inspect temp --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}'
-
-# Cleanup
-docker rm temp
-```
-
-### Step 3: Pack for libriscv
-
-Options:
-- **Embedded**: Convert rootfs.tar to C byte array (small containers <10MB)
-- **Fetch**: Load rootfs.tar via HTTP at runtime (larger containers)
-- **9P**: Stream files on-demand from JavaScript (lowest memory)
-
-### Step 4: Run in libriscv
-
-The host (main.cpp) provides:
-- RISC-V RV64GC emulation
-- Linux syscall emulation (~100 syscalls for typical workloads)
-- Virtual filesystem backed by the container rootfs
-- stdin/stdout/stderr routing to JavaScript
-
-## Key Design Decisions
-
-### Static vs Dynamic Linking
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| Static (musl) | Simple, single binary | Larger binary, rebuild needed |
-| Dynamic | Standard, smaller binaries | Need to emulate ld-linux, load .so files |
-
-**Recommendation**: Start with static (Alpine/musl), add dynamic later.
-
-### Filesystem Strategy
-
-| Strategy | Memory | Latency | Complexity |
-|----------|--------|---------|------------|
-| Embedded tar | High | None | Low |
-| HTTP fetch | Medium | Startup | Medium |
-| 9P on-demand | Low | Per-file | High |
-
-**Recommendation**: Start with embedded tar, add 9P for large containers.
-
-### Syscall Coverage
-
-Minimum viable set (~40 syscalls):
-- Process: exit, exit_group, getpid, getuid, gettimeofday
-- Memory: brk, mmap, munmap, mprotect
-- Files: open, close, read, write, lseek, fstat, stat, readlink
-- Dirs: getdents64, getcwd, chdir
-- I/O: ioctl (basic), fcntl
-- Misc: uname, clock_gettime, getrandom
-
-Full compatibility (~100 syscalls) adds:
-- Signals: rt_sigaction, rt_sigprocmask
-- Threads: clone, futex (for multi-threaded apps)
-- Network: socket, connect, bind, listen, accept, recvfrom, sendto
-- Advanced: epoll, eventfd, pipe
-
-## Networking Architecture
-
-friscy provides network access to containers via a WebSocket bridge to a host-side
-proxy. This enables socket syscalls (TCP/UDP) without browser networking restrictions.
+### Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Browser                                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                     friscy.wasm                                │  │
-│  │  ┌──────────────┐      ┌──────────────┐                       │  │
-│  │  │ RISC-V Guest │ ──── │ network.hpp  │                       │  │
-│  │  │ socket()     │      │ (syscalls)   │                       │  │
-│  │  └──────────────┘      └──────┬───────┘                       │  │
-│  └───────────────────────────────┼───────────────────────────────┘  │
-│                                  │ EM_ASM                            │
-│  ┌───────────────────────────────▼───────────────────────────────┐  │
-│  │                  network_bridge.js                             │  │
-│  │  • Translates socket calls to WebSocket messages               │  │
-│  │  • Buffers received data                                       │  │
-│  │  • Handles connect/send/recv                                   │  │
-│  └───────────────────────────────┬───────────────────────────────┘  │
-└──────────────────────────────────┼──────────────────────────────────┘
-                                   │ WebSocket
-                                   │ ws://localhost:8765
-┌──────────────────────────────────▼──────────────────────────────────┐
-│                          Host Machine                                │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                    host_proxy (Go)                             │  │
-│  │  • Accepts WebSocket connections                               │  │
-│  │  • Creates real TCP/UDP sockets                                │  │
-│  │  • Forwards data between browser and network                   │  │
-│  │  • Optional: gvisor-tap-vsock for advanced networking          │  │
-│  └───────────────────────────────┬───────────────────────────────┘  │
-│                                  │                                   │
-│                                  ▼                                   │
-│                         Real Network / Internet                      │
-└─────────────────────────────────────────────────────────────────────┘
+                    ┌──────────────────┐
+                    │  Interpreter     │
+                    │  executes code   │
+                    └────────┬─────────┘
+                             │ PC exits to JS
+                             ▼
+                    ┌──────────────────┐
+                    │  jit_manager.js  │
+                    │  records PC hit  │
+                    └────────┬─────────┘
+                             │ hit count > threshold?
+                     no      │      yes
+                    ┌────────┴──────────┐
+                    │                    │
+                    ▼                    ▼
+            ┌───────────────┐   ┌──────────────────┐
+            │ friscy_resume │   │ rv2wasm_jit.wasm  │
+            │ (interpreter) │   │ compile_region()  │
+            └───────────────┘   └────────┬─────────┘
+                                         │ Wasm bytes
+                                         ▼
+                                ┌──────────────────┐
+                                │ WebAssembly       │
+                                │ .instantiate()    │
+                                │ (shared memory)   │
+                                └────────┬─────────┘
+                                         │
+                                         ▼
+                                ┌──────────────────┐
+                                │ Direct call to    │
+                                │ JIT'd function    │
+                                │ → returns next PC │
+                                └──────────────────┘
 ```
 
-### Supported Socket Syscalls
+### Invalidation
 
-| Syscall | Number | Status | Notes |
-|---------|--------|--------|-------|
-| socket | 198 | ✅ | AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM |
-| bind | 200 | ✅ | Via proxy |
-| listen | 201 | ✅ | Via proxy |
-| accept | 202 | ⚠️ | Async, limited |
-| connect | 203 | ✅ | Returns EINPROGRESS, async completion |
-| getsockname | 204 | ✅ | Returns localhost |
-| getpeername | 205 | ⚠️ | Stub |
-| sendto | 206 | ✅ | Via proxy |
-| recvfrom | 207 | ✅ | Buffered in JS |
-| setsockopt | 208 | ✅ | Most options ignored |
-| getsockopt | 209 | ✅ | SO_ERROR returns 0 |
-| shutdown | 210 | ✅ | Via proxy |
+When guest code calls `mprotect(PROT_WRITE)` on a page containing JIT'd code,
+the syscall handler signals `jit_manager.js` to invalidate the corresponding
+compiled functions. Uses a dirty-page set (1 entry per 4KB page).
 
-### Running with Networking
+---
 
-```bash
-# Terminal 1: Start host proxy
-cd host_proxy && go run main.go -listen :8765
+## Worker Communication Protocol
 
-# Terminal 2: Run friscy in browser
-# The network_bridge.js will connect to ws://localhost:8765
+### stdin (worker blocks for input)
+
+1. Worker: `Atomics.store(control[0], CMD_STDIN_REQUEST)` + `Atomics.notify()`
+2. Worker: `Atomics.wait(control[0], CMD_STDIN_REQUEST)` — **blocks**
+3. Main: sees request, writes input bytes to `control[64+]`
+4. Main: `Atomics.store(control[0], CMD_STDIN_READY)` + `Atomics.notify()`
+5. Worker: wakes, reads bytes, resets to `CMD_IDLE`
+
+### stdout (worker writes ring buffer)
+
+1. Worker: writes bytes to `stdout_sab[8+]` ring buffer
+2. Worker: updates `write_head` atomically, `Atomics.notify()`
+3. Main: polls at 4ms, drains ring buffer → `term.write()`
+
+### Network RPC (worker → main → network)
+
+1. Worker: writes op/fd/args to `net_sab`, `Atomics.store(lock, 1)`
+2. Worker: `Atomics.wait(lock, 1)` — **blocks**
+3. Main: polls `net_sab`, dispatches to `FriscyNetworkBridge`
+4. Main: writes result to `net_sab`, `Atomics.store(lock, 2)` + notify
+5. Worker: wakes, reads result
+
+---
+
+## Build Configuration
+
+| Flag | Value | Purpose |
+|------|-------|---------|
+| `RISCV_ENCOMPASSING_ARENA_BITS` | 31 | 2GB guest address space |
+| `RISCV_FLAT_RW_ARENA` | ON | O(1) memory access (no page table) |
+| `RISCV_THREADED` | ON | Computed goto dispatch |
+| `RISCV_MAX_EXECUTE_SEGS` | 1024 | Support V8 JIT code regions |
+| `-sSHARED_MEMORY=1` | Emscripten | Enable SharedArrayBuffer |
+| `-matomics -mbulk-memory` | All TUs | Required for shared memory |
+| `-fwasm-exceptions` | Compile+Link | Final-spec try_table/exnref |
+| `INITIAL_MEMORY` | 3GB | 2GB arena + overhead |
+| `MAXIMUM_MEMORY` | 4GB | wasm32 limit |
+
+### What was removed
+
+| Removed | Why |
+|---------|-----|
+| `-sJSPI` | Replaced by Atomics.wait in Worker |
+| `-sJSPI_EXPORTS` | No longer needed |
+| `emscripten_sleep(0)` | Worker blocks freely |
+| `g_waiting_for_stdin` + `machine.stop()` | Atomics.wait replaces this pattern |
+
+---
+
+## Syscall Coverage
+
+### Fully Implemented (~80 syscalls)
+
+**File I/O**: openat, close, read, write, readv, writev, pread64, pwrite64,
+lseek, fstat, newfstatat, readlinkat, faccessat, mkdirat, unlinkat, renameat2,
+ftruncate, fcntl, ioctl, dup, dup3
+
+**Memory**: mmap, munmap, mprotect, madvise, mremap (stub: -ENOMEM), brk (libriscv)
+
+**Process**: clone, execve, fork, exit, exit_group, wait4, getpid, getppid,
+gettid, set_tid_address, prctl, prlimit64
+
+**Signals**: rt_sigaction, rt_sigprocmask, rt_sigreturn, kill, tgkill
+
+**Time**: clock_gettime, clock_getres, gettimeofday, nanosleep
+
+**Network**: socket, bind, listen, accept4, connect, sendto, recvfrom,
+getsockname, getpeername, setsockopt, getsockopt, shutdown
+
+**Epoll**: epoll_create1, epoll_ctl, epoll_pwait (with socket FD polling)
+
+**Other**: pipe2, eventfd2, futex, getrandom, uname, getcwd, chdir, fchdir,
+capget, getuid/geteuid/getgid/getegid, membarrier, sched_getaffinity
+
+### Stub / No-op
+
+| Syscall | Returns | Reason |
+|---------|---------|--------|
+| mremap | -ENOMEM | V8 page probe (2048 calls, all fail on real Linux too) |
+| io_uring_setup | -ENOSYS | Node.js falls back to epoll |
+| riscv_hwprobe | -ENOSYS | Hardware probe, not needed in emulation |
+| clone3 | -ENOSYS | Regular clone works |
+
+---
+
+## Networking
+
+### Native Mode
+
+Direct host TCP sockets via `::socket()`, `::connect()`, `::send()`, `::recv()`.
+Socket FDs start at 1000, epoll FDs at 2000 (no collision).
+`read()`/`write()`/`writev()` on socket FDs delegate to `::recv()`/`::send()`.
+
+### Browser Mode (WebTransport)
+
+```
+Guest socket syscall
+    → network.hpp (C++ handler)
+    → EM_ASM writes to net_sab
+    → Atomics.wait blocks worker
+    → Main thread polls net_sab
+    → network_rpc_host.js dispatches
+    → network_bridge.js → WebTransport → proxy → real TCP
+    → Response flows back through same chain
 ```
 
-### Advanced: gvisor-tap-vsock Integration
-
-For more advanced networking (HTTPS interception, custom routing), the host_proxy
-can be extended to use gvisor-tap-vsock's userspace network stack:
-
-```go
-import (
-    "github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
-    "github.com/containers/gvisor-tap-vsock/pkg/types"
-)
-```
-
-This enables:
-- Full TCP/IP stack in userspace
-- MITM HTTPS proxying with dynamic certs
-- Custom DNS resolution
-- NAT traversal
+---
 
 ## File Structure
 
 ```
-friscy/
-├── main.cpp                # Entry point, machine setup, dynamic linker
-├── vfs.hpp                 # Virtual filesystem (tar-backed)
-├── syscalls.hpp            # Linux syscall handlers (~50 syscalls)
-├── network.hpp             # Socket syscall handlers
-├── elf_loader.hpp          # ELF parsing, aux vector, dynlink namespace
-├── network_bridge.js       # Browser WebSocket ↔ socket bridge
-├── CMakeLists.txt          # Build config (Emscripten + native)
-├── harness.sh              # Docker-based Wasm build script
-│
-├── friscy-pack             # [✓] CLI: Docker image → browser bundle
-│
-├── aot/                # [~] RISC-V → Wasm AOT compiler (Rust)
-│   ├── Cargo.toml          #     Dependencies: goblin, wasm-encoder, clap
-│   └── src/
-│       ├── main.rs         # [✓] CLI entry point
-│       ├── lib.rs          # [✓] Library interface + compile() function
-│       ├── elf.rs          # [✓] ELF parsing (goblin)
-│       ├── disasm.rs       # [✓] RISC-V disassembler (RV64GC, 80+ opcodes)
-│       ├── cfg.rs          # [✓] Control flow graph construction
-│       ├── translate.rs    # [~] RISC-V → Wasm translation (core ops done)
-│       └── wasm_builder.rs # [~] Wasm module emission (wasm-encoder)
-│
-├── proxy/             # Host-side network proxy
-│   ├── main.go             # WebSocket → real TCP/UDP
-│   └── go.mod
-│
-├── tests/
-│   ├── test_http_minimal.c # HTTP networking test
-│   ├── test_server.py      # Test HTTP server
-│   └── run_network_test.sh
-│
-├── ARCHITECTURE.md         # This file
-├── PERFORMANCE_ROADMAP.md  # Implementation status & roadmap
-└── CRAZY_PERF_IDEAS.md     # Advanced optimization strategies
+runtime/
+├── main.cpp          # 780 lines — entry point, simulate loop, exports
+├── syscalls.hpp      # 3800 lines — all syscall handlers
+├── network.hpp       # 450 lines — socket/epoll handlers
+├── vfs.hpp           # 400 lines — tar-backed VFS
+├── elf_loader.hpp    # 350 lines — ELF loading, dynamic linker
+└── CMakeLists.txt    # 200 lines — build config
+
+aot/src/
+├── main.rs           # CLI entry point
+├── elf.rs            # ELF parser (goblin)
+├── disasm.rs         # RV64GC decoder (~240 opcodes)
+├── cfg.rs            # Control flow graph
+├── translate.rs      # 2400 lines — RV→Wasm IR
+└── wasm_builder.rs   # Wasm emission (3 dispatch strategies)
+
+friscy-bundle/
+├── index.html        # 1060 lines — web shell, Worker spawn, SAB I/O
+├── worker.js         # 445 lines — Worker entry, resume loop
+├── jit_manager.js    # 293 lines — hot-region JIT
+├── network_bridge.js # 658 lines — WebTransport bridge
+├── network_rpc_host.js # 216 lines — network RPC handler
+├── serve.js          # 88 lines — dev server (COOP/COEP)
+└── service-worker.js # 115 lines — offline caching
 ```

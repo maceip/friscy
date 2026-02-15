@@ -1,62 +1,71 @@
-# friscy Knowledge Base — Table of Contents
+# friscy
 
-This file is the entry point.  It tells you (or an LLM agent) **where to look**
-for every category of project knowledge.  It does not duplicate content — each
-link leads to a dedicated document that owns its topic.
+friscy runs Docker containers in the browser. It cross-compiles containers to
+RISC-V 64-bit, emulates them in libriscv (userland only, no kernel), and
+compiles the emulator to WebAssembly via Emscripten. Hot code paths are
+JIT-compiled from RISC-V to native Wasm at runtime.
 
-## Architecture & Code
+## Architecture
 
-| Document | What it covers |
-|----------|---------------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, component status, data flow, file structure |
-| [docs/DESIGN.md](docs/DESIGN.md) | Design philosophy — userland emulation, libriscv, Emscripten |
-| [docs/FRONTEND.md](docs/FRONTEND.md) | Browser UI, xterm.js terminal, friscy-bundle |
-| [docs/SECURITY.md](docs/SECURITY.md) | Wasm sandbox model, network proxy trust boundaries |
-| [docs/RELIABILITY.md](docs/RELIABILITY.md) | Syscall coverage guarantees, crash handling, VFS durability |
+See `ARCHITECTURE.md` for the codemap, invariants, and system boundaries.
 
-## Product
+## Code layout
 
-| Document | What it covers |
-|----------|---------------|
-| [docs/PRODUCT_SENSE.md](docs/PRODUCT_SENSE.md) | Target users, jobs-to-be-done, competitive positioning |
-| [docs/product-specs/index.md](docs/product-specs/index.md) | Feature specs index |
-| [docs/QUALITY_SCORE.md](docs/QUALITY_SCORE.md) | Quality rubric, metrics, current vs target scores |
+| Path | What lives there |
+|------|------------------|
+| `runtime/` | C++ emulator: libriscv integration, syscall handlers, VFS, ELF loader |
+| `aot/` | Rust AOT compiler (`rv2wasm`): RISC-V ELF to standalone Wasm |
+| `aot-jit/` | Rust JIT tier: `rv2wasm` compiled to wasm32 via wasm-bindgen |
+| `friscy-bundle/` | Browser deployment: HTML shell, Worker, JIT manager, network bridge |
+| `vendor/libriscv/` | RISC-V emulator library (upstream, with local patches) |
+| `tools/` | Dockerfiles for guest rootfs images |
+| `proxy/` | Go WebTransport-to-TCP network proxy |
+| `tests/` | Integration tests (Node.js scripts) |
+| `docs/` | All documentation beyond this file and ARCHITECTURE.md |
 
-## Design Decisions
+## docs/ structure
 
-| Document | What it covers |
-|----------|---------------|
-| [docs/design-docs/index.md](docs/design-docs/index.md) | ADR log (index of all design docs) |
+| Path | Contents |
+|------|----------|
+| `docs/DESIGN.md` | Design philosophy: userland emulation, libriscv, Emscripten |
+| `docs/FRONTEND.md` | Browser UI, xterm.js, Worker communication |
+| `docs/SECURITY.md` | Wasm sandbox model, network proxy trust boundaries |
+| `docs/RELIABILITY.md` | Syscall coverage guarantees, crash handling, VFS durability |
+| `docs/PLANS.md` | Roadmap, milestones, current focus |
+| `docs/design-docs/` | Architecture Decision Records (ADR log) |
+| `docs/exec-plans/` | Execution plans: `active/`, `completed/`, `tech-debt-tracker.md` |
+| `docs/product-specs/` | Feature specs |
+| `docs/references/` | Reference material (LLM-friendly docs, external specs) |
+| `docs/generated/` | Auto-generated documentation |
 
-## Planning & Execution
+## Build commands
 
-| Document | What it covers |
-|----------|---------------|
-| [docs/PLANS.md](docs/PLANS.md) | Roadmap, milestones, current focus |
-| [docs/exec-plans/active/](docs/exec-plans/active/) | In-flight execution plans |
-| [docs/exec-plans/completed/](docs/exec-plans/completed/) | Archived plans |
-| [docs/exec-plans/tech-debt-tracker.md](docs/exec-plans/tech-debt-tracker.md) | Known tech debt with priority |
+```bash
+# Emscripten (Docker) — produces friscy.wasm + friscy.js
+docker run --rm -v $(pwd):/src emscripten/emsdk:latest bash -c \
+  "cd /src && mkdir -p build-wasm && cd build-wasm && emcmake cmake ../runtime && emmake make -j\$(nproc)"
+cp build-wasm/friscy.{js,wasm} friscy-bundle/
 
-## Generated & Reference
+# Native
+mkdir -p build-native && cd build-native && cmake ../runtime && make -j$(nproc)
 
-| Document | What it covers |
-|----------|---------------|
-| [docs/generated/](docs/generated/) | Auto-generated documentation (empty — future use) |
-| [docs/references/](docs/references/) | Third-party LLM-friendly reference files |
+# AOT compiler
+cd aot && cargo build --release
 
-## Existing Documentation
+# JIT tier (wasm32)
+cd aot-jit && wasm-pack build --target web
 
-| Document | What it covers |
-|----------|---------------|
-| [docs/ENDZIEL.md](docs/ENDZIEL.md) | Advanced optimization strategies, performance tiers |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Detailed implementation status and TODOs |
-| [docs/WORKSTREAMS.md](docs/WORKSTREAMS.md) | Parallel workstream organization and validation |
+# Guest rootfs
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.claude -t friscy-claude . --load
 
-## Maintenance
+# Serve web shell (requires COOP/COEP for SharedArrayBuffer)
+node friscy-bundle/serve.js 9000
+```
 
-The knowledge base is validated by CI:
+## Conventions
 
-- **`.github/workflows/docs-lint.yml`** — checks structure, cross-links, and
-  freshness on every PR.
-- **`scripts/doc-gardening.sh`** — agent that scans for stale docs and opens
-  fix-up issues.  Runs weekly via `.github/workflows/doc-gardening.yml`.
+- Runtime C++ is header-only: `syscalls.hpp`, `network.hpp`, `vfs.hpp`, `elf_loader.hpp` are included from `main.cpp`.
+- Emscripten flags: always use `-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0` at both compile and link. Never use legacy exception handling.
+- Shared memory: `-sSHARED_MEMORY=1 -matomics -mbulk-memory` on all translation units.
+- AOT compiler uses `wasm-encoder 0.201.0` (API: `ty`/`table`, not `type_index`/`table_index`).
+- Rust toolchain: `export PATH="$HOME/.cargo/bin:$PATH"` before cargo commands.

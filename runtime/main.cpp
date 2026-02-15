@@ -209,8 +209,6 @@ static std::vector<uint8_t> load_from_vfs(const std::string& path) {
 static const char* kNodeFetchShim = R"JS('use strict';
 
 (() => {
-  if (typeof globalThis.fetch === 'function') return;
-
   const http = require('http');
   const https = require('https');
   const { Readable } = require('stream');
@@ -470,9 +468,9 @@ static const char* kNodeFetchShim = R"JS('use strict';
     });
   }
 
-  globalThis.Headers = globalThis.Headers || Headers;
-  globalThis.Request = globalThis.Request || Request;
-  globalThis.Response = globalThis.Response || Response;
+  globalThis.Headers = Headers;
+  globalThis.Request = Request;
+  globalThis.Response = Response;
   globalThis.fetch = fetchShim;
 })();
 )JS";
@@ -988,10 +986,9 @@ int main(int argc, char** argv) {
             "LANG=C.UTF-8",
             "HOSTNAME=friscy",
             "TZ=UTC",
-            // Keep jitless for CPU-bound stability/perf, but disable built-in
-            // undici fetch (requires WebAssembly under this Node build) and
-            // install a shim that provides fetch over http/https.
-            "NODE_OPTIONS=--jitless --no-experimental-fetch --max-old-space-size=256 --require=/tmp/friscy-fetch-shim.cjs",
+            // Keep jitless for CPU-bound stability/perf and force-install
+            // a fetch shim that avoids undici's WebAssembly dependency.
+            "NODE_OPTIONS=--jitless --max-old-space-size=256 --require=/tmp/friscy-fetch-shim.cjs",
             "NODE_COMPILE_CACHE=/tmp/node-compile-cache",
         };
         syscalls::g_exec_ctx.env = env;

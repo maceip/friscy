@@ -22,6 +22,12 @@ VENDOR_DIR="$PROJECT_DIR/vendor"
 TARGET_DIR="$VENDOR_DIR/libriscv"
 mkdir -p "$VENDOR_DIR"
 
+# If libriscv is vendored directly (no .git), skip pinning entirely
+if [[ -d "$TARGET_DIR" && ! -d "$TARGET_DIR/.git" ]]; then
+    echo "[pin-libriscv] libriscv is vendored in-repo (no .git), skipping pin"
+    exit 0
+fi
+
 if [[ ! -d "$TARGET_DIR/.git" ]]; then
     echo "[pin-libriscv] Cloning libriscv..."
     git clone https://github.com/libriscv/libriscv.git "$TARGET_DIR"

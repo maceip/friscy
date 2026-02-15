@@ -590,7 +590,10 @@ self.onmessage = async function(e) {
             maybePostJitStats(true);
             signalExit(0);
         } catch (e) {
-            writeStdoutRing(encoder.encode(`\r\n[worker] Error: ${e.message}\r\n`));
+            const errMsg = e?.message || String(e);
+            const errStack = e?.stack ? `\n${e.stack}` : '';
+            console.error('[worker] Run failed:', errMsg, e?.stack || '');
+            writeStdoutRing(encoder.encode(`\r\n[worker] Error: ${errMsg}${errStack}\r\n`));
             maybePostJitStats(true);
             signalExit(1);
         }

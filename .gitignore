@@ -1,11 +1,11 @@
 # Build directories
 build/
 build-native/
+build-wasm/
 runtime/build/
 runtime/build-native/
-
-# Downloaded dependencies (libriscv)
-vendor/libriscv/
+node_modules/
+target/
 
 # Emscripten SDK (if installed locally)
 tools/emsdk/
@@ -13,6 +13,11 @@ tools/emsdk/
 # Go artifacts
 proxy/go.sum
 proxy/proxy
+proxy/friscy-proxy
+
+# Secrets
+proxy/cert.pem
+proxy/key.pem
 
 # Rust artifacts
 aot/target/

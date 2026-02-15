@@ -23,6 +23,7 @@ const NET_OP_HAS_PENDING_ACCEPT = 10;
 const NET_OP_SETSOCKOPT = 11;
 const NET_OP_GETSOCKOPT = 12;
 const NET_OP_SHUTDOWN = 13;
+const ERR_NET_UNREACH = -101; // ENETUNREACH
 
 const NET_HEADER = 64;
 const NET_DATA_SIZE = 65472;
@@ -38,9 +39,24 @@ export class NetworkRPCHost {
     constructor(netSab, bridge) {
         this.netView = new Int32Array(netSab);
         this.netBytes = new Uint8Array(netSab);
-        this.bridge = bridge;
+        this.bridge = bridge || this._createOfflineBridge();
         this.running = false;
         this._pollTimer = null;
+    }
+
+    _createOfflineBridge() {
+        return {
+            nextConnID: 1,
+            fdToConnID: new Map(),
+            connections: new Map(),
+            acceptQueues: new Map(),
+            handleConnect: () => ERR_NET_UNREACH,
+            handleBind: () => ERR_NET_UNREACH,
+            handleListen: () => ERR_NET_UNREACH,
+            handleAccept: () => -11, // EAGAIN
+            handleSend: () => ERR_NET_UNREACH,
+            handleClose: () => 0,
+        };
     }
 
     /**

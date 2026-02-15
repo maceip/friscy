@@ -25,6 +25,7 @@ const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './nodejs-claude.tar';
 const WAIT_FOR_EXIT = process.env.FRISCY_TEST_WAIT_FOR_EXIT !== '0';
 const METRIC_WAIT_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_METRIC_WAIT_TIMEOUT_MS || '180000', 10);
 const SYNTH_BUNDLE_MB = Number.parseInt(process.env.FRISCY_TEST_SYNTH_BUNDLE_MB || '6', 10);
+const NETWORK_READY_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_NETWORK_READY_TIMEOUT_MS || '30000', 10);
 
 const GUEST_WORKLOAD_SOURCE_TEMPLATE = String.raw`
 const vm = require('vm');
@@ -341,6 +342,7 @@ async function main() {
         const start = Date.now();
         let sawSyntheticMarker = false;
         let lastLog = 0;
+        let netWaitLogged = false;
         while (Date.now() - start < 600000) {
             let status = '';
             let content = '';
@@ -368,6 +370,18 @@ async function main() {
                 foundAtMs = Date.now();
                 if (!WAIT_FOR_EXIT) break;
                 console.log('[test] Synthetic marker observed; waiting for exit/metrics...');
+            }
+
+            const netOn = /wasmnet:\s*on/i.test(status);
+            if (!netOn) {
+                const netElapsed = Date.now() - start;
+                if (!netWaitLogged && netElapsed >= 5000) {
+                    netWaitLogged = true;
+                    console.log('[test] waiting for proxy/network to become available...');
+                }
+                if (netElapsed >= NETWORK_READY_TIMEOUT_MS) {
+                    throw new Error(`network did not come online within ${NETWORK_READY_TIMEOUT_MS}ms (status="${status}")`);
+                }
             }
 
             if (sawSyntheticMarker && WAIT_FOR_EXIT) {

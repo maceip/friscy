@@ -1455,11 +1455,10 @@
                 updateNetStatus('disconnected');
             }
 
-            // Start network RPC host (polls netSab for worker requests)
-            if (netBridge) {
-                netRPCHost = new NetworkRPCHost(netSab, netBridge);
-                netRPCHost.start();
-            }
+            // Always start network RPC host to avoid worker-side socket deadlocks.
+            // When no proxy is available, the host returns ENETUNREACH immediately.
+            netRPCHost = new NetworkRPCHost(netSab, netBridge || null);
+            netRPCHost.start();
 
             // Transition: hide overlay FIRST, then show + open terminals
             overlayEl.classList.add('hidden');
@@ -2109,7 +2108,8 @@
                     updateNetStatus('connected');
                 } catch (e) { updateNetStatus('disconnected'); }
             } else { updateNetStatus('disconnected'); }
-            if (netBridge) { netRPCHost = new NetworkRPCHost(netSab, netBridge); netRPCHost.start(); }
+            netRPCHost = new NetworkRPCHost(netSab, netBridge || null);
+            netRPCHost.start();
 
             // Show terminal
             overlayEl.classList.add('hidden');

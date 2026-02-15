@@ -480,11 +480,35 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Create machine with main executable
+        // Create machine with main executable.
         // Use static unique_ptr so machine survives after main() returns,
         // allowing JS to call friscy_resume() for stdin polling.
+        std::cout << "[friscy-debug] Constructing Machine (binary bytes="
+                  << binary.size() << ")\n";
+#if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD) || defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+        riscv::MachineOptions<riscv::RISCV64> machine_opts{};
+#if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
+        machine_opts.load_program = false;
+#endif
+#if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+        machine_opts.use_memory_arena = false;
+        machine_opts.memory_max = 1024ULL << 20; // 1GiB page-backed budget
+#endif
+        std::cout << "[friscy-debug] Machine options:"
+#if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
+                  << " no_program_load"
+#endif
+#if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+                  << " no_arena"
+#endif
+                  << "\n";
+        machine_ptr = std::make_unique<Machine>(binary, machine_opts);
+#else
         machine_ptr = std::make_unique<Machine>(binary);
+#endif
         auto& machine = *machine_ptr;
+        std::cout << "[friscy-debug] Machine constructed (pc=0x"
+                  << std::hex << machine.cpu.pc() << std::dec << ")\n";
 
         // If dynamic, also load the interpreter at a high address
         if (use_dynamic_linker) {

@@ -110,7 +110,6 @@ function looksLikeHaiku(lines) {
 async function main() {
     let server = null;
     let browser = null;
-    let originalManifest = null;
     let instructionCount = null;
     let guestExitCode = null;
     let jitCompilerLoaded = false;
@@ -118,10 +117,10 @@ async function main() {
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
-        const manifestPath = join(BUNDLE_DIR, 'manifest.json');
-        originalManifest = readFileSync(manifestPath, 'utf8');
-
-        writeFileSync(manifestPath, JSON.stringify({
+        // SECURITY: never write ANTHROPIC_API_KEY into a tracked file on disk.
+        // Instead, intercept the browser's /manifest.json request and serve an
+        // in-memory manifest with the sensitive env injected.
+        const injectedManifest = {
             version: 1,
             image: 'test-claude-haiku',
             rootfs: ROOTFS_URL,
@@ -129,7 +128,8 @@ async function main() {
             workdir: '/',
             env: forwardEnv(),
             aot: [],
-        }, null, 2));
+        };
+        const injectedManifestText = JSON.stringify(injectedManifest, null, 2);
 
         server = spawn('node', [join(BUNDLE_DIR, 'serve.js'), String(port)], {
             stdio: ['ignore', 'pipe', 'pipe'],
@@ -178,6 +178,28 @@ async function main() {
             console.log(`[chrome] [${msg.type()}] ${text}`);
         });
         page.on('pageerror', err => console.log(`[chrome-error] ${err.message}`));
+
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            try {
+                const u = new URL(req.url());
+                if (u.pathname.endsWith('/manifest.json')) {
+                    req.respond({
+                        status: 200,
+                        contentType: 'application/json',
+                        headers: {
+                            'cache-control': 'no-store',
+                        },
+                        body: injectedManifestText,
+                    });
+                    return;
+                }
+                req.continue();
+            } catch {
+                // Fail open: if interception handler errors, allow request through.
+                req.continue();
+            }
+        });
 
         await page.goto(`http://127.0.0.1:${port}${PAGE_QUERY}`, {
             waitUntil: 'domcontentloaded',
@@ -292,9 +314,6 @@ async function main() {
 
         return pass ? 0 : 1;
     } finally {
-        if (originalManifest) {
-            try { writeFileSync(join(BUNDLE_DIR, 'manifest.json'), originalManifest); } catch {}
-        }
         if (browser) try { await browser.close(); } catch {}
         if (server) server.kill('SIGTERM');
     }

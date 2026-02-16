@@ -1,0 +1,371 @@
+diff --git a/lib/libriscv/bytecode_impl.cpp b/lib/libriscv/bytecode_impl.cpp
+index d252064..577779a 100644
+--- a/lib/libriscv/bytecode_impl.cpp
++++ b/lib/libriscv/bytecode_impl.cpp
+@@ -2,6 +2,7 @@
+  * Popular instructions
+ */
+ 
++
+ #ifdef RISCV_EXT_COMPRESSED
+ INSTRUCTION(RV32C_BC_ADDI, rv32c_addi) {
+ 	VIEW_INSTR_AS(fi, FasterItype);
+@@ -146,19 +147,11 @@ INSTRUCTION(RV32C_BC_JAL_ADDIW, rv32c_jal_addiw) {
+ }
+ INSTRUCTION(RV32C_BC_JR, rv32c_jr) {
+ 	VIEW_INSTR();
+-	if constexpr (VERBOSE_JUMPS) {
+-		fprintf(stderr, "C.JR from 0x%lX to 0x%lX\n",
+-			long(pc), long(REG(instr.whole)));
+-	}
+ 	pc = REG(instr.whole) & ~addr_t(1);
+ 	OVERFLOW_CHECKED_JUMP();
+ }
+ INSTRUCTION(RV32C_BC_JALR, rv32c_jalr) {
+ 	VIEW_INSTR();
+-	if constexpr (VERBOSE_JUMPS) {
+-		fprintf(stderr, "C.JALR from 0x%lX to 0x%lX\n",
+-			long(pc), long(REG(instr.whole)));
+-	}
+ 	REG(REG_RA) = pc + 2;
+ 	pc = REG(instr.whole) & ~addr_t(1);
+ 	OVERFLOW_CHECKED_JUMP();
+@@ -171,8 +164,10 @@ INSTRUCTION(RV32I_BC_JAL, rv32i_jal)
+ 	if constexpr (VERBOSE_JUMPS) {
+ 		printf("JAL PC 0x%lX => 0x%lX\n", (long)pc, (long)pc + fi.signed_imm());
+ 	}
+-	REG(fi.rd) = pc + 4;
+-	NEXT_BLOCK(fi.signed_imm(), true);
++	if (fi.rd != 0)
++		REG(fi.rd) = pc + 4;
++	pc += fi.signed_imm();
++	OVERFLOW_CHECKED_JUMP();
+ }
+ 
+ INSTRUCTION(RV32I_BC_BEQ, rv32i_beq) {
+@@ -592,10 +587,6 @@ INSTRUCTION(RV32I_BC_JALR, rv32i_jalr) {
+ 	if (fi.rs1 != 0) {
+ 		REG(fi.rs1) = pc + 4;
+ 	}
+-	if constexpr (VERBOSE_JUMPS) {
+-		fprintf(stderr, "JALR x%d + %d => rd=%d   PC 0x%lX => 0x%lX\n",
+-			fi.rs2, fi.signed_imm(), fi.rs1, long(pc), long(address));
+-	}
+ 	static constexpr addr_t ALIGN_MASK = (compressed_enabled) ? 0x1 : 0x3;
+ 	pc = address & ~ALIGN_MASK;
+ 	OVERFLOW_CHECKED_JUMP();
+diff --git a/lib/libriscv/cpu_dispatch.cpp b/lib/libriscv/cpu_dispatch.cpp
+index b83880d..bc42592 100644
+--- a/lib/libriscv/cpu_dispatch.cpp
++++ b/lib/libriscv/cpu_dispatch.cpp
+@@ -60,15 +60,25 @@ namespace riscv
+ 
+ #define PERFORM_BRANCH()                 \
+ 	if constexpr (VERBOSE_JUMPS) fprintf(stderr, "Branch 0x%lX >= 0x%lX (decoder=%p)\n", long(pc), long(pc + fi.signed_imm()), decoder); \
+-	if (LIKELY(!counter.overflowed())) { \
+-		NEXT_BLOCK(fi.signed_imm(), false);     \
+-	}                                    \
+ 	pc += fi.signed_imm();               \
++	if (LIKELY((pc - current_begin < current_end - current_begin) && !counter.overflowed())) { \
++		decoder += fi.signed_imm() >> DecoderCache<W>::SHIFT; \
++		pc += decoder->block_bytes();    \
++		counter.increment_counter(decoder->instruction_count()); \
++		EXECUTE_INSTR();                 \
++	}                                    \
+ 	goto check_jump;
+ 
+ #define PERFORM_FORWARD_BRANCH()         \
+ 	if constexpr (VERBOSE_JUMPS) fprintf(stderr, "Fw.Branch 0x%lX >= 0x%lX\n", long(pc), long(pc + fi.signed_imm())); \
+-	NEXT_BLOCK(fi.signed_imm(), false);
++	pc += fi.signed_imm();               \
++	if (LIKELY(pc - current_begin < current_end - current_begin)) { \
++		decoder += fi.signed_imm() >> DecoderCache<W>::SHIFT; \
++		pc += decoder->block_bytes();    \
++		counter.increment_counter(decoder->instruction_count()); \
++		EXECUTE_INSTR();                 \
++	}                                    \
++	goto check_jump;
+ 
+ #define OVERFLOW_CHECKED_JUMP() \
+ 	goto check_jump
+diff --git a/lib/libriscv/cpu_inaccurate_dispatch.cpp b/lib/libriscv/cpu_inaccurate_dispatch.cpp
+index 7cd0219..80bf267 100644
+--- a/lib/libriscv/cpu_inaccurate_dispatch.cpp
++++ b/lib/libriscv/cpu_inaccurate_dispatch.cpp
+@@ -65,7 +65,13 @@ namespace riscv
+ #define PERFORM_BRANCH()                                                                                        \
+ 	if constexpr (VERBOSE_JUMPS)                                                                                \
+ 		fprintf(stderr, "Branch 0x%lX >= 0x%lX (decoder=%p)\n", long(pc), long(pc + fi.signed_imm()), decoder); \
+-	NEXT_BLOCK(fi.signed_imm(), false);
++	pc += fi.signed_imm();                                                                                      \
++	if (LIKELY(pc - exec->exec_begin() < exec->exec_end() - exec->exec_begin())) {                              \
++		decoder += fi.signed_imm() >> DecoderCache<W>::SHIFT;                                                   \
++		pc += decoder->block_bytes();                                                                           \
++		EXECUTE_INSTR();                                                                                        \
++	}                                                                                                           \
++	goto new_execute_segment;
+ 
+ #define PERFORM_FORWARD_BRANCH PERFORM_BRANCH
+ 
+diff --git a/lib/libriscv/machine_inline.hpp b/lib/libriscv/machine_inline.hpp
+index 72c8fdd..cb8c5fd 100644
+--- a/lib/libriscv/machine_inline.hpp
++++ b/lib/libriscv/machine_inline.hpp
+@@ -1,4 +1,3 @@
+-
+ template <int W>
+ inline void Machine<W>::stop() noexcept {
+ 	m_max_counter = 0;
+@@ -75,14 +74,49 @@ void Machine<W>::install_syscall_handlers(std::initializer_list<std::pair<size_t
+ 		install_syscall_handler(scall.first, scall.second);
+ }
+ 
++// Ring buffer for last N syscalls (used for abort diagnostics)
++struct SyscallTrace {
++	size_t sysnum;
++	uint64_t a0, a1, a2;
++	int64_t result;
++	uint64_t pc;
++};
++inline SyscallTrace g_syscall_ring[32] = {};
++inline int g_syscall_ring_idx = 0;
++
+ template <int W>
+ inline void Machine<W>::system_call(size_t sysnum)
+ {
++	auto& entry = g_syscall_ring[g_syscall_ring_idx % 32];
++	entry.sysnum = sysnum;
++	entry.a0 = cpu.reg(REG_ARG0);
++	entry.a1 = cpu.reg(REG_ARG0 + 1);
++	entry.a2 = cpu.reg(REG_ARG0 + 2);
++	entry.pc = cpu.pc();
++
++	// Periodic progress report
++	static size_t total_syscalls = 0;
++	if (++total_syscalls % 1000000 == 0)
++		fprintf(stderr, "[progress] %zuM syscalls, last=sys#%zu\n", total_syscalls / 1000000, sysnum);
++
+ 	if (LIKELY(sysnum < syscall_handlers.size())) {
+-		Machine::syscall_handlers[RISCV_SPECSAFE(sysnum)](*this);
++		auto& handler = Machine::syscall_handlers[RISCV_SPECSAFE(sysnum)];
++		if (!handler) {
++			// Return -ENOSYS for unhandled syscalls instead of crashing
++			static size_t unhandled_count = 0;
++			if (++unhandled_count <= 20)
++				fprintf(stderr, "[UNHANDLED] sysnum=%zu PC=0x%lX\n", sysnum, (long)cpu.pc());
++			cpu.reg(REG_ARG0) = -38; // -ENOSYS
++			entry.result = -38;
++			g_syscall_ring_idx++;
++			return;
++		}
++		handler(*this);
+ 	} else {
+ 		on_unhandled_syscall(*this, sysnum);
+ 	}
++	entry.result = (int64_t)cpu.reg(REG_ARG0);
++	g_syscall_ring_idx++;
+ }
+ 
+ template <int W>
+diff --git a/lib/libriscv/memory.cpp b/lib/libriscv/memory.cpp
+index ac4d1cb..9f9a155 100644
+--- a/lib/libriscv/memory.cpp
++++ b/lib/libriscv/memory.cpp
+@@ -84,7 +84,18 @@ namespace riscv
+ 				{
+ 					// Allocate a complete N-bit arena, covering the entire N-bit address space
+ 					// Add 1 extra page to avoid having to bounds-check memory accesses
++#ifdef __EMSCRIPTEN__
++					// In Emscripten/wasm32, new PageData[n] fails for n*4096 >= 2GB
++					// due to signed overflow in the C++ runtime's array allocation.
++					// Use malloc+memset instead.
++					auto* base_ptr = (uint8_t *)std::malloc(UNBOUNDED_ARENA_SIZE);
++					if (!base_ptr) {
++						throw MachineException(OUT_OF_MEMORY, "Arena malloc failed", UNBOUNDED_ARENA_SIZE);
++					}
++					std::memset(base_ptr, 0, (size_t)UNBOUNDED_ARENA_SIZE);
++#else
+ 					auto* base_ptr = (uint8_t *)new PageData[UNBOUNDED_ARENA_SIZE / Page::size()];
++#endif
+ 					// Adjust pointer forward by OVERALLOCATE to provide over-allocation on both sides
+ 					// while keeping arena at same logical address (relative to zero)
+ 					this->m_arena.data = (PageData *)(base_ptr + Memory::OVERALLOCATE);
+@@ -184,8 +195,12 @@ namespace riscv
+ 			}
+ #else
+ 			// Adjust back to the original base pointer (subtract OVERALLOCATE)
+-			auto* base_ptr = (PageData *)((uint8_t *)this->m_arena.data - Memory::OVERALLOCATE);
+-			delete[] base_ptr;
++			auto* base_ptr = (uint8_t *)this->m_arena.data - Memory::OVERALLOCATE;
++#ifdef __EMSCRIPTEN__
++			std::free(base_ptr);
++#else
++			delete[] (PageData *)base_ptr;
++#endif
+ #endif
+ 		}
+ 	}
+diff --git a/lib/libriscv/tailcall_dispatch.cpp b/lib/libriscv/tailcall_dispatch.cpp
+index dced2c1..1fec082 100644
+--- a/lib/libriscv/tailcall_dispatch.cpp
++++ b/lib/libriscv/tailcall_dispatch.cpp
+@@ -75,8 +75,9 @@
+ 			pc, pc + fi.signed_imm());  \
+ 	}                                   \
+ 	pc += fi.signed_imm();              \
+-	d += fi.signed_imm() >> DecoderCache<W>::SHIFT; \
+ 	OVERFLOW_CHECK()                    \
++	QUICK_EXEC_CHECK()                  \
++	d += fi.signed_imm() >> DecoderCache<W>::SHIFT; \
+ 	BEGIN_BLOCK()                       \
+ 	EXECUTE_CURRENT()
+ 
+@@ -85,7 +86,11 @@
+ 		printf("Fwd. Branch from 0x%lX to 0x%lX\n", \
+ 			pc, pc + fi.signed_imm());  \
+ 	}                                   \
+-	NEXT_BLOCK(fi.signed_imm(), false)
++	pc += fi.signed_imm();              \
++	QUICK_EXEC_CHECK()                  \
++	d += fi.signed_imm() >> DecoderCache<W>::SHIFT; \
++	BEGIN_BLOCK()                       \
++	EXECUTE_CURRENT()
+ 
+ #define OVERFLOW_CHECKED_JUMP() \
+ 	OVERFLOW_CHECK(); \
+diff --git a/lib/libriscv/threaded_rewriter.cpp b/lib/libriscv/threaded_rewriter.cpp
+index 062d331..22ebce4 100644
+--- a/lib/libriscv/threaded_rewriter.cpp
++++ b/lib/libriscv/threaded_rewriter.cpp
+@@ -119,15 +119,6 @@ namespace riscv
+ 				const bool overflow = __builtin_add_overflow(pc, imm, &addr);
+ #endif
+ 
+-				if (!this->is_within(addr, 4) || (addr % PCAL) != 0 || overflow)
+-				{
+-					// Use invalid instruction for out-of-bounds branches
+-					// or misaligned jumps. It is strictly a cheat, but
+-					// it should also never happen on (especially) these
+-					// instructions. No sandbox harm.
+-					return RV32I_BC_INVALID;
+-				}
+-
+ 				FasterItype rewritten;
+ 				rewritten.rs1 = original.Btype.rs1;
+ 				rewritten.rs2 = original.Btype.rs2;
+@@ -135,6 +126,14 @@ namespace riscv
+ 
+ 				instr.whole = rewritten.whole;
+ 
++				if (!this->is_within(addr, 4) || (addr % PCAL) != 0 || overflow)
++				{
++					// Target outside execute segment or misaligned.
++					// Use base bytecode (no FW optimization).
++					// Dispatch loop handles segment switches.
++					return bytecode;
++				}
++
+ 				// Forward branches can skip instr count check
+ 				if (imm > 0 && bytecode == RV32I_BC_BEQ)
+ 					return RV32I_BC_BEQ_FW;
+@@ -248,36 +247,35 @@ namespace riscv
+ 				const bool store_zero = original.Jtype.rd == 0;
+ 				const bool store_ra = original.Jtype.rd == REG_RA;
+ 
+-				// The destination address also needs to be within
+-				// the current execute segment, as an optimization.
++				// Always rewrite to FasterJtype format since the
++				// JAL handler expects this encoding.
++				FasterJtype rewritten;
++				rewritten.offset = original.Jtype.jump_offset();
++				rewritten.rd     = original.Jtype.rd;
++
++				// Fast-path bytecodes only if target is within segment.
+ 				if (this->is_within(addr, 4) && is_aligned)
+ 				{
+ 					const int32_t diff = addr - pc;
+-					if (!this->is_within(pc + diff, 4))
+-					{
+-						return RV32I_BC_INVALID;
+-					}
+-					else if (store_zero)
+-					{
+-						instr.whole = diff;
+-						return RV32I_BC_FAST_JAL;
+-					}
+-					else if (store_ra)
++					if (this->is_within(pc + diff, 4))
+ 					{
+-						// TODO: Optimize forward JALs instead
+-						instr.whole = diff;
+-						return RV32I_BC_FAST_CALL;
++						if (store_zero)
++						{
++							instr.whole = diff;
++							return RV32I_BC_FAST_JAL;
++						}
++						else if (store_ra)
++						{
++							instr.whole = diff;
++							return RV32I_BC_FAST_CALL;
++						}
+ 					}
+-
+-					FasterJtype rewritten;
+-					rewritten.offset = original.Jtype.jump_offset();
+-					rewritten.rd     = original.Jtype.rd;
+-
+-					instr.whole = rewritten.whole;
+-					return bytecode;
+ 				}
+ 
+-				return RV32I_BC_INVALID;
++				// Use base JAL bytecode (handles cross-segment via
++				// check_jump in dispatcher).
++				instr.whole = rewritten.whole;
++				return bytecode;
+ 			}
+ 			case RV32I_BC_JALR: {
+ 				FasterItype rewritten;
+@@ -452,13 +450,6 @@ namespace riscv
+ 				const rv32c_instruction ci{instr};
+ 
+ 				const int32_t imm = ci.CB.signed_imm();
+-				const auto addr = pc + imm;
+-
+-				if (!this->is_within(addr, 2) || (addr % PCAL) != 0)
+-				{
+-					// Allow branch outside of execute segment?
+-					return RV32I_BC_INVALID; // No, just return invalid
+-				}
+ 
+ 				FasterItype rewritten;
+ 				rewritten.rs1 = ci.CB.srs1 + 8;
+@@ -466,6 +457,9 @@ namespace riscv
+ 				rewritten.imm = imm;
+ 
+ 				instr.whole = rewritten.whole;
++
++				// Target outside segment is OK - dispatch loop
++				// handles segment switches at runtime.
+ 				return bytecode;
+ 			}
+ 			case RV32C_BC_JMP:
+@@ -484,14 +478,11 @@ namespace riscv
+ 				}
+ 
+ 				const int32_t imm = ci.CJ.signed_imm();
+-				const auto addr = pc + imm;
+-
+-				if (!this->is_within(addr, 4) || (addr % PCAL) != 0)
+-				{
+-					return RV32I_BC_INVALID;
+-				}
+ 
+ 				instr.whole = imm;
++
++				// Target outside segment is OK - dispatch loop
++				// handles segment switches at runtime.
+ 				return bytecode;
+ 			}
+ 			case RV32C_BC_JALR: {

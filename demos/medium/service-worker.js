@@ -1,0 +1,1 @@
+../../friscy-bundle/service-worker.js

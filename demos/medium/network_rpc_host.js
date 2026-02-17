@@ -1,0 +1,1 @@
+../../friscy-bundle/network_rpc_host.js

@@ -21,6 +21,9 @@ proxy/go.sum
 proxy/proxy
 proxy/friscy-proxy
 
+# Go toolchain (256MB, install separately)
+tools/go-patched/
+
 # Secrets
 proxy/cert.pem
 proxy/key.pem

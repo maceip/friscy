@@ -87,8 +87,19 @@ add_definitions(-DRISCV_MAX_EXECUTE_SEGS=1024)
 # libriscv is in ../vendor/libriscv (cloned by setup scripts)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../vendor/libriscv/lib ${CMAKE_BINARY_DIR}/libriscv)
 
+# --- Generate claude-repl.js.inc from claude-repl.js ---
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/claude-repl.js.inc
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen-js-inc.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/claude-repl.js
+            > ${CMAKE_CURRENT_SOURCE_DIR}/claude-repl.js.inc
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/claude-repl.js
+            ${CMAKE_CURRENT_SOURCE_DIR}/gen-js-inc.sh
+    COMMENT "Generating claude-repl.js.inc from claude-repl.js"
+)
+
 # --- Main executable ---
-add_executable(friscy main.cpp)
+add_executable(friscy main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/claude-repl.js.inc)
 target_link_libraries(friscy PUBLIC riscv)
 
 # Include directories for our headers

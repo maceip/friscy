@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "image": "friscy-claude",
+  "rootfs": "./claude-slim-snap.tar",
+  "entrypoint": ["/usr/bin/node", "--jitless", "--snapshot-blob", "/tmp/snapshot-fast.blob", "--", "Write a haiku about RISC-V emulation running in WebAssembly"],
+  "workdir": "/root",
+  "env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/root",
+    "TERM=xterm-256color",
+    "COLORTERM=truecolor",
+    "COLORFGBG=15;0",
+    "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+  ],
+  "dns": ["108.61.10.10"],
+  "aot": [],
+  "examples": {
+    "claude": {
+      "rootfs": "./claude-slim-snap.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "--snapshot-blob", "/tmp/snapshot-fast.blob", "--", "Write a haiku about RISC-V emulation running in WebAssembly"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    }
+  }
+}

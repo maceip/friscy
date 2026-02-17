@@ -40,7 +40,7 @@ static void segfault_handler(int sig) {
 using Machine = riscv::Machine<riscv::RISCV64>;
 
 // Configuration
-static constexpr uint64_t MAX_INSTRUCTIONS = 512'000'000'000ULL;  // 512 billion
+static constexpr uint64_t MAX_INSTRUCTIONS = 10'000'000'000'000ULL;  // 10 trillion
 static constexpr uint32_t HEAP_SYSCALLS_BASE = 480;
 static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 
@@ -81,6 +81,7 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     if (!g_machine) return 0;
     syscalls::g_waiting_for_stdin = false;
     static constexpr uint64_t YIELD_CHUNK = 2'000'000;
+    static int resume_log_count = 0;
     for (int retries = 0; retries < 8; retries++) {
         try {
             while (true) {
@@ -88,6 +89,12 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 if (syscalls::g_waiting_for_stdin) break;
                 if (!g_machine->instruction_limit_reached()) break;
                 // No yield needed — Worker thread doesn't block UI
+            }
+            resume_log_count++;
+            if (resume_log_count <= 10 || resume_log_count % 500 == 0) {
+                auto [instr, _] = g_machine->get_counters();
+                fprintf(stderr, "[resume] #%d instructions=%lu stopped=%d\n",
+                        resume_log_count, (unsigned long)instr, friscy_stopped());
             }
             return friscy_stopped();
         } catch (const riscv::MachineException& e) {
@@ -150,6 +157,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_state_ptr() {
 // ============================================================================
 #ifdef FRISCY_WIZER
 static bool g_wizer_initialized = false;
+static std::vector<uint8_t> g_wizer_binary;
+static std::string g_wizer_entry;
 
 extern "C" void wizer_init() {
     // Pre-initialize code paths and VFS structures.
@@ -230,7 +239,419 @@ static void setup_virtual_files() {
     g_vfs.add_virtual_file("/etc/hosts", "127.0.0.1 localhost\n");
 
     // /etc/resolv.conf
-    g_vfs.add_virtual_file("/etc/resolv.conf", "nameserver 8.8.8.8\n");
+    g_vfs.add_virtual_file("/etc/resolv.conf", "nameserver 108.61.10.10\nnameserver 9.9.9.9\n");
+
+    // DNS preload script: monkey-patches dns.lookup() to use c-ares resolver
+    // instead of libuv threadpool + musl getaddrinfo (broken in cooperative threading).
+    // Loaded via NODE_OPTIONS="-r /etc/dns-preload.js"
+    g_vfs.add_virtual_file("/etc/dns-preload.js",
+        "// WebAssembly shim: --jitless disables WebAssembly entirely, but undici\n"
+        "// needs it for llhttp WASM parser. Provide a stub that throws so undici\n"
+        "// falls back to its JS parser.\n"
+        "if (typeof WebAssembly === 'undefined') {\n"
+        "  const fail = () => { throw new Error('WebAssembly disabled'); };\n"
+        "  globalThis.WebAssembly = {\n"
+        "    compile: fail, instantiate: fail, validate: () => false,\n"
+        "    Module: function() { throw new Error('WebAssembly disabled'); },\n"
+        "    Instance: function() { throw new Error('WebAssembly disabled'); },\n"
+        "    Memory: function() { throw new Error('WebAssembly disabled'); },\n"
+        "    Table: function() { throw new Error('WebAssembly disabled'); },\n"
+        "    CompileError: Error, LinkError: Error, RuntimeError: Error,\n"
+        "  };\n"
+        "}\n"
+        "const dns = require('dns');\n"
+        "const { Resolver } = dns;\n"
+        "const r = new Resolver();\n"
+        "try { const fs = require('fs');\n"
+        "  const rc = fs.readFileSync('/etc/resolv.conf','utf8');\n"
+        "  const srvs = rc.match(/nameserver\\s+(\\S+)/g);\n"
+        "  if (srvs) r.setServers(srvs.map(s=>s.split(/\\s+/)[1]));\n"
+        "} catch(e) { r.setServers(['108.61.10.10','9.9.9.9']); }\n"
+        "const origLookup = dns.lookup;\n"
+        "// DNS warm cache: seed with static IPs, refresh in background after boot.\n"
+        "// First lookup for a cached host returns instantly; c-ares updates the entry async.\n"
+        "const dnsCache = {\n"
+        "  'api.anthropic.com': '160.79.104.10',\n"
+        "  'generativelanguage.googleapis.com': '142.250.80.106',\n"
+        "  'api.openai.com': '104.18.6.192',\n"
+        "};\n"
+        "// Lazy refresh: only re-resolve after 24h, never during boot\n"
+        "const dnsCacheTime = {};\n"
+        "const DNS_TTL = 86400000; // 24 hours\n"
+        "// Seed timestamps so cached entries are fresh at boot\n"
+        "for (const h of Object.keys(dnsCache)) dnsCacheTime[h] = Date.now();\n"
+        "function dnsRefresh(host) {\n"
+        "  dnsCacheTime[host] = Date.now();\n"
+        "  r.resolve4(host, (err, addrs) => {\n"
+        "    if (!err && addrs && addrs[0]) dnsCache[host] = addrs[0];\n"
+        "  });\n"
+        "}\n"
+        "dns.lookup = function(hostname, options, callback) {\n"
+        "  if (typeof options === 'function') { callback = options; options = {}; }\n"
+        "  if (typeof options === 'number') options = { family: options };\n"
+        "  const family = (options && options.family) || 0;\n"
+        "  if (hostname === 'localhost' || hostname === '127.0.0.1') {\n"
+        "    return origLookup.call(dns, hostname, options, callback);\n"
+        "  }\n"
+        "  const all = options && options.all;\n"
+        "  // Fast path: cached hosts return instantly\n"
+        "  if (dnsCache[hostname]) {\n"
+        "    const ip = dnsCache[hostname];\n"
+        "    // Stale? refresh in background (non-blocking, current call uses cached IP)\n"
+        "    if (!dnsCacheTime[hostname] || Date.now() - dnsCacheTime[hostname] > DNS_TTL) {\n"
+        "      dnsRefresh(hostname);\n"
+        "    }\n"
+        "    if (all) return callback(null, [{address: ip, family: 4}]);\n"
+        "    return callback(null, ip, 4);\n"
+        "  }\n"
+        "  console.error('[dns] lookup called for:', hostname, 'family:', family);\n"
+        "  const resolve = (fam) => {\n"
+        "    const method = fam === 6 ? 'resolve6' : 'resolve4';\n"
+        "    console.error('[dns] calling', method, 'for', hostname);\n"
+        "    r[method](hostname, (err, addrs) => {\n"
+        "      console.error('[dns]', method, 'callback:', err ? 'ERR:'+err.code : 'OK', addrs);\n"
+        "      if (err && fam !== 6 && family === 0) return resolve(6);\n"
+        "      if (err) return callback(err);\n"
+        "      if (all) {\n"
+        "        callback(null, addrs.map(a => ({address:a, family: fam===6?6:4})));\n"
+        "      } else {\n"
+        "        callback(null, addrs[0], fam === 6 ? 6 : 4);\n"
+        "      }\n"
+        "    });\n"
+        "  };\n"
+        "  resolve(family === 6 ? 6 : 4);\n"
+        "};\n"
+    );
+
+    // dns-test.js: Minimal DNS resolution test to isolate DNS callback issues
+    g_vfs.add_virtual_file("/usr/local/bin/dns-test.js",
+        "'use strict';\n"
+        "const dns = require('dns');\n"
+        "console.error('[dns-test] Starting DNS resolution test...');\n"
+        "console.error('[dns-test] dns.lookup is:', dns.lookup.name || 'anonymous');\n"
+        "dns.lookup('api.anthropic.com', { family: 4 }, (err, address, family) => {\n"
+        "  console.error('[dns-test] dns.lookup callback fired!');\n"
+        "  if (err) {\n"
+        "    console.error('[dns-test] Error:', err.code, err.message);\n"
+        "  } else {\n"
+        "    console.error('[dns-test] Resolved:', address, 'family:', family);\n"
+        "  }\n"
+        "  process.exit(err ? 1 : 0);\n"
+        "});\n"
+        "console.error('[dns-test] dns.lookup called, waiting for callback...');\n"
+        "setTimeout(() => { console.error('[dns-test] Timeout!'); process.exit(1); }, 30000);\n"
+    );
+
+    // claude-fast.js: Lightweight direct API client that bypasses the full
+    // Claude Code CLI (68MB bundle too slow with --jitless).
+    // Usage: node claude-fast.js "your prompt here"
+    g_vfs.add_virtual_file("/usr/local/bin/claude-fast.js",
+        "#!/usr/bin/env node\n"
+        "'use strict';\n"
+        "const prompt = process.argv.slice(2).join(' ') || 'Write a haiku';\n"
+        "const h = require('https');\n"
+        "const key = process.env.ANTHROPIC_API_KEY;\n"
+        "if (!key) { console.error('Error: ANTHROPIC_API_KEY not set'); process.exit(1); }\n"
+        "console.error('[claude-fast] Starting with prompt:', prompt);\n"
+        "const body = JSON.stringify({\n"
+        "  model: 'claude-sonnet-4-20250514',\n"
+        "  max_tokens: 1024,\n"
+        "  messages: [{role:'user', content: prompt}]\n"
+        "});\n"
+        "console.error('[claude-fast] Creating HTTPS request to api.anthropic.com...');\n"
+        "const req = h.request({\n"
+        "  hostname: 'api.anthropic.com', port: 443,\n"
+        "  path: '/v1/messages', method: 'POST',\n"
+        "  headers: {\n"
+        "    'Content-Type': 'application/json',\n"
+        "    'x-api-key': key,\n"
+        "    'anthropic-version': '2023-06-01',\n"
+        "    'Content-Length': Buffer.byteLength(body)\n"
+        "  }\n"
+        "}, res => {\n"
+        "  console.error('[claude-fast] Got response:', res.statusCode);\n"
+        "  let data = '';\n"
+        "  res.on('data', c => data += c);\n"
+        "  res.on('end', () => {\n"
+        "    try {\n"
+        "      const j = JSON.parse(data);\n"
+        "      if (j.content) console.log(j.content[0].text);\n"
+        "      else console.log(data.substring(0, 500));\n"
+        "    } catch(e) { console.log(data.substring(0, 500)); }\n"
+        "    process.exit(0);\n"
+        "  });\n"
+        "});\n"
+        "req.on('error', e => { console.error('[claude-fast] Error:', e.message); process.exit(1); });\n"
+        "req.on('socket', s => { console.error('[claude-fast] Socket assigned'); s.on('connect', () => console.error('[claude-fast] TCP connected')); });\n"
+        "req.write(body);\n"
+        "req.end();\n"
+        "console.error('[claude-fast] Request sent, waiting for response...');\n"
+        "setTimeout(() => { console.error('Timeout'); process.exit(1); }, 120000);\n"
+    );
+
+    // claude-start.sh: wrapper that runs claude-repl.js then drops to interactive shell.
+    // When user types /exit in Claude, they get an Alpine ash prompt.
+    g_vfs.add_virtual_file("/usr/local/bin/claude-start.sh",
+        "#!/bin/sh\n"
+        "node --jitless --max-old-space-size=256 /usr/local/bin/claude-repl.js\n"
+        "printf '\\x02SHELL\\x02\\n'\n"
+        "exec /bin/sh -i\n"
+    );
+
+    // claude-repl.js: SWE-bench-style tool-using agent REPL for the Claude Code demo.
+    // Runs inside the emulator as a real Node.js process in Alpine Linux.
+    // Protocol: reads API key from env, then prompts from stdin in a loop.
+    // Sentinels: \x02READY\x02, \x02START\x02, \x02END\x02, \x02SHELL\x02 for host coordination.
+    // Tools: bash (execSync), read_file (fs.readFileSync), write_file (fs.writeFileSync)
+    // Agent loop: call Claude API with tools → execute tool_use → return results → repeat
+    g_vfs.add_virtual_file("/usr/local/bin/claude-repl.js",
+        "#!/usr/bin/env node\n"
+        "'use strict';\n"
+        "const h = require('https');\n"
+        "const fs = require('fs');\n"
+        "const cp = require('child_process');\n"
+        "// Read lines from fd 0 using fs.readSync — avoids process.stdin\n"
+        "// which triggers libuv pipe2+dup2 and breaks emulator stdin delivery.\n"
+        "function readLine() {\n"
+        "  return new Promise(resolve => {\n"
+        "    let line = '';\n"
+        "    const buf = Buffer.alloc(1);\n"
+        "    while (true) {\n"
+        "      try {\n"
+        "        const n = fs.readSync(0, buf, 0, 1);\n"
+        "        if (n === 0) { resolve(line || null); return; }\n"
+        "        const ch = buf.toString('utf8', 0, 1);\n"
+        "        if (ch === '\\n') { resolve(line); return; }\n"
+        "        if (ch !== '\\r') line += ch;\n"
+        "      } catch(e) {\n"
+        "        resolve(line || null); return;\n"
+        "      }\n"
+        "    }\n"
+        "  });\n"
+        "}\n"
+        "\n"
+        "const messages = [];\n"
+        "const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';\n"
+        "const SYSTEM = 'You are Claude Code, an AI assistant running inside a Linux environment. '\n"
+        "  + 'You have access to bash, file reading, and file writing tools. '\n"
+        "  + 'Use them to help the user with coding tasks. '\n"
+        "  + 'Be concise in your responses. Show your work.';\n"
+        "\n"
+        "const TOOLS = [\n"
+        "  { name: 'bash', description: 'Execute a bash command. Returns stdout, stderr, and exit code.',\n"
+        "    input_schema: { type: 'object', properties: {\n"
+        "      command: { type: 'string', description: 'The bash command to execute' },\n"
+        "      timeout: { type: 'number', description: 'Timeout in ms (default 30000)' }\n"
+        "    }, required: ['command'] } },\n"
+        "  { name: 'read_file', description: 'Read the contents of a file.',\n"
+        "    input_schema: { type: 'object', properties: {\n"
+        "      path: { type: 'string', description: 'Absolute or relative file path' }\n"
+        "    }, required: ['path'] } },\n"
+        "  { name: 'write_file', description: 'Write content to a file (creates or overwrites).',\n"
+        "    input_schema: { type: 'object', properties: {\n"
+        "      path: { type: 'string', description: 'File path' },\n"
+        "      content: { type: 'string', description: 'Content to write' }\n"
+        "    }, required: ['path', 'content'] } },\n"
+        "  { name: 'search_files', description: 'Search file contents using ripgrep (rg). Returns matching lines with file paths and line numbers.',\n"
+        "    input_schema: { type: 'object', properties: {\n"
+        "      pattern: { type: 'string', description: 'Regex pattern to search for' },\n"
+        "      path: { type: 'string', description: 'Directory or file to search in (default: current dir)' },\n"
+        "      glob: { type: 'string', description: 'File glob filter, e.g. \"*.py\" or \"*.js\"' }\n"
+        "    }, required: ['pattern'] } },\n"
+        "  { name: 'list_dir', description: 'List files and directories. Returns names with / suffix for directories.',\n"
+        "    input_schema: { type: 'object', properties: {\n"
+        "      path: { type: 'string', description: 'Directory path (default: current dir)' },\n"
+        "      recursive: { type: 'boolean', description: 'List recursively (default: false)' }\n"
+        "    } } },\n"
+        "  { name: 'edit_file', description: 'Replace exact text in a file. The old_string must match exactly (including whitespace).',\n"
+        "    input_schema: { type: 'object', properties: {\n"
+        "      path: { type: 'string', description: 'File path' },\n"
+        "      old_string: { type: 'string', description: 'Exact text to find and replace' },\n"
+        "      new_string: { type: 'string', description: 'Replacement text' }\n"
+        "    }, required: ['path', 'old_string', 'new_string'] } }\n"
+        "];\n"
+        "\n"
+        "// Execute a tool call and return the result string\n"
+        "function execTool(name, input) {\n"
+        "  try {\n"
+        "    if (name === 'bash') {\n"
+        "      const timeout = input.timeout || 30000;\n"
+        "      try {\n"
+        "        const out = cp.execSync(input.command, {\n"
+        "          encoding: 'utf8', timeout, maxBuffer: 1024 * 1024,\n"
+        "          stdio: ['pipe', 'pipe', 'pipe']\n"
+        "        });\n"
+        "        return out.slice(0, 8000) || '(no output)';\n"
+        "      } catch(e) {\n"
+        "        const out = (e.stdout || '') + (e.stderr || '');\n"
+        "        return 'Exit code ' + (e.status || 1) + '\\n' + out.slice(0, 8000);\n"
+        "      }\n"
+        "    }\n"
+        "    if (name === 'read_file') {\n"
+        "      return fs.readFileSync(input.path, 'utf8').slice(0, 16000);\n"
+        "    }\n"
+        "    if (name === 'write_file') {\n"
+        "      fs.writeFileSync(input.path, input.content);\n"
+        "      return 'Written ' + input.content.length + ' bytes to ' + input.path;\n"
+        "    }\n"
+        "    if (name === 'search_files') {\n"
+        "      const args = ['-n', '--max-count=50'];\n"
+        "      if (input.glob) args.push('--glob', input.glob);\n"
+        "      args.push(input.pattern, input.path || '.');\n"
+        "      try {\n"
+        "        return cp.execSync('rg ' + args.map(a => '\"' + a.replace(/\"/g, '\\\\\"') + '\"').join(' '), {\n"
+        "          encoding: 'utf8', timeout: 15000, maxBuffer: 512 * 1024\n"
+        "        }).slice(0, 8000) || '(no matches)';\n"
+        "      } catch(e) {\n"
+        "        if (e.status === 1) return '(no matches)';\n"
+        "        return 'Error: ' + (e.stderr || e.message).slice(0, 500);\n"
+        "      }\n"
+        "    }\n"
+        "    if (name === 'list_dir') {\n"
+        "      const p = input.path || '.';\n"
+        "      if (input.recursive) {\n"
+        "        try {\n"
+        "          return cp.execSync('find \"' + p + '\" -maxdepth 3 -not -path \"*/node_modules/*\" -not -path \"*/.git/*\" | head -200', {\n"
+        "            encoding: 'utf8', timeout: 10000\n"
+        "          }).slice(0, 8000);\n"
+        "        } catch(e) { return 'Error: ' + e.message; }\n"
+        "      }\n"
+        "      const entries = fs.readdirSync(p, { withFileTypes: true });\n"
+        "      return entries.map(e => e.name + (e.isDirectory() ? '/' : '')).join('\\n');\n"
+        "    }\n"
+        "    if (name === 'edit_file') {\n"
+        "      const content = fs.readFileSync(input.path, 'utf8');\n"
+        "      const idx = content.indexOf(input.old_string);\n"
+        "      if (idx === -1) return 'Error: old_string not found in ' + input.path;\n"
+        "      const count = content.split(input.old_string).length - 1;\n"
+        "      if (count > 1) return 'Error: old_string matches ' + count + ' locations. Make it more specific.';\n"
+        "      const updated = content.slice(0, idx) + input.new_string + content.slice(idx + input.old_string.length);\n"
+        "      fs.writeFileSync(input.path, updated);\n"
+        "      return 'Edited ' + input.path + ' (replaced ' + input.old_string.length + ' chars with ' + input.new_string.length + ' chars)';\n"
+        "    }\n"
+        "    return 'Unknown tool: ' + name;\n"
+        "  } catch(e) { return 'Error: ' + e.message; }\n"
+        "}\n"
+        "\n"
+        "// Make a streaming API call. Returns { text, toolCalls }.\n"
+        "// text is streamed to stdout in real-time; toolCalls is an array of {id, name, input}.\n"
+        "function apiCall(apiKey, msgs) {\n"
+        "  const body = JSON.stringify({\n"
+        "    model, max_tokens: 4096, stream: true,\n"
+        "    system: SYSTEM, tools: TOOLS, messages: msgs\n"
+        "  });\n"
+        "  return new Promise((resolve, reject) => {\n"
+        "    const req = h.request({\n"
+        "      hostname: 'api.anthropic.com', port: 443,\n"
+        "      path: '/v1/messages', method: 'POST',\n"
+        "      headers: {\n"
+        "        'Content-Type': 'application/json',\n"
+        "        'x-api-key': apiKey,\n"
+        "        'anthropic-version': '2023-06-01',\n"
+        "        'Content-Length': Buffer.byteLength(body)\n"
+        "      }\n"
+        "    }, res => {\n"
+        "      if (res.statusCode !== 200) {\n"
+        "        let d = '';\n"
+        "        res.on('data', c => d += c);\n"
+        "        res.on('end', () => reject(new Error('API ' + res.statusCode + ': ' + d.slice(0, 200))));\n"
+        "        return;\n"
+        "      }\n"
+        "      let buf = '', text = '', stopReason = '';\n"
+        "      const toolCalls = [];\n"
+        "      let curToolId = '', curToolName = '', curToolJson = '';\n"
+        "      res.on('data', chunk => {\n"
+        "        buf += chunk;\n"
+        "        const parts = buf.split('\\n\\n');\n"
+        "        buf = parts.pop();\n"
+        "        for (const part of parts) {\n"
+        "          const dl = part.split('\\n').find(l => l.startsWith('data: '));\n"
+        "          if (!dl) continue;\n"
+        "          try {\n"
+        "            const ev = JSON.parse(dl.slice(6));\n"
+        "            if (ev.type === 'content_block_start') {\n"
+        "              if (ev.content_block && ev.content_block.type === 'tool_use') {\n"
+        "                curToolId = ev.content_block.id;\n"
+        "                curToolName = ev.content_block.name;\n"
+        "                curToolJson = '';\n"
+        "              }\n"
+        "            } else if (ev.type === 'content_block_delta') {\n"
+        "              if (ev.delta && ev.delta.type === 'text_delta' && ev.delta.text) {\n"
+        "                process.stdout.write(ev.delta.text);\n"
+        "                text += ev.delta.text;\n"
+        "              } else if (ev.delta && ev.delta.type === 'input_json_delta' && ev.delta.partial_json) {\n"
+        "                curToolJson += ev.delta.partial_json;\n"
+        "              }\n"
+        "            } else if (ev.type === 'content_block_stop') {\n"
+        "              if (curToolId) {\n"
+        "                try {\n"
+        "                  toolCalls.push({ id: curToolId, name: curToolName, input: JSON.parse(curToolJson) });\n"
+        "                } catch(e) {\n"
+        "                  toolCalls.push({ id: curToolId, name: curToolName, input: { command: curToolJson } });\n"
+        "                }\n"
+        "                curToolId = '';\n"
+        "              }\n"
+        "            } else if (ev.type === 'message_delta' && ev.delta) {\n"
+        "              stopReason = ev.delta.stop_reason || '';\n"
+        "            }\n"
+        "          } catch(e) {}\n"
+        "        }\n"
+        "      });\n"
+        "      res.on('end', () => resolve({ text, toolCalls, stopReason }));\n"
+        "    });\n"
+        "    req.on('error', e => reject(e));\n"
+        "    req.write(body);\n"
+        "    req.end();\n"
+        "    setTimeout(() => reject(new Error('timeout')), 120000);\n"
+        "  });\n"
+        "}\n"
+        "\n"
+        "async function agentLoop(apiKey, userPrompt) {\n"
+        "  messages.push({ role: 'user', content: userPrompt });\n"
+        "  for (let step = 0; step < 20; step++) {\n"
+        "    const result = await apiCall(apiKey, messages);\n"
+        "    // Build assistant content blocks\n"
+        "    const content = [];\n"
+        "    if (result.text) content.push({ type: 'text', text: result.text });\n"
+        "    for (const tc of result.toolCalls) {\n"
+        "      content.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input });\n"
+        "    }\n"
+        "    messages.push({ role: 'assistant', content });\n"
+        "    // If no tool calls, we're done\n"
+        "    if (result.toolCalls.length === 0 || result.stopReason === 'end_turn') break;\n"
+        "    // Execute tools and build tool_result messages\n"
+        "    const toolResults = [];\n"
+        "    for (const tc of result.toolCalls) {\n"
+        "      process.stdout.write('\\n\\x1b[90m\\u2192 ' + tc.name + ': ' + \n"
+        "        (tc.name === 'bash' ? tc.input.command : tc.input.path || '').slice(0, 60) + '\\x1b[0m\\n');\n"
+        "      const output = execTool(tc.name, tc.input);\n"
+        "      toolResults.push({ type: 'tool_result', tool_use_id: tc.id, content: output });\n"
+        "    }\n"
+        "    messages.push({ role: 'user', content: toolResults });\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "async function main() {\n"
+        "  const apiKey = process.env.ANTHROPIC_API_KEY;\n"
+        "  if (!apiKey) { process.stderr.write('[repl] Error: ANTHROPIC_API_KEY not set\\n'); process.exit(1); }\n"
+        "  process.stdout.write('\\x02READY\\x02\\n');\n"
+        "  while (true) {\n"
+        "    const prompt = (await readLine()).trim();\n"
+        "    if (!prompt || prompt === '/exit' || prompt === '/quit') break;\n"
+        "    process.stdout.write('\\x02START\\x02\\n');\n"
+        "    try {\n"
+        "      await agentLoop(apiKey, prompt);\n"
+        "    } catch(e) {\n"
+        "      process.stdout.write('\\n\\x1b[31mError: ' + e.message + '\\x1b[0m\\n');\n"
+        "    }\n"
+        "    process.stdout.write('\\x02END\\x02\\n');\n"
+        "  }\n"
+        "  // Signal host to restart emulator with /bin/sh -i for a real shell\n"
+        "  process.stdout.write('\\x02SHELL\\x02\\n');\n"
+        "  process.exit(0);\n"
+        "}\n"
+        "main().catch(e => { process.stderr.write('[repl] Fatal: ' + e.message + '\\n'); process.exit(1); });\n"
+    );
 
     // Timezone data — needed by Node.js (abseil/cctz) to avoid abort()
     // Minimal TZif2 file for UTC: no transitions, one ttinfo (offset=0, "UTC")
@@ -343,19 +764,25 @@ int main(int argc, char** argv) {
     std::string entry_path;
     std::string export_tar_path;
     std::vector<std::string> guest_args;
+    std::vector<std::string> extra_env;
     bool container_mode = false;
 
     // Parse arguments
     int i = 1;
     while (i < argc) {
         if (strcmp(argv[i], "--rootfs") == 0) {
-            if (i + 2 >= argc) {
-                std::cerr << "Error: --rootfs requires <tarfile> and <entry-binary>\n";
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --rootfs requires <tarfile>\n";
                 return 1;
             }
             container_mode = true;
             rootfs_path = argv[++i];
-            entry_path = argv[++i];
+        } else if (strcmp(argv[i], "--env") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --env requires KEY=VALUE\n";
+                return 1;
+            }
+            extra_env.push_back(argv[++i]);
         } else if (strcmp(argv[i], "--export-tar") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --export-tar requires <path>\n";
@@ -369,7 +796,7 @@ int main(int argc, char** argv) {
             std::cerr << "Error: Unknown option: " << argv[i] << "\n";
             return 1;
         } else {
-            if (!container_mode && entry_path.empty()) {
+            if (entry_path.empty()) {
                 entry_path = argv[i];
             }
             // Collect remaining args for the guest
@@ -701,6 +1128,16 @@ int main(int argc, char** argv) {
             auto* sock = net::get_network_ctx().get_socket(fd);
             return (sock && sock->native_fd >= 0) ? sock->native_fd : -1;
         };
+        syscalls::net_set_nonblock = [](int fd, bool on) {
+            auto* sock = net::get_network_ctx().get_socket(fd);
+            if (sock && sock->native_fd >= 0) {
+                int flags = fcntl(sock->native_fd, F_GETFL, 0);
+                if (on) flags |= O_NONBLOCK;
+                else flags &= ~O_NONBLOCK;
+                fcntl(sock->native_fd, F_SETFL, flags);
+                sock->nonblocking = on;
+            }
+        };
 #endif
 
         // Set up environment variables
@@ -712,9 +1149,25 @@ int main(int argc, char** argv) {
             "LANG=C.UTF-8",
             "HOSTNAME=friscy",
             "TZ=UTC",
-            "NODE_OPTIONS=--jitless --max-old-space-size=256",
+            "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js",
             "NODE_COMPILE_CACHE=/tmp/node-compile-cache",
         };
+        // Apply --env overrides: if KEY matches an existing var, replace it
+        for (const auto& e : extra_env) {
+            auto eq = e.find('=');
+            std::string key = (eq != std::string::npos) ? e.substr(0, eq + 1) : e;
+            bool replaced = false;
+            for (auto& existing : env) {
+                if (existing.compare(0, key.size(), key) == 0) {
+                    existing = e;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                env.push_back(e);
+            }
+        }
         syscalls::g_exec_ctx.env = env;
 
         // Set up argv — ensure entry_path is argv[0]
@@ -876,7 +1329,9 @@ int main(int argc, char** argv) {
                     continue;
                 }
 #endif
-                std::cerr << "[friscy] simulate() returned normally, retries=" << retries << "\n";
+                std::cerr << "[friscy] simulate() returned normally, retries=" << retries
+                          << " instructions=" << machine.instruction_counter()
+                          << " exit_code=" << machine.return_value() << "\n";
                 break;
             } catch (const riscv::MachineException& e) {
                 uint64_t fault_addr = e.data();

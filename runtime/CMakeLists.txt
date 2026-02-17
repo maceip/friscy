@@ -10,9 +10,14 @@ if(NOT EMSCRIPTEN)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -flto -march=native -DNDEBUG")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto -O3")
 else()
-    # SHARED_MEMORY requires atomics+bulk-memory at compile time (for all TUs including libriscv)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -matomics -mbulk-memory")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -matomics -mbulk-memory")
+    if(FRISCY_WIZER)
+        # Wizer builds: NO shared memory, NO bulk-memory (data.drop unsupported by wasmtime)
+        # Wizer snapshots run single-threaded, no Worker/SharedArrayBuffer needed
+    else()
+        # SHARED_MEMORY requires atomics+bulk-memory at compile time (for all TUs including libriscv)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -matomics -mbulk-memory")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -matomics -mbulk-memory")
+    endif()
 endif()
 
 # ============================================================================
@@ -60,7 +65,7 @@ set(RISCV_TAILCALL_DISPATCH OFF CACHE BOOL "musttail doesn't work in Wasm")
 # 28-bit = 256MB, 29-bit = 512MB, 30-bit = 1GB, 31-bit = 2GB
 # 31-bit required for Node.js/V8 (pointer cage + code spaces need ~1.15GB)
 set(RISCV_ENCOMPASSING_ARENA ON  CACHE BOOL "Pre-allocate guest address space")
-set(RISCV_ENCOMPASSING_ARENA_BITS 31 CACHE STRING "2GB guest address space")
+set(RISCV_ENCOMPASSING_ARENA_BITS 30 CACHE STRING "1GB guest address space (leaves ~2.5GB for host C++ heap)")
 set(RISCV_FLAT_RW_ARENA ON  CACHE BOOL "Fast read-write arena")
 set(RISCV_MEMORY_TRAPS OFF CACHE BOOL "Disable page traps (overhead)")
 
@@ -120,9 +125,13 @@ else()
             -O2
             -fwasm-exceptions
             -sWASM_LEGACY_EXCEPTIONS=0
-            -msimd128              # WASM SIMD (2-4x faster memcpy)
-            -mbulk-memory          # Fast memcpy/memset intrinsics
         )
+        if(NOT FRISCY_WIZER)
+            target_compile_options(friscy PRIVATE
+                -msimd128              # WASM SIMD (2-4x faster memcpy)
+                -mbulk-memory          # Fast memcpy/memset intrinsics
+            )
+        endif()
     else()
         # Native build: maximize interpreter throughput
         target_compile_options(friscy PRIVATE
@@ -141,12 +150,8 @@ if(EMSCRIPTEN)
         -fwasm-exceptions
         -sWASM_LEGACY_EXCEPTIONS=0
         -sSUPPORT_LONGJMP=0
-        -sSHARED_MEMORY=1               # SharedArrayBuffer for Worker communication
-        -sPTHREAD_POOL_SIZE=0           # No pthread workers — we manage our own Worker
-        -msimd128                       # WASM SIMD for faster memory ops
-        -mbulk-memory                   # memory.copy, memory.fill intrinsics
         -sALLOW_TABLE_GROWTH
-        -sINITIAL_MEMORY=3221225472     # 3GB initial (2GB arena + overhead)
+        -sINITIAL_MEMORY=2147483648     # 2GB initial (1GB arena + 1GB host heap)
         -sALLOW_MEMORY_GROWTH
         -sMAXIMUM_MEMORY=4294967296     # 4GB max (wasm32 limit)
         -sSTACK_SIZE=1048576            # 1MB stack
@@ -183,6 +188,17 @@ if(EMSCRIPTEN)
         if(NOT FRISCY_WIZER)
             list(APPEND FRISCY_LINK_FLAGS -sASSERTIONS=1)
         endif()
+    endif()
+
+    # Shared memory + bulk-memory + SIMD: only for non-Wizer builds
+    # Wizer's wasmtime doesn't support data.drop (from bulk-memory) or shared memory
+    if(NOT FRISCY_WIZER)
+        list(APPEND FRISCY_LINK_FLAGS
+            -sSHARED_MEMORY=1               # SharedArrayBuffer for Worker communication
+            -sPTHREAD_POOL_SIZE=0           # No pthread workers — we manage our own Worker
+            -msimd128                       # WASM SIMD for faster memory ops
+            -mbulk-memory                   # memory.copy, memory.fill intrinsics
+        )
     endif()
 
     target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})

@@ -44,6 +44,21 @@ inline int g_trace_countdown = 0;
 // Avoids including network.hpp here (which would cause macro clashes with fcntl.h).
 inline bool (*net_is_socket_fd)(int fd) = nullptr;
 inline int  (*net_get_native_fd)(int fd) = nullptr;  // returns native fd or -1
+inline void (*net_set_nonblock)(int fd, bool on) = nullptr;  // set O_NONBLOCK on native socket
+
+// eventfd tracking: maps VFS fd → counter (0 means empty/not signaled)
+inline std::unordered_map<int, uint64_t> g_eventfd_counters;
+
+// Epoll instance (forward declaration — used by eventfd write to wake sleeping threads)
+struct EpollInterest {
+    uint32_t events;
+    uint64_t data;
+};
+struct EpollInstance {
+    std::unordered_map<int, EpollInterest> interests;
+};
+inline std::unordered_map<int, EpollInstance> g_epoll_instances;
+inline int g_next_epoll_fd = 2000;
 
 // Cooperative fork state — single-process vfork emulation.
 // On clone(): save parent registers, return 0 (child runs).
@@ -140,7 +155,7 @@ struct VThread {
     uint64_t clear_child_tid;  // CLONE_CHILD_CLEARTID address (written 0 + futex wake on exit)
     uint64_t syscall_budget;   // Syscalls remaining before forced yield
 };
-constexpr int MAX_VTHREADS = 8;
+constexpr int MAX_VTHREADS = 16;
 constexpr uint64_t THREAD_QUANTUM = 50000;
 struct ThreadScheduler {
     VThread threads[MAX_VTHREADS];
@@ -1296,6 +1311,33 @@ static void sys_read(Machine& m) {
         fd = 0;  // treat as stdin read
     }
 
+    // eventfd: return 8-byte counter value and reset
+    if (fd > 2 && g_eventfd_counters.count(fd)) {
+        if (count < 8) {
+            m.set_result(-22);  // -EINVAL (eventfd reads must be 8 bytes)
+            return;
+        }
+        uint64_t val = g_eventfd_counters[fd];
+        if (val == 0) {
+            // No signal pending — would block (EAGAIN for nonblock)
+            m.set_result(-11);  // -EAGAIN
+            return;
+        }
+        // Reset counter and clear Fifo content so epoll sees empty
+        g_eventfd_counters[fd] = 0;
+        auto& fs2 = get_fs(m);
+        auto entry = fs2.get_entry(fd);
+        if (entry) {
+            entry->content.clear();
+            entry->size = 0;
+        }
+        // Reset file offset for next write
+        fs2.lseek(fd, 0, 0);  // SEEK_SET
+        m.memory.template write<uint64_t>(buf_addr, val);
+        m.set_result(8);
+        return;
+    }
+
     // /dev/urandom, /dev/random — return random bytes
     if (fd > 2) {
         auto path = fs.get_path(fd);
@@ -1313,15 +1355,23 @@ static void sys_read(Machine& m) {
         }
     }
 
-    // If fd has been redirected (e.g. dup2'd to a pipe), use VFS
+    // If fd has been redirected (e.g. dup2'd to a pipe), try VFS first.
+    // In Emscripten mode, if the VFS pipe is empty (n <= 0), fall through
+    // to the Module._stdinBuffer mechanism — libuv does pipe2+dup2 on fd 0
+    // but nothing writes to that pipe; real stdin comes via SAB.
     if (fd == 0 && fs.is_open(fd)) {
         std::vector<uint8_t> buf(count);
         ssize_t n = fs.read(fd, buf.data(), count);
         if (n > 0) {
             m.memory.memcpy(buf_addr, buf.data(), n);
+            m.set_result(n);
+            return;
         }
+#ifndef __EMSCRIPTEN__
         m.set_result(n);
         return;
+#endif
+        // Emscripten: fall through to Module._stdinBuffer below
     }
 
     if (fd == 0) {
@@ -1350,14 +1400,37 @@ static void sys_read(Machine& m) {
             m.stop();
         }
 #else
-        m.set_result(0);  // EOF for stdin
+        // Native mode: read from host stdin (pipe or terminal)
+        {
+            std::vector<uint8_t> buf(count);
+            ssize_t n = ::read(STDIN_FILENO, buf.data(), count);
+            if (n > 0) {
+                m.memory.memcpy(buf_addr, buf.data(), n);
+            }
+            m.set_result(n >= 0 ? n : -errno);
+        }
 #endif
         return;
     }
 
-    // Socket FDs: delegate to recv
-#ifndef __EMSCRIPTEN__
+    // Socket FDs: delegate to recv / network bridge
     if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        // Emscripten: read socket data from JS network bridge via RPC
+        auto view = m.memory.memview(buf_addr, count);
+        int bytes_read = EM_ASM_INT({
+            if (typeof Module.readSocketData !== 'function') return 0;
+            var result = Module.readSocketData($0, $1);
+            if (!result || result.length === 0) return 0;
+            for (var i = 0; i < result.length; i++) {
+                Module.HEAPU8[$2 + i] = result[i];
+            }
+            return result.length;
+        }, fd, (int)count, (int)(uintptr_t)view.data());
+        fprintf(stderr, "[read-socket] fd=%d len=%zu bytes_read=%d\n", fd, count, bytes_read);
+        m.set_result(bytes_read > 0 ? bytes_read : -11 /*EAGAIN*/);
+        return;
+#else
         int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
         if (native_fd >= 0) {
             std::vector<uint8_t> buf(count);
@@ -1368,8 +1441,8 @@ static void sys_read(Machine& m) {
             m.set_result(n >= 0 ? n : -errno);
             return;
         }
-    }
 #endif
+    }
 
     std::vector<uint8_t> buf(count);
     ssize_t n = fs.read(fd, buf.data(), count);
@@ -1399,11 +1472,63 @@ static void sys_write(Machine& m) {
         }
     }
 
+    // eventfd write: add value to counter, signal Fifo
+    if (fd > 2 && g_eventfd_counters.count(fd) && count >= 8) {
+        uint64_t val = m.memory.template read<uint64_t>(buf_addr);
+        g_eventfd_counters[fd] += val;
+        uint64_t total = g_eventfd_counters[fd];
+        // Update Fifo content at offset 0 so epoll sees it as ready
+        auto entry = fs.get_entry(fd);
+        if (entry) {
+            entry->content.resize(8);
+            memcpy(entry->content.data(), &total, 8);
+            entry->size = 8;
+        }
+        // Reset write offset to 0 for consistent eventfd semantics
+        fs.lseek(fd, 0, 0);  // SEEK_SET
+
+        // Wake threads sleeping on epoll instances that watch this eventfd.
+        // Threads mark themselves as waiting with futex_addr = epfd.
+        for (auto& [epfd, inst] : g_epoll_instances) {
+            if (inst.interests.count(fd)) {
+                // This epoll watches the eventfd we just wrote to.
+                // Wake any thread sleeping on this epfd.
+                for (int i = 0; i < MAX_VTHREADS; i++) {
+                    if (g_sched.threads[i].active && g_sched.threads[i].waiting
+                        && g_sched.threads[i].futex_addr == (uint64_t)epfd) {
+                        g_sched.threads[i].waiting = false;
+                        static int ewake = 0;
+                        if (++ewake <= 20)
+                            fprintf(stderr, "[eventfd-wake] write fd=%d → wake t%d (epfd=%d)\n",
+                                    fd, i, epfd);
+                    }
+                }
+            }
+        }
+        m.set_result(8);
+        return;
+    }
+
     // Check VFS first — fd 1/2 may have been dup2'd to a pipe/file
     if (fs.is_open(fd)) {
         std::vector<uint8_t> buf(count);
         m.memory.memcpy_out(buf.data(), buf_addr, count);
+        // Also tap fd 1/2 writes to host printer (Node.js dup2's stdio to pipes)
+        if (fd == 1 || fd == 2) {
+            m.print(reinterpret_cast<const char*>(buf.data()), count);
+        }
         ssize_t n = fs.write(fd, buf.data(), count);
+        // Wake threads sleeping on epoll instances watching this pipe fd
+        for (auto& [epfd, inst] : g_epoll_instances) {
+            if (inst.interests.count(fd)) {
+                for (int i = 0; i < MAX_VTHREADS; i++) {
+                    if (g_sched.threads[i].active && g_sched.threads[i].waiting
+                        && g_sched.threads[i].futex_addr == (uint64_t)epfd) {
+                        g_sched.threads[i].waiting = false;
+                    }
+                }
+            }
+        }
         m.set_result(n);
         return;
     }
@@ -1426,9 +1551,21 @@ static void sys_write(Machine& m) {
         return;
     }
 
-    // Socket FDs: delegate to send
-#ifndef __EMSCRIPTEN__
+    // Socket FDs: delegate to send / network bridge
     if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        std::vector<uint8_t> buf(count);
+        m.memory.memcpy_out(buf.data(), buf_addr, count);
+        int result = EM_ASM_INT({
+            if (typeof Module.onSocketSend === 'function') {
+                var data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                return Module.onSocketSend($0, data);
+            }
+            return -38;
+        }, fd, buf.data(), count);
+        m.set_result(result >= 0 ? (int64_t)count : result);
+        return;
+#else
         int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
         if (native_fd >= 0) {
             std::vector<uint8_t> buf(count);
@@ -1437,8 +1574,8 @@ static void sys_write(Machine& m) {
             m.set_result(n >= 0 ? n : -errno);
             return;
         }
-    }
 #endif
+    }
 
     m.set_result(err::BADF);
 }
@@ -1458,6 +1595,10 @@ static void sys_writev(Machine& m) {
             if (len > 0) {
                 std::vector<uint8_t> buf(len);
                 m.memory.memcpy_out(buf.data(), base, len);
+                // Also tap fd 1/2 writes to host printer
+                if (fd == 1 || fd == 2) {
+                    m.print(reinterpret_cast<const char*>(buf.data()), len);
+                }
                 ssize_t n = fs.write(fd, buf.data(), len);
                 if (n < 0) {
                     m.set_result(total > 0 ? (int64_t)total : n);
@@ -1486,9 +1627,34 @@ static void sys_writev(Machine& m) {
         return;
     }
 
-    // Socket FDs: gather iov and send
-#ifndef __EMSCRIPTEN__
+    // Socket FDs: gather iov and send / network bridge
     if (net_is_socket_fd && net_is_socket_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        // Gather all iov buffers and send via network bridge
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len > 0) {
+                std::vector<uint8_t> buf(len);
+                m.memory.memcpy_out(buf.data(), base, len);
+                int result = EM_ASM_INT({
+                    if (typeof Module.onSocketSend === 'function') {
+                        var data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                        return Module.onSocketSend($0, data);
+                    }
+                    return -38;
+                }, fd, buf.data(), len);
+                if (result < 0) {
+                    m.set_result(total > 0 ? (int64_t)total : result);
+                    return;
+                }
+                total += len;
+            }
+        }
+        m.set_result(total);
+        return;
+#else
         int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
         if (native_fd >= 0) {
             size_t total = 0;
@@ -1510,8 +1676,8 @@ static void sys_writev(Machine& m) {
             m.set_result(total);
             return;
         }
-    }
 #endif
+    }
 
     m.set_result(err::BADF);
 }
@@ -2306,9 +2472,10 @@ static void sys_fcntl(Machine& m) {
     int cmd = m.template sysarg<int>(1);
 
     // Validate fd: 0-2 are always valid (stdin/stdout/stderr),
-    // other fds must be open in VFS. Return -EBADF for invalid fds
+    // other fds must be open in VFS or be a socket fd.
+    // Return -EBADF for invalid fds
     // (critical: loops like libuv's fd-cloexec rely on -EBADF to terminate).
-    bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd);
+    bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd) || net_is_socket_fd(fd);
     if (!valid) {
         m.set_result(err::BADF);
         return;
@@ -2340,9 +2507,17 @@ static void sys_fcntl(Machine& m) {
         case F_GETFL:
             m.set_result((fd == 1 || fd == 2) ? 1 : 0);
             return;
-        case F_SETFL:
+        case F_SETFL: {
+#ifndef __EMSCRIPTEN__
+            // For socket FDs, forward nonblocking flag to the real socket
+            if (net_is_socket_fd(fd) && net_set_nonblock) {
+                int arg = m.template sysarg<int>(2);
+                net_set_nonblock(fd, (arg & 0x800) != 0);
+            }
+#endif
             m.set_result(0);
             return;
+        }
         default:
             m.set_result(0);
             return;
@@ -2419,7 +2594,9 @@ static void sys_readv(Machine& m) {
         fd = 0;  // treat as stdin read
     }
 
-    // If fd 0 has been redirected (e.g. dup2'd to a pipe), use VFS
+    // If fd 0 has been redirected (e.g. dup2'd to a pipe), try VFS first.
+    // In Emscripten mode, if the VFS pipe is empty, fall through to
+    // Module._stdinBuffer — libuv does pipe2+dup2 but real stdin comes via SAB.
     if (fd == 0 && fs.is_open(fd)) {
         size_t total = 0;
         for (int i = 0; i < iovcnt; i++) {
@@ -2439,8 +2616,15 @@ static void sys_readv(Machine& m) {
                 if (static_cast<size_t>(n) < len) break;
             }
         }
-        m.set_result(total);
+        if (total > 0) {
+            m.set_result(total);
+            return;
+        }
+#ifndef __EMSCRIPTEN__
+        m.set_result(0);
         return;
+#endif
+        // Emscripten: fall through to Module._stdinBuffer below
     }
 
     if (fd == 0) {
@@ -2486,7 +2670,22 @@ static void sys_readv(Machine& m) {
         }
         m.set_result(total);
 #else
-        m.set_result(0);  // EOF for stdin
+        // Native mode: read from host stdin into iovec
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+            if (len > 0) {
+                std::vector<uint8_t> buf(len);
+                ssize_t n = ::read(STDIN_FILENO, buf.data(), len);
+                if (n > 0) {
+                    m.memory.memcpy(base, buf.data(), n);
+                    total += n;
+                }
+                if (n <= 0 || static_cast<size_t>(n) < len) break;
+            }
+        }
+        m.set_result(total > 0 ? (int64_t)total : 0);
 #endif
         return;
     }
@@ -2723,8 +2922,17 @@ static void sys_ppoll(Machine& m) {
                 needs_stdin = true;
             }
 #else
-            revents |= 0x0010; // POLLHUP (EOF in native mode)
-            ready++;
+            // Native mode: use real poll on stdin
+            struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+            int ret = ::poll(&pfd, 1, 0);
+            if (ret > 0 && (pfd.revents & POLLIN)) {
+                revents |= 0x0001; // POLLIN
+                ready++;
+            } else if (ret > 0 && (pfd.revents & POLLHUP)) {
+                revents |= 0x0010; // POLLHUP
+                ready++;
+            }
+            // else: no data yet, don't set needs_stdin for native mode
 #endif
         } else if (fd == 1 || fd == 2) {
             if (events & 0x0004 /*POLLOUT*/) {
@@ -2732,6 +2940,27 @@ static void sys_ppoll(Machine& m) {
                 ready++;
             }
         } else if (fd >= 0) {
+#ifndef __EMSCRIPTEN__
+            // For socket FDs, use real poll on the native fd
+            if (net_is_socket_fd && net_is_socket_fd(fd) && net_get_native_fd) {
+                int native_fd = net_get_native_fd(fd);
+                if (native_fd >= 0) {
+                    struct pollfd pfd;
+                    pfd.fd = native_fd;
+                    pfd.events = events;
+                    pfd.revents = 0;
+                    // Use a short timeout to avoid blocking forever
+                    int timeout_ms = zero_timeout ? 0 : (has_timeout ? 10 : 100);
+                    int pr = ::poll(&pfd, 1, timeout_ms);
+                    if (pr > 0) {
+                        revents = pfd.revents;
+                        ready++;
+                    }
+                    m.memory.template write<int16_t>(entry_addr + 6, revents);
+                    continue;
+                }
+            }
+#endif
             // VFS file descriptors are always ready
             revents |= (events & 0x0001); // POLLIN if requested
             if (revents) ready++;
@@ -2765,18 +2994,7 @@ static void sys_ppoll(Machine& m) {
 // epoll — I/O event notification for libuv (Node.js event loop)
 // ============================================================================
 
-// Epoll instance keyed by VFS fd
-struct EpollInterest {
-    uint32_t events;  // EPOLLIN=1, EPOLLOUT=4, etc.
-    uint64_t data;    // Caller's epoll_data (returned as-is in epoll_pwait)
-};
-struct EpollInstance {
-    std::unordered_map<int, EpollInterest> interests;  // fd → {events, data}
-};
-
-// Global epoll instances (keyed by epoll fd)
-inline std::unordered_map<int, EpollInstance> g_epoll_instances;
-inline int g_next_epoll_fd = 2000;  // Start at 2000 to avoid collision with socket FDs (base 1000)
+// (EpollInterest, EpollInstance, g_epoll_instances, g_next_epoll_fd declared near top of file)
 
 static void sys_epoll_create1(Machine& m) {
     int fd = g_next_epoll_fd++;
@@ -2806,6 +3024,8 @@ static void sys_epoll_ctl(Machine& m) {
         uint32_t events = m.memory.template read<uint32_t>(event_addr);
         uint64_t data   = m.memory.template read<uint64_t>(event_addr + 8);
         it->second.interests[fd] = EpollInterest{events, data};
+        fprintf(stderr, "[epoll_ctl] %s epfd=%d fd=%d events=0x%x data=0x%lx\n",
+                op == 1 ? "ADD" : "MOD", epfd, fd, events, (unsigned long)data);
         m.set_result(0);
     } else if (op == EPOLL_CTL_DEL) {
         it->second.interests.erase(fd);
@@ -2823,12 +3043,29 @@ static void sys_epoll_pwait(Machine& m) {
 
     auto it = g_epoll_instances.find(epfd);
     if (it == g_epoll_instances.end()) {
-        m.set_result(-9);  // -EBADF
+        m.set_result(-4);  // -EINTR (avoid libuv assertion on cleanup)
         return;
     }
 
+#ifdef __EMSCRIPTEN__
+    // Debug: log epoll interests to see which fds are watched
+    static int epoll_log_count = 0;
+    if (epoll_log_count < 40) {
+        epoll_log_count++;
+        fprintf(stderr, "[epoll] epfd=%d timeout=%d maxev=%d interests:", epfd, timeout, maxevents);
+        for (auto& [fd2, int2] : it->second.interests) {
+            bool is_sock = net_is_socket_fd && net_is_socket_fd(fd2);
+            fprintf(stderr, " fd=%d(ev=0x%x,d=0x%lx%s)", fd2, int2.events, (unsigned long)int2.data, is_sock ? ",sock" : "");
+        }
+        fprintf(stderr, "\n");
+    }
+#endif
+
     auto& fs = get_fs(m);
     int ready = 0;
+#ifdef __EMSCRIPTEN__
+    bool socket_waiting_for_data = false;  // Socket has EPOLLIN interest but no data yet
+#endif
 
     // Check each interest for readiness
     for (auto& [fd, interest] : it->second.interests) {
@@ -2882,6 +3119,8 @@ static void sys_epoll_pwait(Machine& m) {
                 revents |= 0x04;
             if ((sock_status & 1) && (interest.events & 0x01 /*EPOLLIN*/))
                 revents |= 0x01;
+            else if (interest.events & 0x01 /*EPOLLIN*/)
+                socket_waiting_for_data = true;  // Wants EPOLLIN but no data yet
             if ((sock_status & 2) && (interest.events & 0x01 /*EPOLLIN*/))
                 revents |= 0x01;
         }
@@ -2912,8 +3151,19 @@ static void sys_epoll_pwait(Machine& m) {
             m.memory.template write<uint32_t>(offset + 4, 0);  // padding
             m.memory.template write<uint64_t>(offset + 8, interest.data);  // caller's data
             ready++;
+#ifdef __EMSCRIPTEN__
+            if (epoll_log_count <= 40) {
+                fprintf(stderr, "[epoll-ev] fd=%d revents=0x%x data=0x%lx\n", fd, revents, (unsigned long)interest.data);
+            }
+#endif
         }
     }
+
+#ifdef __EMSCRIPTEN__
+    if (epoll_log_count <= 40) {
+        fprintf(stderr, "[epoll] result: ready=%d socket_waiting=%d\n", ready, (int)socket_waiting_for_data);
+    }
+#endif
 
     if (ready > 0) {
         m.set_result(ready);
@@ -2966,11 +3216,77 @@ static void sys_epoll_pwait(Machine& m) {
             return;
         }
 #endif
-        // Nothing ready, timeout > 0 or -1 (infinite).
-        // Yield to JS event loop so stdin data / timers can arrive.
+        // Nothing ready — use cooperative threading to schedule other threads.
+        if (timeout == -1) {
+            // Infinite timeout: block this thread until an eventfd wakes it.
+            if (g_sched.count > 1) {
+                auto& cur = g_sched.threads[g_sched.current];
+                cur.waiting = true;
+                cur.futex_addr = (uint64_t)epfd;  // epoll fd as wakeup key
+                m.set_result(0);  // Will re-execute when woken
+                m.cpu.increment_pc(-4);  // Rewind to ecall
+                int next = g_sched.next_runnable(g_sched.current);
+                if (next >= 0) {
+                    switch_to_thread(m, next);
+                    return;
+                }
+                // All threads waiting — deadlock. Force-wake one.
+                for (int i = 0; i < MAX_VTHREADS; i++) {
+                    if (i != g_sched.current && g_sched.threads[i].active && g_sched.threads[i].waiting) {
+                        g_sched.threads[i].waiting = false;
+                        switch_to_thread(m, i);
+                        return;
+                    }
+                }
+                // Truly alone — unmark and fall through
+                cur.waiting = false;
+            }
+#ifdef __EMSCRIPTEN__
+            // In Wasm: yield to JS event loop (can't usleep — blocks everything).
+            // Return -EINTR (same as native) so the event loop handles it properly.
+            // Do NOT rewind PC — let the event loop continue past epoll_pwait.
+            g_waiting_for_stdin = true;
+            m.set_result(-4);  // -EINTR
+            m.stop();
+            return;
+#else
+            // Native: sleep 10ms, return -EINTR
+            usleep(10000);
+            m.set_result(-4);  // -EINTR
+            return;
+#endif
+        }
+        // Finite timeout > 0: yield to runnable threads first, then
+        // sleep briefly and return 0.
+        if (g_sched.count > 1) {
+            int next = g_sched.next_runnable(g_sched.current);
+            if (next >= 0) {
+                // Let runnable worker threads execute (e.g. DNS resolution).
+                // Rewind PC so this thread re-enters epoll_pwait when rescheduled.
+                m.cpu.increment_pc(-4);
+                switch_to_thread(m, next);
+                return;
+            }
+        }
+        // No runnable threads — sleep briefly and return 0.
+#ifdef __EMSCRIPTEN__
+        // In Wasm: yield to JS for timers/network.
+        // IMPORTANT: Do NOT rewind PC. Return 0 events so the event loop
+        // continues past epoll_pwait and processes pending callbacks.
+        // If we rewound PC, the machine would re-enter epoll_pwait forever
+        // in a tight loop without processing any event loop callbacks.
         g_waiting_for_stdin = true;
-        m.cpu.increment_pc(-4);
+        m.set_result(0);
         m.stop();
+#else
+        {
+            if (timeout > 0) {
+                int sleep_ms = std::min(timeout, 10);
+                usleep(sleep_ms * 1000);
+            }
+            m.set_result(0);
+        }
+#endif
     }
 }
 
@@ -3216,7 +3532,13 @@ static void sys_nanosleep(Machine& m) {
     }
 
 #ifdef __EMSCRIPTEN__
-    emscripten_sleep(ms);
+    // Yield to host event loop — emscripten_sleep is not available (no ASYNCIFY).
+    // Don't rewind PC: nanosleep should return 0 on resume (sleep "completed").
+    // The host's 4ms poll interval provides a natural minimum sleep.
+    g_waiting_for_stdin = true;
+    m.set_result(0);
+    m.stop();
+    return;
 #endif
     m.set_result(0);
 }
@@ -3255,19 +3577,26 @@ static void sys_mremap(Machine& m) {
     // mmap+memcpy+munmap. This matches QEMU behavior.
     m.set_result(uint64_t(-12));  // -ENOMEM
 }
+
 static void sys_eventfd2(Machine& m) {
-    // eventfd: create a notification fd backed by a shared buffer.
+    // eventfd: create a notification fd backed by a counter.
     // libuv uses this for async wakeup — write(fd, &val, 8) to signal,
-    // read(fd, &val, 8) to consume. We implement it as a regular VFS entry.
+    // read(fd, &val, 8) to consume.
+    uint32_t initval = m.template sysarg<uint32_t>(0);
     auto& fs = get_fs(m);
     auto entry = std::make_shared<vfs::Entry>();
-    entry->type = vfs::FileType::Regular;  // Allow read/write
+    entry->type = vfs::FileType::Fifo;  // Pipe-like: only ready when data available
     entry->mode = 0600;
     entry->size = 0;
-    // Initialize with 8-byte zero counter
-    entry->content.resize(8, 0);
-    int fd = fs.open_pipe(entry, 0);  // reuse open_pipe to get a fresh fd
-    fprintf(stderr, "[eventfd2] => fd=%d\n", fd);
+    // Start with empty content (no signal pending)
+    int fd = fs.open_pipe(entry, 0);
+    g_eventfd_counters[fd] = initval;
+    // If initval > 0, mark as having data
+    if (initval > 0) {
+        entry->content.resize(8);
+        memcpy(entry->content.data(), &initval, sizeof(initval));
+    }
+    fprintf(stderr, "[eventfd2] => fd=%d initval=%u\n", fd, initval);
     m.set_result(fd);
 }
 static void sys_io_uring_setup(Machine& m) { m.set_result(err::NOSYS); }

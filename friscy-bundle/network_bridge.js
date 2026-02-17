@@ -216,6 +216,13 @@ export class FriscyNetworkBridge {
 
     this.sendMessage(msg);
 
+    // Mark connected optimistically — matches C++ sys_connect behavior.
+    // The proxy buffers data until the real TCP connect completes.
+    // If connect fails, proxy sends CONNECT_ERROR and subsequent I/O will error.
+    if (conn.type === 1) {
+      conn.connected = true;
+    }
+
     // Return EINPROGRESS for async connect
     return -115;
   }
@@ -304,6 +311,11 @@ export class FriscyNetworkBridge {
     view.setUint32(5, data.length, false);
     msg.set(data, 9);
 
+    // Log first bytes of outgoing data (DNS query txID)
+    if (data.length >= 4) {
+      console.log(`[friscy-net] handleSend fd=${fd} connID=${connID} len=${data.length} first4: ${data[0].toString(16)} ${data[1].toString(16)} ${data[2].toString(16)} ${data[3].toString(16)}`);
+    }
+
     this.sendMessage(msg);
     return data.length;
   }
@@ -357,13 +369,14 @@ export class FriscyNetworkBridge {
   async readIncomingStreams() {
     if (!this.transport) return;
 
+    console.log('[friscy-net] readIncomingStreams: waiting for unidirectional streams...');
     const reader = this.transport.incomingUnidirectionalStreams.getReader();
 
     try {
       while (true) {
         const { value: stream, done } = await reader.read();
-        if (done) break;
-
+        if (done) { console.log('[friscy-net] readIncomingUniStreams: done'); break; }
+        console.log('[friscy-net] readIncomingUniStreams: got stream!');
         this.handleIncomingStream(stream);
       }
     } catch (e) {
@@ -380,12 +393,14 @@ export class FriscyNetworkBridge {
   async readIncomingBidirectionalStreams() {
     if (!this.transport) return;
 
+    console.log('[friscy-net] readIncomingBidirectionalStreams: waiting for server streams...');
     const reader = this.transport.incomingBidirectionalStreams.getReader();
 
     try {
       while (true) {
         const { value: stream, done } = await reader.read();
-        if (done) break;
+        if (done) { console.log('[friscy-net] readIncomingBidiStreams: done'); break; }
+        console.log('[friscy-net] readIncomingBidiStreams: got stream!', stream);
         if (stream && stream.readable) {
           this.handleIncomingStream(stream.readable);
         }
@@ -408,6 +423,7 @@ export class FriscyNetworkBridge {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        console.log(`[friscy-net] handleIncomingStream: chunk ${value.length} bytes`);
         chunks.push(value);
       }
 
@@ -461,6 +477,7 @@ export class FriscyNetworkBridge {
    * Handle message from proxy
    */
   handleProxyMessage(data) {
+    console.log(`[friscy-net] handleProxyMessage: len=${data.length} type=0x${data[0]?.toString(16)}`);
     if (data.length < 9) return;
 
     const view = new DataView(data.buffer, data.byteOffset);
@@ -489,6 +506,10 @@ export class FriscyNetworkBridge {
 
       case MSG.DATA:
         if (conn) {
+          // Log first bytes of incoming data (DNS response txID)
+          if (payload.length >= 4) {
+            console.log(`[friscy-net] DATA connID=${connID} len=${payload.length} first4: ${payload[0].toString(16)} ${payload[1].toString(16)} ${payload[2].toString(16)} ${payload[3].toString(16)}`);
+          }
           conn.recvBuffer.push(...payload);
         }
         break;

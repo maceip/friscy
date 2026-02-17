@@ -255,6 +255,8 @@ function maybePostJitStats(force = false) {
  * Integrates JIT: checks for compiled functions before falling back to interpreter.
  */
 function runResumeLoop() {
+    console.log('[worker] entering resume loop');
+    let resumeCount = 0;
     const friscy_stopped = emModule._friscy_stopped;
     const friscy_resume = emModule._friscy_resume;
     const friscy_get_pc = emModule._friscy_get_pc;
@@ -262,16 +264,42 @@ function runResumeLoop() {
     const friscy_get_state_ptr = emModule._friscy_get_state_ptr;
 
     while (friscy_stopped()) {
-        // Request stdin from main thread (blocks until data arrives)
-        const stdinData = requestStdin(4096);
-        maybePostJitStats();
-
-        // Push received bytes into the Module's stdin buffer
-        if (stdinData.length > 0) {
-            for (let i = 0; i < stdinData.length; i++) {
-                emModule._stdinBuffer.push(stdinData[i]);
+        // Check if stdin data is available (non-blocking first).
+        // The machine may stop for epoll yields (cooperative threading),
+        // not just stdin — so we can't block forever waiting for stdin.
+        const cmd = Atomics.load(controlView, 0);
+        if (cmd === CMD_STDIN_READY) {
+            // Main thread already has stdin data ready — consume it
+            const len = Atomics.load(controlView, 2);
+            if (len > 0) {
+                for (let i = 0; i < len; i++) {
+                    emModule._stdinBuffer.push(controlBytes[64 + i]);
+                }
+            }
+            Atomics.store(controlView, 0, CMD_IDLE);
+        } else {
+            // Request stdin with a short timeout so we don't block on epoll yields.
+            // If no stdin arrives within 1ms, resume anyway (epoll yield path).
+            Atomics.store(controlView, 2, 4096);
+            Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
+            Atomics.notify(controlView, 0);
+            // Wait briefly for main thread to provide stdin
+            Atomics.wait(controlView, 0, CMD_STDIN_REQUEST, 1);
+            const newCmd = Atomics.load(controlView, 0);
+            if (newCmd === CMD_STDIN_READY) {
+                const len = Atomics.load(controlView, 2);
+                if (len > 0) {
+                    for (let i = 0; i < len; i++) {
+                        emModule._stdinBuffer.push(controlBytes[64 + i]);
+                    }
+                }
+                Atomics.store(controlView, 0, CMD_IDLE);
+            } else {
+                // No stdin — reset to idle and resume (epoll yield or timer)
+                Atomics.store(controlView, 0, CMD_IDLE);
             }
         }
+        maybePostJitStats();
 
         // Try JIT execution before falling back to interpreter.
         // The JIT run() function chains blocks inside Wasm and returns only on:
@@ -320,10 +348,15 @@ function runResumeLoop() {
         }
 
         // Resume interpreter
+        resumeCount++;
+        if (resumeCount <= 5 || resumeCount % 100 === 0) {
+            console.log(`[worker] resume #${resumeCount}`);
+        }
         const stillStopped = friscy_resume();
         maybePostJitStats();
         if (!stillStopped) {
             // Machine finished (guest called exit)
+            console.log(`[worker] resume loop: machine finished after ${resumeCount} resumes`);
             return;
         }
     }
@@ -580,6 +613,7 @@ self.onmessage = async function(e) {
 
             // Run with arguments
             emModule.callMain(args);
+            console.log('[worker] callMain returned, checking stopped:', emModule._friscy_stopped ? emModule._friscy_stopped() : 'no fn');
 
             // Enter resume loop if machine stopped for stdin
             if (emModule._friscy_stopped && emModule._friscy_stopped()) {

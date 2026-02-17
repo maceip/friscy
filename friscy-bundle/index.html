@@ -5,10 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>friscy</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            background: #1a1a2e;
+            background: #1e1e2e;
             color: #eee;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             min-height: 100vh;
@@ -31,9 +34,28 @@
             border-radius: 3px;
             margin-left: 0.5rem;
         }
-        .net-status.connected { background: #1a4d2e; color: #98c379; }
-        .net-status.disconnected { background: #4d1a1a; color: #e06c75; }
-        .net-status.connecting { background: #4d3d1a; color: #e5c07b; }
+        .net-status.connected { background: #1a4d2e; color: #a6e3a1; }
+        .net-status.disconnected { background: #4d1a1a; color: #f38ba8; }
+        .net-status.connecting { background: #4d3d1a; color: #f9e2af; }
+        #search-bar {
+            display: none; position: fixed; top: 8px; right: 16px; z-index: 50;
+            background: #313244; border: 1px solid #585b70; border-radius: 6px;
+            padding: 4px 8px; align-items: center; gap: 6px;
+            font-family: '"JetBrains Mono", monospace'; font-size: 13px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        }
+        #search-bar.visible { display: flex; }
+        #search-bar input {
+            background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a;
+            border-radius: 4px; padding: 4px 8px; font-size: 13px;
+            font-family: inherit; outline: none; width: 240px;
+        }
+        #search-bar input:focus { border-color: #89b4fa; }
+        #search-bar button {
+            background: none; border: none; color: #a6adc8; cursor: pointer;
+            font-size: 14px; padding: 2px 6px; border-radius: 3px;
+        }
+        #search-bar button:hover { background: #45475a; color: #cdd6f4; }
         #jit-warmup-hud {
             position: fixed;
             right: 12px;
@@ -41,10 +63,10 @@
             min-width: 196px;
             padding: 0.55rem 0.65rem;
             border: 1px solid rgba(249, 168, 212, 0.25);
-            background: rgba(13, 17, 23, 0.88);
-            color: #c9d1d9;
+            background: rgba(30, 30, 46, 0.88);
+            color: #cdd6f4;
             border-radius: 8px;
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-family: 'JetBrains Mono', 'Menlo', 'Monaco', monospace;
             font-size: 0.68rem;
             line-height: 1.45;
             z-index: 30;
@@ -162,7 +184,7 @@
             border-radius: 999px;
             border: 1px solid #f9a8d4;
             font-size: 0.8rem;
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-family: 'JetBrains Mono', 'Menlo', 'Monaco', monospace;
             cursor: pointer;
             transition: opacity 0.15s, border-color 0.15s;
             margin-bottom: 4px;
@@ -188,7 +210,7 @@
             border: none;
             color: #e6edf3;
             font-size: 0.95rem;
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-family: 'JetBrains Mono', 'Menlo', 'Monaco', monospace;
             outline: none;
             min-width: 0;
         }
@@ -227,7 +249,7 @@
             padding: 8px 20px;
             cursor: pointer;
             font-size: 0.85rem;
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-family: 'JetBrains Mono', 'Menlo', 'Monaco', monospace;
             color: #c9d1d9;
             border-bottom: 1px solid #21262d;
         }
@@ -403,6 +425,12 @@
             <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
         </div>
     </header>
+    <div id="search-bar">
+        <input id="search-input" type="text" placeholder="Search terminal..." spellcheck="false" autocomplete="off">
+        <button id="search-prev" title="Previous (Shift+Enter)">&#x25B2;</button>
+        <button id="search-next" title="Next (Enter)">&#x25BC;</button>
+        <button id="search-close" title="Close (Escape)">&#x2715;</button>
+    </div>
     <div id="jit-warmup-hud" aria-live="polite">
         <div class="hud-title">JIT Warmup</div>
         <div class="hud-row"><span class="key">compiled</span><span class="val" id="jit-hud-compiled">0</span></div>
@@ -419,6 +447,9 @@
         </button>
         <button class="tab" id="tab-server" data-example="server" title="HTTP echo server on port 8080">
             <img src="./go-icon.svg" alt="" class="tab-icon">Go Server
+        </button>
+        <button class="tab" id="tab-claude" data-example="claude" title="Claude Code (AI assistant)">
+            <img src="./claude-icon.svg" alt="" class="tab-icon">Claude
         </button>
         <button class="tab" id="tab-import" data-example="import" title="Import a Docker image">
             <img src="./docker-icon.svg" alt="" class="tab-icon">Import
@@ -490,6 +521,10 @@
     <script type="module">
         import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm';
         import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm';
+        import { WebglAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/+esm';
+        import { WebLinksAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/+esm';
+        import { Unicode11Addon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-unicode11@0.6.0/+esm';
+        import { SearchAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/+esm';
         import { FriscyNetworkBridge } from './network_bridge.js';
         import { NetworkRPCHost } from './network_rpc_host.js';
 
@@ -673,7 +708,11 @@
             Atomics.store(stdoutView, 1, pos);
 
             // Decode and write to terminal
-            const text = new TextDecoder().decode(buf);
+            // TextDecoder.decode() rejects SharedArrayBuffer-backed views in Chrome —
+            // copy to regular Uint8Array first
+            const copied = new Uint8Array(buf.length);
+            copied.set(buf);
+            const text = new TextDecoder().decode(copied);
             term.write(text);
         }
 
@@ -1336,34 +1375,73 @@
             // Initialize xterm.js (created now, opened after overlay hides)
             term = new Terminal({
                 cursorBlink: true,
+                cursorStyle: 'bar',
+                cursorInactiveStyle: 'outline',
+                cursorWidth: 2,
                 convertEol: true,
+                allowProposedApi: true,
                 fontSize: 14,
-                fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Monaco, monospace',
+                fontWeight: '400',
+                fontWeightBold: '700',
+                lineHeight: 1.15,
+                scrollback: 10000,
+                smoothScrollDuration: 100,
+                minimumContrastRatio: 4.5,
+                customGlyphs: true,
+                rescaleOverlappingGlyphs: true,
+                drawBoldTextInBrightColors: false,
+                altClickMovesCursor: true,
+                scrollOnUserInput: true,
                 theme: {
-                    background: '#0d1117',
-                    foreground: '#c9d1d9',
-                    selectionBackground: '#00507a',
-                    cursor: '#c9d1d9',
-                    black: '#000000',
-                    red: '#e06c75',
-                    green: '#98c379',
-                    yellow: '#e5c07b',
-                    blue: '#61afef',
-                    magenta: '#c678dd',
-                    cyan: '#56b6c2',
-                    white: '#ffffff',
-                    brightBlack: '#5c6370',
-                    brightRed: '#e06c75',
-                    brightGreen: '#98c379',
-                    brightYellow: '#e5c07b',
-                    brightBlue: '#61afef',
-                    brightMagenta: '#c678dd',
-                    brightCyan: '#56b6c2',
-                    brightWhite: '#ffffff',
+                    background: '#1e1e2e',
+                    foreground: '#cdd6f4',
+                    selectionBackground: '#45475a',
+                    selectionForeground: '#cdd6f4',
+                    selectionInactiveBackground: '#313244',
+                    cursor: '#f5e0dc',
+                    cursorAccent: '#1e1e2e',
+                    black: '#45475a',
+                    red: '#f38ba8',
+                    green: '#a6e3a1',
+                    yellow: '#f9e2af',
+                    blue: '#89b4fa',
+                    magenta: '#cba6f7',
+                    cyan: '#94e2d5',
+                    white: '#bac2de',
+                    brightBlack: '#585b70',
+                    brightRed: '#f38ba8',
+                    brightGreen: '#a6e3a1',
+                    brightYellow: '#f9e2af',
+                    brightBlue: '#89b4fa',
+                    brightMagenta: '#cba6f7',
+                    brightCyan: '#94e2d5',
+                    brightWhite: '#a6adc8',
                 }
             });
             fitAddon = new FitAddon();
             term.loadAddon(fitAddon);
+
+            // WebGL renderer (GPU-accelerated, 3-10x faster)
+            try {
+                const webgl = new WebglAddon();
+                webgl.onContextLoss(() => { webgl.dispose(); });
+                term.loadAddon(webgl);
+            } catch (e) {
+                console.warn('[xterm] WebGL2 not available, using canvas renderer');
+            }
+
+            // Clickable URLs in terminal output
+            term.loadAddon(new WebLinksAddon());
+
+            // Unicode 11 for correct CJK/emoji widths
+            const unicode11 = new Unicode11Addon();
+            term.loadAddon(unicode11);
+            term.unicode.activeVersion = '11';
+
+            // Search (Ctrl+Shift+F)
+            const searchAddon = new SearchAddon();
+            term.loadAddon(searchAddon);
 
             function debounce(fn, ms) {
                 let id;
@@ -1490,8 +1568,35 @@
                 : '\x1b[33mNetwork: offline (no proxy)\x1b[0m');
             term.writeln('');
 
-            // --- Clipboard support (Ctrl+C copy / Ctrl+V paste) + Tab capture ---
+            // --- Search bar wiring ---
+            const searchBarEl = document.getElementById('search-bar');
+            const searchInputEl = document.getElementById('search-input');
+            function openSearch() {
+                searchBarEl.classList.add('visible');
+                searchInputEl.focus();
+                searchInputEl.select();
+            }
+            function closeSearch() {
+                searchBarEl.classList.remove('visible');
+                searchAddon.clearDecorations();
+                term.focus();
+            }
+            searchInputEl.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Enter' && ev.shiftKey) { searchAddon.findPrevious(searchInputEl.value); ev.preventDefault(); }
+                else if (ev.key === 'Enter') { searchAddon.findNext(searchInputEl.value); ev.preventDefault(); }
+                else if (ev.key === 'Escape') { closeSearch(); ev.preventDefault(); }
+            });
+            searchInputEl.addEventListener('input', () => { if (searchInputEl.value) searchAddon.findNext(searchInputEl.value); });
+            document.getElementById('search-prev').addEventListener('click', () => searchAddon.findPrevious(searchInputEl.value));
+            document.getElementById('search-next').addEventListener('click', () => searchAddon.findNext(searchInputEl.value));
+            document.getElementById('search-close').addEventListener('click', closeSearch);
+
+            // --- Clipboard support (Ctrl+C/V) + Search (Ctrl+Shift+F) + Tab ---
             term.attachCustomKeyEventHandler((ev) => {
+                if (ev.type === 'keydown' && ev.ctrlKey && ev.shiftKey && ev.key === 'F') {
+                    openSearch();
+                    return false;
+                }
                 if (ev.type === 'keydown' && ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
                     navigator.clipboard.writeText(term.getSelection());
                     return false;
@@ -1502,10 +1607,9 @@
                     }).catch(() => {});
                     return false;
                 }
-                // Capture Tab key — send \t to guest shell for tab completion
                 if (ev.key === 'Tab') {
                     ev.preventDefault();
-                    return true; // let xterm process it (sends \t via onData)
+                    return true;
                 }
                 return true;
             });
@@ -1557,7 +1661,10 @@
             // Build args matching main.cpp: --rootfs <tar> <entry> [args...]
             const entrypoint = exampleCfg.entrypoint || manifest.entrypoint;
             const guestCmd = Array.isArray(entrypoint) ? entrypoint : entrypoint.split(' ').filter(s => s);
-            const args = ['--rootfs', '/rootfs.tar', ...guestCmd];
+            // Pass env vars from manifest as --env KEY=VALUE args
+            const envVars = exampleCfg.env || [];
+            const envArgs = envVars.flatMap(e => ['--env', e]);
+            const args = [...envArgs, '--rootfs', '/rootfs.tar', ...guestCmd];
 
             statusEl.textContent = 'Booting...';
             machineRunning = true;
@@ -1838,21 +1945,33 @@
         async function bootCompanion(rootfsBuffer, proxyUrl) {
             const termEl2 = document.getElementById('terminal-companion');
             term2 = new Terminal({
-                cursorBlink: true, convertEol: true, fontSize: 13,
-                fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                cursorBlink: true, cursorStyle: 'bar', cursorWidth: 2,
+                convertEol: true, fontSize: 13,
+                fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Monaco, monospace',
+                fontWeight: '400', fontWeightBold: '700',
+                lineHeight: 1.15, scrollback: 10000,
+                smoothScrollDuration: 100, minimumContrastRatio: 4.5,
+                customGlyphs: true, rescaleOverlappingGlyphs: true,
+                drawBoldTextInBrightColors: false,
                 theme: {
-                    background: '#0d1117', foreground: '#c9d1d9',
-                    selectionBackground: '#00507a', cursor: '#c9d1d9',
-                    black: '#000000', red: '#e06c75', green: '#98c379',
-                    yellow: '#e5c07b', blue: '#61afef', magenta: '#c678dd',
-                    cyan: '#56b6c2', white: '#ffffff',
-                    brightBlack: '#5c6370', brightRed: '#e06c75', brightGreen: '#98c379',
-                    brightYellow: '#e5c07b', brightBlue: '#61afef', brightMagenta: '#c678dd',
-                    brightCyan: '#56b6c2', brightWhite: '#ffffff',
+                    background: '#1e1e2e', foreground: '#cdd6f4',
+                    selectionBackground: '#45475a', selectionForeground: '#cdd6f4',
+                    cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
+                    black: '#45475a', red: '#f38ba8', green: '#a6e3a1',
+                    yellow: '#f9e2af', blue: '#89b4fa', magenta: '#cba6f7',
+                    cyan: '#94e2d5', white: '#bac2de',
+                    brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
+                    brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#cba6f7',
+                    brightCyan: '#94e2d5', brightWhite: '#a6adc8',
                 }
             });
             fitAddon2 = new FitAddon();
             term2.loadAddon(fitAddon2);
+            try { term2.loadAddon(new WebglAddon()); } catch (e) {}
+            term2.loadAddon(new WebLinksAddon());
+            const u11_2 = new Unicode11Addon();
+            term2.loadAddon(u11_2);
+            term2.unicode.activeVersion = '11';
             term2.open(termEl2);
             termEl2.addEventListener('click', () => term2.focus());
 
@@ -2280,7 +2399,7 @@
             // Tool 4: Switch to a different example tab
             navigator.modelContext.registerTool({
                 name: 'switch_tab',
-                description: 'Switch to a different friscy example tab. Available tabs: "alpine" (Alpine Linux shell), "nodejs" (Node.js REPL), "server" (Go echo HTTP server), "import" (import Docker image).',
+                description: 'Switch to a different friscy example tab. Available tabs: "alpine" (Alpine Linux shell), "nodejs" (Node.js REPL), "server" (Go echo HTTP server), "claude" (Claude Code AI), "import" (import Docker image).',
                 inputSchema: {
                     type: 'object',
                     properties: {

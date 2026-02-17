@@ -1,4 +1,4 @@
-const CACHE_NAME = 'friscy-cache-v19';
+const CACHE_NAME = 'friscy-cache-v20';
 const CACHE_ASSETS = [
   './',
   './index.html',
@@ -13,9 +13,15 @@ const CACHE_ASSETS = [
   './go-icon.svg',
   './docker-icon.svg',
   './webmcp-icon.svg',
+  './claude-icon.svg',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
   'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm',
   'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm',
+  'https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/+esm',
+  'https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/+esm',
+  'https://cdn.jsdelivr.net/npm/xterm-addon-unicode11@0.6.0/+esm',
+  'https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/+esm',
+  'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap',
 ];
 
 // Files that change often — always fetch fresh (matched by filename, not full path)

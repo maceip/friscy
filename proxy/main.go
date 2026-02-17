@@ -154,13 +154,15 @@ const (
 
 // Connection represents a virtual socket
 type Connection struct {
-	id       uint32
-	sockType int
-	conn     net.Conn
-	listener net.Listener
-	udpConn  *net.UDPConn
-	closed   atomic.Bool
-	mu       sync.Mutex
+	id        uint32
+	sockType  int
+	conn      net.Conn
+	listener  net.Listener
+	udpConn   *net.UDPConn
+	closed    atomic.Bool
+	mu        sync.Mutex
+	dialReady chan struct{} // closed when dial completes (conn is set or failed)
+	dialErr   error        // non-nil if dial failed
 }
 
 // Session represents a WebTransport client session
@@ -368,10 +370,11 @@ func (sess *Session) handleConnect(stream webtransport.Stream) {
 		return
 	}
 
-	// Create connection
+	// Create connection with dial-ready signal
 	conn := &Connection{
-		id:       connID,
-		sockType: sockType,
+		id:        connID,
+		sockType:  sockType,
+		dialReady: make(chan struct{}),
 	}
 	sess.connections.Store(connID, conn)
 
@@ -388,6 +391,8 @@ func (sess *Session) handleConnect(stream webtransport.Stream) {
 
 		if err != nil {
 			log.Printf("[%d] Connect failed: %v", connID, err)
+			conn.dialErr = err
+			close(conn.dialReady)
 			sess.sendEvent(MsgConnectError, connID, []byte(err.Error()))
 			sess.connections.Delete(connID)
 			return
@@ -397,10 +402,12 @@ func (sess *Session) handleConnect(stream webtransport.Stream) {
 		if conn.closed.Load() {
 			netConn.Close()
 			conn.mu.Unlock()
+			close(conn.dialReady)
 			return
 		}
 		conn.conn = netConn
 		conn.mu.Unlock()
+		close(conn.dialReady) // Signal that dial is complete
 
 		log.Printf("[%d] Connected to %s", connID, addr)
 		sess.sendEvent(MsgConnected, connID, nil)
@@ -425,9 +432,12 @@ func (sess *Session) handleBind(stream webtransport.Stream) {
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("[%d] Bind to %s (type=%d)", connID, addr, sockType)
 
+	ready := make(chan struct{})
+	close(ready) // Already ready (no dial needed for bind)
 	conn := &Connection{
-		id:       connID,
-		sockType: sockType,
+		id:        connID,
+		sockType:  sockType,
+		dialReady: ready,
 	}
 
 	var err error
@@ -531,20 +541,46 @@ func (sess *Session) handleSend(stream webtransport.Stream) {
 
 	v, ok := sess.connections.Load(connID)
 	if !ok {
+		log.Printf("[%d] Send: connection not found", connID)
 		return
 	}
 	conn := v.(*Connection)
+
+	// Wait for dial to complete before sending (fixes race where SEND
+	// arrives before CONNECT's goroutine has finished dialing)
+	if conn.dialReady != nil {
+		select {
+		case <-conn.dialReady:
+			// Dial completed
+		case <-sess.ctx.Done():
+			return
+		case <-time.After(15 * time.Second):
+			log.Printf("[%d] Send: timed out waiting for dial", connID)
+			return
+		}
+		if conn.dialErr != nil {
+			log.Printf("[%d] Send: dial had failed: %v", connID, conn.dialErr)
+			return
+		}
+	}
 
 	conn.mu.Lock()
 	netConn := conn.conn
 	conn.mu.Unlock()
 
 	if netConn == nil {
+		log.Printf("[%d] Send: no net connection", connID)
 		return
 	}
 
 	if _, err := netConn.Write(data); err != nil {
 		log.Printf("[%d] Send error: %v", connID, err)
+	} else {
+		hex := ""
+		for i := 0; i < len(data) && i < 8; i++ {
+			hex += fmt.Sprintf(" %02x", data[i])
+		}
+		log.Printf("[%d] Send: %d bytes, first8:%s", connID, len(data), hex)
 	}
 }
 
@@ -568,9 +604,11 @@ func (sess *Session) handleClose(stream webtransport.Stream) {
 
 func (sess *Session) readLoop(conn *Connection) {
 	buf := make([]byte, 65536)
+	log.Printf("[%d] readLoop started (type=%d)", conn.id, conn.sockType)
 
 	for {
 		if conn.closed.Load() {
+			log.Printf("[%d] readLoop: connection closed", conn.id)
 			return
 		}
 
@@ -579,6 +617,7 @@ func (sess *Session) readLoop(conn *Connection) {
 		conn.mu.Unlock()
 
 		if netConn == nil {
+			log.Printf("[%d] readLoop: netConn is nil", conn.id)
 			return
 		}
 
@@ -590,6 +629,7 @@ func (sess *Session) readLoop(conn *Connection) {
 				continue
 			}
 			if err == io.EOF || conn.closed.Load() {
+				log.Printf("[%d] readLoop: EOF/closed", conn.id)
 				sess.sendEvent(MsgClosed, conn.id, nil)
 				return
 			}
@@ -599,6 +639,11 @@ func (sess *Session) readLoop(conn *Connection) {
 		}
 
 		if n > 0 {
+			hex := ""
+			for i := 0; i < n && i < 8; i++ {
+				hex += fmt.Sprintf(" %02x", buf[i])
+			}
+			log.Printf("[%d] readLoop: read %d bytes, first8:%s", conn.id, n, hex)
 			data := make([]byte, n)
 			copy(data, buf[:n])
 			sess.sendEvent(MsgData, conn.id, data)

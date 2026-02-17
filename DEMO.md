@@ -121,4 +121,4 @@ The prompt is the last argument in the entrypoint:
 
 ## Git checkpoint
 
-Commit `ee5eec6` — all files needed for this demo are committed (large files via git LFS).
+Commit `d620442` — all files needed for this demo are committed (large files via git LFS).

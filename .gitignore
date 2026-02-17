@@ -33,9 +33,11 @@ aot/target/
 target/
 aot/Cargo.lock
 
-# Test binaries
+# Test binaries and tarballs (built locally)
 tests/test_http
 tests/test_http_minimal
+tests/*.tar
+tests/echo_server/echo_server
 
 # Editor/IDE
 .vscode/

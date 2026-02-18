@@ -10,6 +10,10 @@ if(NOT EMSCRIPTEN)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -flto -march=native -DNDEBUG")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto -O3")
 else()
+    # Global Emscripten flags: -O2 needed for ALL TUs (including libriscv) so
+    # musttail emits return_call; -mtail-call enables the Wasm tail call proposal
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -mtail-call")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -mtail-call")
     if(FRISCY_WIZER)
         # Wizer builds: NO shared memory, NO bulk-memory (data.drop unsupported by wasmtime)
         # Wizer snapshots run single-threaded, no Worker/SharedArrayBuffer needed
@@ -32,7 +36,7 @@ endif()
 #
 # Key configuration decisions (see PERFORMANCE_ROADMAP.md):
 #   - NO MEMORY64: Guest 64-bit addrs are uint64_t in 32-bit host space
-#   - NO TAIL CALLS: Wasm return_call != libriscv's musttail dispatch
+#   - TAIL CALL DISPATCH: musttail → Wasm return_call (faster than br_table)
 #   - NO BINARY TRANSLATION: No dlopen in Wasm
 #   - YES EXCEPTIONS: libriscv uses throw/catch
 #   - THREADED DISPATCH: Fastest interpreter mode
@@ -55,10 +59,11 @@ set(RISCV_EXT_ZMMUL  OFF CACHE BOOL "")
 set(RISCV_EXT_ZCMP   OFF CACHE BOOL "")
 
 # --- Dispatch mode ---
-# Threaded dispatch (computed goto) works in Emscripten and is fastest.
-# Provides ~30-40% speedup over switch-based dispatch.
-set(RISCV_THREADED ON  CACHE BOOL "Computed-goto threaded dispatch")
-set(RISCV_TAILCALL_DISPATCH OFF CACHE BOOL "musttail doesn't work in Wasm")
+# Tail call dispatch: musttail → Wasm return_call. Each instruction handler
+# tail-calls the next, eliminating br_table overhead and enabling Wasm engine
+# optimizations. Mutually exclusive with threaded dispatch.
+set(RISCV_THREADED OFF CACHE BOOL "Computed-goto threaded dispatch (OFF for tail call)")
+set(RISCV_TAILCALL_DISPATCH ON  CACHE BOOL "musttail → Wasm return_call dispatch")
 
 # --- Memory configuration ---
 # Encompassing arena: pre-allocate full guest address space
@@ -119,6 +124,7 @@ if(FRISCY_PRODUCTION)
             -msimd128              # WASM SIMD
             -mbulk-memory          # Fast memcpy/memset
             -mnontrapping-fptoint  # Faster FP conversions
+            -mtail-call            # Wasm tail call proposal
         )
     else()
         target_compile_options(friscy PRIVATE
@@ -136,6 +142,7 @@ else()
             -O2
             -fwasm-exceptions
             -sWASM_LEGACY_EXCEPTIONS=0
+            -mtail-call            # Wasm tail call proposal
         )
         if(NOT FRISCY_WIZER)
             target_compile_options(friscy PRIVATE
@@ -161,6 +168,7 @@ if(EMSCRIPTEN)
         -fwasm-exceptions
         -sWASM_LEGACY_EXCEPTIONS=0
         -sSUPPORT_LONGJMP=0
+        -mtail-call
         -sALLOW_TABLE_GROWTH
         -sINITIAL_MEMORY=2147483648     # 2GB initial (1GB arena + 1GB host heap)
         -sALLOW_MEMORY_GROWTH
@@ -230,3 +238,4 @@ message(STATUS "  Production build: ${FRISCY_PRODUCTION}")
 message(STATUS "  Wizer snapshots: ${FRISCY_WIZER}")
 message(STATUS "  Arena size: ${RISCV_ENCOMPASSING_ARENA_BITS} bits (${RISCV_ENCOMPASSING_ARENA_BITS})")
 message(STATUS "  Threaded dispatch: ${RISCV_THREADED}")
+message(STATUS "  Tail call dispatch: ${RISCV_TAILCALL_DISPATCH}")

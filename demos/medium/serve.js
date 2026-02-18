@@ -1,1 +1,1 @@
-../../friscy-bundle/serve.js
+../serve.js

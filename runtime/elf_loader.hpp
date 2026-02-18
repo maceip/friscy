@@ -403,133 +403,105 @@ inline uint64_t load_elf_segments(
     }
 
     // Pass 1: Copy segment data into guest memory.
-    // Use fault-retry loop: if a page isn't writable (e.g. code pages from
-    // a previous binary during execve), make it RWX and retry.
-    for (const auto& seg : segments) {
-        auto copy_with_retry = [&](uint64_t dst, const void* src, size_t len) {
-            size_t offset = 0;
-            int faults = 0;
-            while (offset < len) {
-                try {
-                    machine.memory.memcpy(dst + offset,
-                        (const uint8_t*)src + offset, len - offset);
-                    if (faults > 0) {
-                        fprintf(stderr, "[load_elf] copy 0x%lx+0x%lx len=0x%lx done after %d faults\n",
-                                (long)dst, (long)offset, (long)len, faults);
-                    }
-                    return;  // success
-                } catch (const riscv::MachineException& e) {
-                    uint64_t fault = e.data();
-                    if (fault == 0) throw;  // not a page fault
-                    faults++;
-                    if (faults <= 10)
-                        fprintf(stderr, "[load_elf] fault #%d at 0x%lx (page 0x%lx) during copy dst=0x%lx+0x%lx len=0x%lx\n",
-                                faults, (long)fault, (long)(fault & ~0xFFFULL),
-                                (long)dst, (long)offset, (long)len);
-                    // Make the faulting page writable and retry
-                    uint64_t page = fault & ~0xFFFULL;
-                    riscv::PageAttributes attr;
-                    attr.read = true; attr.write = true; attr.exec = true;
-                    machine.memory.set_page_attr(page, 4096, attr);
-                    // Advance offset to skip already-copied data
-                    if (fault >= dst + offset) {
-                        offset = (fault & ~0xFFFULL) - dst;
-                    }
+    if constexpr (riscv::encompassing_Nbit_arena > 0) {
+        // Arena mode: write directly to arena buffer.
+        auto* arena = (uint8_t*)machine.memory.memory_arena_ptr();
+        size_t arena_size = machine.memory.memory_arena_size();
+        constexpr uint64_t ARENA_MASK = (1ULL << riscv::encompassing_Nbit_arena) - 1;
+        for (const auto& seg : segments) {
+            uint64_t arena_dst = seg.vaddr & ARENA_MASK;
+            if (seg.filesz > 0 && arena_dst + seg.filesz <= arena_size) {
+                std::memcpy(arena + arena_dst,
+                            elf_data.data() + seg.offset, seg.filesz);
+            }
+            if (seg.memsz > seg.filesz) {
+                uint64_t bss_dst = (seg.vaddr + seg.filesz) & ARENA_MASK;
+                size_t bss_len = seg.memsz - seg.filesz;
+                if (bss_dst + bss_len <= arena_size) {
+                    std::memset(arena + bss_dst, 0, bss_len);
                 }
             }
-        };
-        auto memset_with_retry = [&](uint64_t dst, uint8_t val, size_t len) {
-            size_t offset = 0;
-            while (offset < len) {
-                try {
-                    machine.memory.memset(dst + offset, val, len - offset);
-                    return;
-                } catch (const riscv::MachineException& e) {
-                    uint64_t fault = e.data();
-                    if (fault == 0) throw;
-                    uint64_t page = fault & ~0xFFFULL;
-                    riscv::PageAttributes attr;
-                    attr.read = true; attr.write = true; attr.exec = true;
-                    machine.memory.set_page_attr(page, 4096, attr);
-                    if (fault >= dst + offset) {
-                        offset = (fault & ~0xFFFULL) - dst;
+        }
+    } else {
+        // Page mode: use fault-retry loop for page-based memcpy.
+        for (const auto& seg : segments) {
+            auto copy_with_retry = [&](uint64_t dst, const void* src, size_t len) {
+                size_t offset = 0;
+                int faults = 0;
+                while (offset < len) {
+                    try {
+                        machine.memory.memcpy(dst + offset,
+                            (const uint8_t*)src + offset, len - offset);
+                        return;
+                    } catch (const riscv::MachineException& e) {
+                        uint64_t fault = e.data();
+                        if (fault == 0) throw;
+                        faults++;
+                        uint64_t page = fault & ~0xFFFULL;
+                        riscv::PageAttributes attr;
+                        attr.read = true; attr.write = true; attr.exec = true;
+                        machine.memory.set_page_attr(page, 4096, attr);
+                        if (fault >= dst + offset) {
+                            offset = (fault & ~0xFFFULL) - dst;
+                        }
                     }
                 }
+            };
+            auto memset_with_retry = [&](uint64_t dst, uint8_t val, size_t len) {
+                size_t offset = 0;
+                while (offset < len) {
+                    try {
+                        machine.memory.memset(dst + offset, val, len - offset);
+                        return;
+                    } catch (const riscv::MachineException& e) {
+                        uint64_t fault = e.data();
+                        if (fault == 0) throw;
+                        uint64_t page = fault & ~0xFFFULL;
+                        riscv::PageAttributes attr;
+                        attr.read = true; attr.write = true; attr.exec = true;
+                        machine.memory.set_page_attr(page, 4096, attr);
+                        if (fault >= dst + offset) {
+                            offset = (fault & ~0xFFFULL) - dst;
+                        }
+                    }
+                }
+            };
+
+            if (seg.filesz > 0) {
+                copy_with_retry(seg.vaddr, elf_data.data() + seg.offset, seg.filesz);
             }
-        };
-
-        if (seg.filesz > 0) {
-            copy_with_retry(seg.vaddr, elf_data.data() + seg.offset, seg.filesz);
-        }
-        if (seg.memsz > seg.filesz) {
-            memset_with_retry(seg.vaddr + seg.filesz, 0, seg.memsz - seg.filesz);
-        }
-
-        // In encompassing_Nbit_arena mode, the fast-path read/write bypasses
-        // the page table and accesses the arena buffer directly. But page-based
-        // memcpy above may have written to "owning" page objects that DON'T
-        // point to the arena (e.g. stack pages from before execve). Fix this by
-        // also writing segment data directly to the arena buffer.
-        if constexpr (riscv::encompassing_Nbit_arena > 0) {
-            auto* arena = (uint8_t*)machine.memory.memory_arena_ptr();
-            if (arena) {
-                constexpr uint64_t ARENA_MASK = (1ULL << riscv::encompassing_Nbit_arena) - 1;
-                uint64_t arena_dst = seg.vaddr & ARENA_MASK;
-                size_t arena_size = machine.memory.memory_arena_size();
-                if (seg.filesz > 0 && arena_dst + seg.filesz <= arena_size) {
-                    std::memcpy(arena + arena_dst,
-                                elf_data.data() + seg.offset, seg.filesz);
-                }
-                // Zero BSS in arena too
-                if (seg.memsz > seg.filesz) {
-                    uint64_t bss_dst = (seg.vaddr + seg.filesz) & ARENA_MASK;
-                    size_t bss_len = seg.memsz - seg.filesz;
-                    if (bss_dst + bss_len <= arena_size) {
-                        std::memset(arena + bss_dst, 0, bss_len);
-                    }
-                }
+            if (seg.memsz > seg.filesz) {
+                memset_with_retry(seg.vaddr + seg.filesz, 0, seg.memsz - seg.filesz);
             }
         }
     }
 
-    // Pass 2: Set page permissions with proper merging.
-    // For each page touched by any segment, OR the permissions from all
-    // overlapping segments. This prevents a data segment (RW) from removing
-    // execute permission on a page shared with a code segment (RX).
-    constexpr uint64_t RISCV_PAGE = 4096;
-    constexpr uint64_t RISCV_PAGE_MASK = ~(RISCV_PAGE - 1);
-
-    // Find overall page range
-    uint64_t range_lo = UINT64_MAX, range_hi = 0;
-    for (const auto& seg : segments) {
-        uint64_t lo = seg.vaddr & RISCV_PAGE_MASK;
-        uint64_t hi = (seg.vaddr + seg.memsz + RISCV_PAGE - 1) & RISCV_PAGE_MASK;
-        if (lo < range_lo) range_lo = lo;
-        if (hi > range_hi) range_hi = hi;
-    }
-
-    // Set merged permissions per page
-    for (uint64_t page = range_lo; page < range_hi; page += RISCV_PAGE) {
-        bool r = false, w = false, x = false;
-        bool touched = false;
+    // Pass 2: Set page permissions.
+    // In arena mode, reads/writes bypass page attrs, BUT the decoder still
+    // needs exec permission to build its instruction cache. Set RWX on all
+    // pages touched by executable segments.
+    {
+        constexpr uint64_t RISCV_PAGE = 4096;
+        constexpr uint64_t RISCV_PAGE_MASK = ~(RISCV_PAGE - 1);
 
         for (const auto& seg : segments) {
-            uint64_t seg_end = seg.vaddr + seg.memsz;
-            // Does this page overlap with this segment?
-            if (page < seg_end && page + RISCV_PAGE > seg.vaddr) {
-                touched = true;
-                r |= (seg.flags & elf::PF_R) != 0;
-                w |= (seg.flags & elf::PF_W) != 0;
-                x |= (seg.flags & elf::PF_X) != 0;
+            // In arena mode, only care about executable segments (decoder needs exec attr).
+            // In page mode, set all permissions.
+            if constexpr (riscv::encompassing_Nbit_arena > 0) {
+                if (!(seg.flags & elf::PF_X)) continue;  // skip non-exec in arena mode
             }
-        }
 
-        if (touched) {
+            uint64_t seg_start = seg.vaddr & RISCV_PAGE_MASK;
+            uint64_t seg_end = (seg.vaddr + seg.memsz + RISCV_PAGE - 1) & RISCV_PAGE_MASK;
+
             riscv::PageAttributes attr;
-            attr.read = r;
-            attr.write = w;
-            attr.exec = x;
-            machine.memory.set_page_attr(page, RISCV_PAGE, attr);
+            attr.read = true;
+            attr.write = true;
+            attr.exec = (seg.flags & elf::PF_X) != 0;
+
+            for (uint64_t page = seg_start; page < seg_end; page += RISCV_PAGE) {
+                machine.memory.set_page_attr(page, RISCV_PAGE, attr);
+            }
         }
     }
 

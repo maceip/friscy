@@ -15,8 +15,15 @@
 #define MUSTTAIL __attribute__((musttail))
 #define MUNUSED  [[maybe_unused]]
 #define DISPATCH_MODE_TAILCALL
+// preserve_none is x86/aarch64-only; on wasm it's ignored and breaks musttail
+// (calling convention mismatch prevents return_call emission)
+#ifdef __EMSCRIPTEN__
+#define TCO_CC
+#else
+#define TCO_CC __attribute__((preserve_none))
+#endif
 #define INSTRUCTION(bytecode, name) \
-	template <int W> __attribute__((preserve_none)) \
+	template <int W> TCO_CC \
 	static TcoRet<W> name(DecoderData<W>* d, MUNUSED DecodedExecuteSegment<W>* exec, MUNUSED CPU<W>& cpu, MUNUSED address_type<W> pc, MUNUSED InstrCounter& counter)
 #define addr_t  address_type<W>
 #define saddr_t signed_address_type<W>
@@ -120,7 +127,7 @@ namespace riscv
 	using TcoRet = address_type<W>;
 
 	template <int W>
-	using DecoderFunc =  __attribute__((preserve_none)) TcoRet<W>(*)(DecoderData<W>*, DecodedExecuteSegment<W>*, CPU<W> &, address_type<W> pc, InstrCounter& counter);
+	using DecoderFunc = TCO_CC TcoRet<W>(*)(DecoderData<W>*, DecodedExecuteSegment<W>*, CPU<W> &, address_type<W> pc, InstrCounter& counter);
 	namespace {
 		template <int W>
 		extern const DecoderFunc<W> computed_opcode[BYTECODES_MAX];

@@ -28,6 +28,13 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // Used by JS resume loop to distinguish stdin-wait from program exit.
 inline bool g_waiting_for_stdin = false;
 
+// Host fetch hypercall (syscall 500): guest does ecall with a7=500,
+// machine stops, Worker performs fetch, writes response, resumes.
+inline bool g_waiting_for_host_fetch = false;
+inline bool g_host_fetch_response_ready = false;
+inline std::string g_host_fetch_request;
+inline std::string g_host_fetch_response;
+
 // Flag: true when machine stopped due to execve loading a new binary.
 // The dispatch loop must re-enter simulate() with the new binary.
 inline bool g_execve_restart = false;
@@ -91,6 +98,10 @@ struct ForkState {
     // VFS fd snapshot: fds open before fork. On child exit, close any
     // fds not in this set to undo child's dup2/pipe/open changes.
     std::set<int> parent_open_fds;
+    // Thread scheduler snapshot: saved as raw bytes to avoid ordering
+    // dependency on ThreadScheduler definition. execve in fork child
+    // resets g_sched; must restore parent's thread state on child exit.
+    alignas(16) uint8_t saved_sched[8192];  // enough for ThreadScheduler (~5KB)
 };
 inline ForkState g_fork = {};
 inline pid_t g_next_pid = 100;
@@ -377,7 +388,9 @@ namespace nr {
     constexpr int rt_sigreturn  = 139;
     constexpr int getresuid     = 148;
     constexpr int getresgid     = 150;
+    constexpr int setpgid       = 154;
     constexpr int getpgid       = 155;
+    constexpr int setsid        = 157;
     constexpr int getgroups     = 158;
     constexpr int umask         = 166;
     constexpr int socketpair    = 199;
@@ -600,6 +613,10 @@ static void sys_exit(Machine& m) {
             g_fork.parent_open_fds.clear();
         }
 
+        // Restore cooperative thread scheduler state.
+        // The fork child's execve may have reset g_sched.
+        std::memcpy(&g_sched, g_fork.saved_sched, sizeof(g_sched));
+
         // Restore parent registers (x0-x31)
         for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
             m.cpu.reg(i) = g_fork.regs[i];
@@ -704,7 +721,9 @@ static void sys_clone(Machine& m) {
         return;
     }
 
-    fprintf(stderr, "[clone] fork flags=0x%lx\n", (long)flags);
+    auto child_stack = m.sysarg(1);
+    fprintf(stderr, "[clone] fork flags=0x%lx child_stack=0x%lx\n",
+            (long)flags, (long)child_stack);
 
     // Save parent registers
     for (int i = 0; i < 32; i++) {
@@ -713,6 +732,14 @@ static void sys_clone(Machine& m) {
     g_fork.pc = m.cpu.pc();  // Already past the ecall
     g_fork.child_pid = g_next_pid++;
     g_fork.exit_status = 0;
+
+    // Set child's stack pointer if provided (non-zero).
+    // musl's __clone stores the child function pointer and arg
+    // on the child stack before calling clone(). The child's code
+    // loads these from SP after clone returns 0.
+    if (child_stack != 0) {
+        m.cpu.reg(riscv::REG_SP) = child_stack;
+    }
 
     // Save parent memory BEFORE setting in_child.
     // If memcpy_out throws (e.g. protection fault on RELRO pages),
@@ -786,6 +813,12 @@ static void sys_clone(Machine& m) {
 
     // Save VFS open fd set so child's dup2/pipe/open can be undone
     g_fork.parent_open_fds = get_fs(m).get_open_fds();
+
+    // Save cooperative thread scheduler state. The fork child's execve
+    // resets g_sched, and we need to restore the parent's thread state
+    // when the child exits.
+    static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
+    std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
 
     // Only set in_child AFTER all saves succeed.
     // This way if memcpy_out throws, the retry will re-enter clone
@@ -887,7 +920,7 @@ static void sys_execve(Machine& m) {
     auto path_addr = m.sysarg(0);
     auto argv_addr = m.sysarg(1);
 
-    if (!g_exec_ctx.dynamic || g_exec_ctx.exec_binary.empty()) {
+    if (g_exec_ctx.exec_binary.empty()) {
         m.set_result(-38);  // -ENOSYS
         return;
     }
@@ -1011,10 +1044,6 @@ static void sys_execve(Machine& m) {
             auto [new_lo, new_hi] = elf::get_load_range(new_binary);
             uint64_t exec_base = 0x40000;
             uint64_t load_end = exec_base + new_hi - new_lo;
-            std::cerr << "[execve] ELF load range: lo=0x" << std::hex << new_lo
-                      << " hi=0x" << new_hi << " load_end=0x" << load_end
-                      << " arena=0x" << ARENA_SIZE << std::dec << "\n";
-
             if (load_end >= ARENA_SIZE) {
                 std::cerr << "[execve] ERROR: binary too large for arena! "
                           << "Need 0x" << std::hex << load_end
@@ -1023,6 +1052,13 @@ static void sys_execve(Machine& m) {
                 return;
             }
 
+            // CRITICAL: Reset cooperative thread scheduler before execve.
+            // The old binary's threads have stale register/stack state that
+            // must not survive into the new binary. If we don't reset,
+            // load_elf_segments may crash when libriscv internals interact
+            // with stale thread state (e.g. decoder cache entries).
+            g_sched.init(g_sched.threads[g_sched.current].tid);
+
             // CRITICAL: Evict all stale decoder/execute segments from the old
             // binary BEFORE loading new code. set_page_attr does NOT invalidate
             // the decoder cache, so without this the CPU tries to execute stale
@@ -1030,48 +1066,48 @@ static void sys_execve(Machine& m) {
             // "Max execute segments reached".
             m.memory.evict_execute_segments();
 
-            // Make entire arena writable from exec_base to load_end
-            // (covers both old and new binary ranges)
-            {
-                riscv::PageAttributes rw;
-                rw.read = true; rw.write = true;
-                uint64_t rw_start = exec_base;
-                uint64_t rw_len = load_end - exec_base;
-                std::cerr << "[execve] set_page_attr RW 0x" << std::hex
-                          << rw_start << " - 0x" << (rw_start + rw_len)
-                          << std::dec << "\n";
-                m.memory.set_page_attr(rw_start, rw_len, rw);
+            // In arena mode, skip set_page_attr for old/new ranges.
+            // Arena reads/writes bypass page attributes entirely, so these
+            // calls are expensive no-ops that can also trigger O(n²) scans
+            // in owned_pages_active(). The load_elf_segments function handles
+            // writing directly to both pages AND arena buffer.
+            if constexpr (riscv::encompassing_Nbit_arena == 0) {
+                // Make entire arena writable from exec_base to load_end
+                {
+                    riscv::PageAttributes rw;
+                    rw.read = true; rw.write = true;
+                    uint64_t rw_start = exec_base;
+                    uint64_t rw_len = load_end - exec_base;
+                    m.memory.set_page_attr(rw_start, rw_len, rw);
+                }
+                // Also make old binary range writable
+                {
+                    auto [old_lo, old_hi] = elf::get_load_range(g_exec_ctx.exec_binary);
+                    uint64_t old_start = g_exec_ctx.exec_base;
+                    uint64_t old_end = old_start + old_hi;
+                    riscv::PageAttributes rw;
+                    rw.read = true; rw.write = true;
+                    m.memory.set_page_attr(old_start, old_end - old_start, rw);
+                }
             }
 
-            // Also make old binary range writable (may have different base)
-            {
-                auto [old_lo, old_hi] = elf::get_load_range(g_exec_ctx.exec_binary);
-                uint64_t old_start = g_exec_ctx.exec_base;
-                uint64_t old_end = old_start + old_hi;
-                riscv::PageAttributes rw;
-                rw.read = true; rw.write = true;
-                m.memory.set_page_attr(old_start, old_end - old_start, rw);
-            }
+            // Extract all ELF info BEFORE loading (load_elf_segments may cause
+            // stack corruption with LTO inlining when called in fork context)
+            auto [rw_lo, rw_hi] = elf::get_writable_range(new_binary);
 
-            // Load new main binary segments at PIE base
+            // Load new main binary segments
             if (exec_info.type == elf::ET_DYN) {
                 auto [lo, hi] = elf::get_load_range(new_binary);
                 exec_base = 0x40000;
-                std::cerr << "[execve] loading " << (hi - lo) / 1024
-                          << " KB of segments at base 0x" << std::hex
-                          << exec_base << std::dec << "\n";
-
                 dynlink::load_elf_segments(m, new_binary, exec_base);
 
                 exec_info.phdr_addr += (exec_base - lo);
                 exec_info.entry_point += (exec_base - lo);
                 g_exec_ctx.exec_base = exec_base;
-                auto [rw_lo, rw_hi] = elf::get_writable_range(new_binary);
                 g_exec_ctx.exec_rw_start = (exec_base - lo) + rw_lo;
                 g_exec_ctx.exec_rw_end = (exec_base - lo) + rw_hi;
             } else {
                 dynlink::load_elf_segments(m, new_binary, 0);
-                auto [rw_lo, rw_hi] = elf::get_writable_range(new_binary);
                 g_exec_ctx.exec_rw_start = rw_lo;
                 g_exec_ctx.exec_rw_end = rw_hi;
             }
@@ -1092,14 +1128,23 @@ static void sys_execve(Machine& m) {
                 }
 
                 // Make old interpreter pages writable before overwriting
-                {
-                    auto [ilo, ihi] = elf::get_load_range(g_exec_ctx.interp_binary);
-                    riscv::PageAttributes rw;
-                    rw.read = true; rw.write = true;
-                    m.memory.set_page_attr(interp_base, ihi - ilo, rw);
+                // (only if previous binary had an interpreter loaded)
+                if (!g_exec_ctx.interp_binary.empty()) {
+                    if constexpr (riscv::encompassing_Nbit_arena == 0) {
+                        auto [ilo, ihi] = elf::get_load_range(g_exec_ctx.interp_binary);
+                        riscv::PageAttributes rw;
+                        rw.read = true; rw.write = true;
+                        m.memory.set_page_attr(interp_base, ihi - ilo, rw);
+                    }
                 }
 
-                // Reload interpreter at same base
+                // Choose interpreter base: reuse old if available, else pick fresh address
+                if (interp_base == 0) {
+                    // Previous binary had no interpreter — pick a base above the new binary
+                    interp_base = (load_end + 0x10000) & ~0xFFFULL;
+                }
+
+                // Load interpreter
                 dynlink::load_elf_segments(m, interp_binary, interp_base);
 
 
@@ -1158,10 +1203,6 @@ static void sys_execve(Machine& m) {
                     m.memory.mmap_address() = new_mmap_start;
                 }
 
-                std::cerr << "[execve] memory layout reset: brk=0x" << std::hex
-                          << new_brk_base << " mmap=0x"
-                          << m.memory.mmap_address() << std::dec << "\n";
-
             }
 
             // Relocate stack above the brk area so it doesn't get clobbered
@@ -1188,9 +1229,6 @@ static void sys_execve(Machine& m) {
                 m.memory.mmap_address() = new_stack_top + 0x1000;
             }
             g_exec_ctx.original_stack_top = new_stack_top;
-            std::cerr << "[execve] stack at 0x" << std::hex << new_stack_top
-                      << " mmap_next=0x" << m.memory.mmap_address()
-                      << std::dec << "\n";
 
             // Set up fresh stack
             uint64_t sp = dynlink::setup_dynamic_stack(
@@ -1294,6 +1332,9 @@ static void sys_close(Machine& m) {
         fprintf(stderr, "[TRACE] close(fd=%d) pc=0x%lx\n", fd, (long)m.cpu.pc());
     // Remove from tty tracking (but never remove 0/1/2)
     if (fd > 2) g_tty_fds.erase(fd);
+    // Clean up epoll/eventfd state
+    g_epoll_instances.erase(fd);
+    g_eventfd_counters.erase(fd);
     get_fs(m).close(fd);
     m.set_result(0);
 }
@@ -1376,6 +1417,7 @@ static void sys_read(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
+        fprintf(stderr, "[sys_read] fd=0 count=%zu pc=0x%lx\n", (size_t)count, (long)m.cpu.pc());
         // Try non-blocking read from JavaScript stdin buffer
         auto view = m.memory.memview(buf_addr, count);
         int bytes_read = EM_ASM_INT({
@@ -2027,12 +2069,24 @@ static void sys_mmap(Machine& m) {
                             (long)addr_g, (long)length);
             }
             if (our_bump + aligned_len > ARENA_LIMIT) {
-                m.set_result(uint64_t(-12));  // -ENOMEM
-                static int oom_count = 0;
-                if (++oom_count <= 10)
-                    fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx\n",
-                            (long)length, (long)our_bump, (long)ARENA_LIMIT);
-                return;
+                // For huge allocations (>= 64MB), clamp to what fits in the arena.
+                // snmalloc reserves 256GB+ of virtual space but only commits
+                // small pages within it via MAP_FIXED later. Clamping gives it
+                // a smaller but usable region. This also covers PROT_NONE
+                // reservations from Go and other runtimes.
+                if (aligned_len >= (64ULL << 20) && (ARENA_LIMIT > our_bump + (4ULL << 20))) {
+                    uint64_t clamped = (ARENA_LIMIT - our_bump) & ~4095ULL;
+                    fprintf(stderr, "[mmap-clamp] len=0x%lx clamped to 0x%lx prot=%d\n",
+                            (long)length, (long)clamped, prot);
+                    aligned_len = clamped;
+                } else {
+                    m.set_result(uint64_t(-12));  // -ENOMEM
+                    static int oom_count = 0;
+                    if (++oom_count <= 10)
+                        fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx prot=%d\n",
+                                (long)length, (long)our_bump, (long)ARENA_LIMIT, prot);
+                    return;
+                }
             }
             result = our_bump;
             our_bump += aligned_len;
@@ -2472,10 +2526,12 @@ static void sys_fcntl(Machine& m) {
     int cmd = m.template sysarg<int>(1);
 
     // Validate fd: 0-2 are always valid (stdin/stdout/stderr),
-    // other fds must be open in VFS or be a socket fd.
+    // other fds must be open in VFS, be a socket fd, or be an epoll fd.
     // Return -EBADF for invalid fds
     // (critical: loops like libuv's fd-cloexec rely on -EBADF to terminate).
-    bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd) || net_is_socket_fd(fd);
+    bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd) || net_is_socket_fd(fd)
+                 || g_epoll_instances.count(fd) || g_eventfd_counters.count(fd);
+    fprintf(stderr, "[fcntl] fd=%d cmd=%d valid=%d\n", fd, cmd, (int)valid);
     if (!valid) {
         m.set_result(err::BADF);
         return;
@@ -2491,6 +2547,21 @@ static void sys_fcntl(Machine& m) {
     switch (cmd) {
         case F_DUPFD:
         case F_DUPFD_CLOEXEC: {
+            // Epoll fds: dup by creating alias in g_epoll_instances
+            if (g_epoll_instances.count(fd)) {
+                int newfd = g_next_epoll_fd++;
+                g_epoll_instances[newfd] = g_epoll_instances[fd];
+                fprintf(stderr, "[fcntl] F_DUPFD epoll fd=%d -> newfd=%d\n", fd, newfd);
+                m.set_result(newfd);
+                return;
+            }
+            // Eventfd: dup by creating alias in VFS + counter map
+            if (g_eventfd_counters.count(fd)) {
+                int newfd = fs.dup(fd);
+                if (newfd >= 0) g_eventfd_counters[newfd] = g_eventfd_counters[fd];
+                m.set_result(newfd);
+                return;
+            }
             int newfd = fs.dup(fd);
             // Propagate tty status to new fd
             if (newfd >= 0 && g_tty_fds.count(fd))
@@ -3351,23 +3422,19 @@ static void sys_futex(Machine& m) {
             cur.waiting = false;
         }
 
-        // Fallback: no cooperative threads (all exited).
-        // If expected == 0, the value was already changed by thread exit.
-        // Return -EAGAIN to break the caller's spin loop.
+        // Fallback: single-threaded (or all threads exited).
+        // No other thread can wake us. Force-unlock the futex word so
+        // glibc's __lll_lock_wait CAS loop can acquire the lock.
+        // Stack canary is zeroed (AT_RANDOM=0) to prevent false positives
+        // from any glibc state disruption this may cause.
         static int futex_wait_count = 0;
         if (++futex_wait_count <= 50) {
             fprintf(stderr, "[futex] WAIT fallback addr=0x%lx exp=0x%x actual=0x%x count=%d pc=0x%lx\n",
                     (long)uaddr, (unsigned)expected, (unsigned)actual,
                     g_sched.count, (long)m.cpu.pc());
         }
-        if (g_sched.count <= 1) {
-            // No other threads can wake us — tell the caller the value changed
-            m.set_result(-11);  // -EAGAIN
-            return;
-        }
-        // Still have other threads but none are runnable (blocked) — write 0 and return
         m.memory.template write<int32_t>(uaddr, 0);
-        m.set_result(0);
+        m.set_result(-11);  // -EAGAIN: value changed, re-check
 
     } else if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
         int max_wake = m.template sysarg<int>(2);
@@ -3634,8 +3701,19 @@ static void sys_umask(Machine& m) {
     m.set_result(old);
 }
 
+static void sys_setpgid(Machine& m) {
+    // setpgid(pid, pgid) — shells call this to manage job control.
+    // Single-process emulation: accept silently.
+    m.set_result(0);
+}
+
 static void sys_getpgid(Machine& m) {
     // Return same as getpid — single process group
+    m.set_result(1);
+}
+
+static void sys_setsid(Machine& m) {
+    // setsid() — create new session. Return "new session id" = our pid.
     m.set_result(1);
 }
 
@@ -4084,6 +4162,39 @@ static void sys_riscv_hwprobe(Machine& m) {
     m.set_result(-38);  // -ENOSYS — musl handles the fallback gracefully
 }
 
+// Syscall 500: Host fetch hypercall
+// Guest calls ecall with a7=500, a0=req_ptr, a1=req_len, a2=resp_buf, a3=resp_cap
+// First invocation: store request, stop machine (Worker performs fetch)
+// Re-entry after resume: copy response to guest buffer, return bytes_written in a0
+static void sys_host_fetch(Machine& m) {
+    if (g_host_fetch_response_ready) {
+        // Re-entry after Worker completed the fetch
+        auto resp_buf = m.sysarg(2);
+        auto resp_cap = m.sysarg(3);
+        size_t to_copy = std::min((size_t)resp_cap, g_host_fetch_response.size());
+        if (to_copy > 0) {
+            m.memory.memcpy(resp_buf,
+                reinterpret_cast<const uint8_t*>(g_host_fetch_response.data()),
+                to_copy);
+        }
+        m.set_result(to_copy);
+        g_host_fetch_response_ready = false;
+        g_host_fetch_response.clear();
+        g_host_fetch_request.clear();
+        return;
+    }
+    // First call: store request, stop machine for Worker to handle
+    auto req_addr = m.sysarg(0);
+    auto req_len = m.sysarg(1);
+    std::vector<uint8_t> buf(req_len);
+    m.memory.memcpy_out(buf.data(), req_addr, req_len);
+    g_host_fetch_request.assign(reinterpret_cast<const char*>(buf.data()), req_len);
+    g_host_fetch_response.clear();
+    g_waiting_for_host_fetch = true;
+    m.cpu.increment_pc(-4);  // Rewind to ecall for re-entry
+    m.stop();
+}
+
 // Install all syscall handlers
 inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     // Create and store context
@@ -4184,7 +4295,9 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
 
     // Round 2: discovered from strace of curl/git/python/vim/bash/ssh
     machine.install_syscall_handler(nr::umask, sys_umask);
+    machine.install_syscall_handler(nr::setpgid, sys_setpgid);
     machine.install_syscall_handler(nr::getpgid, sys_getpgid);
+    machine.install_syscall_handler(nr::setsid, sys_setsid);
     machine.install_syscall_handler(nr::getresuid, sys_getresuid);
     machine.install_syscall_handler(nr::getresgid, sys_getresgid);
     machine.install_syscall_handler(nr::sigaltstack, sys_sigaltstack);
@@ -4214,6 +4327,9 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     // getsockname (204) is handled by network.hpp — installed via install_network_syscalls
     machine.install_syscall_handler(nr::getsockopt, sys_getsockopt);
     machine.install_syscall_handler(nr::riscv_hwprobe, sys_riscv_hwprobe);
+
+    // Custom hypercalls (500+)
+    machine.install_syscall_handler(500, sys_host_fetch);
 }
 
 }  // namespace syscalls

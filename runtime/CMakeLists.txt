@@ -10,6 +10,10 @@ if(NOT EMSCRIPTEN)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -flto -march=native -DNDEBUG")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto -O3")
 else()
+    # Global Emscripten flags: -O2 needed for ALL TUs (including libriscv) so
+    # musttail emits return_call; -mtail-call enables the Wasm tail call proposal
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -mtail-call")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -mtail-call")
     if(FRISCY_WIZER)
         # Wizer builds: NO shared memory, NO bulk-memory (data.drop unsupported by wasmtime)
         # Wizer snapshots run single-threaded, no Worker/SharedArrayBuffer needed
@@ -32,7 +36,7 @@ endif()
 #
 # Key configuration decisions (see PERFORMANCE_ROADMAP.md):
 #   - NO MEMORY64: Guest 64-bit addrs are uint64_t in 32-bit host space
-#   - NO TAIL CALLS: Wasm return_call != libriscv's musttail dispatch
+#   - TAIL CALL DISPATCH: musttail → Wasm return_call (faster than br_table)
 #   - NO BINARY TRANSLATION: No dlopen in Wasm
 #   - YES EXCEPTIONS: libriscv uses throw/catch
 #   - THREADED DISPATCH: Fastest interpreter mode
@@ -55,17 +59,18 @@ set(RISCV_EXT_ZMMUL  OFF CACHE BOOL "")
 set(RISCV_EXT_ZCMP   OFF CACHE BOOL "")
 
 # --- Dispatch mode ---
-# Threaded dispatch (computed goto) works in Emscripten and is fastest.
-# Provides ~30-40% speedup over switch-based dispatch.
-set(RISCV_THREADED ON  CACHE BOOL "Computed-goto threaded dispatch")
-set(RISCV_TAILCALL_DISPATCH OFF CACHE BOOL "musttail doesn't work in Wasm")
+# Tail call dispatch: musttail → Wasm return_call. Each instruction handler
+# tail-calls the next, eliminating br_table overhead and enabling Wasm engine
+# optimizations. Mutually exclusive with threaded dispatch.
+set(RISCV_THREADED OFF CACHE BOOL "Computed-goto threaded dispatch (OFF for tail call)")
+set(RISCV_TAILCALL_DISPATCH ON  CACHE BOOL "musttail → Wasm return_call dispatch")
 
 # --- Memory configuration ---
 # Encompassing arena: pre-allocate full guest address space
 # 28-bit = 256MB, 29-bit = 512MB, 30-bit = 1GB, 31-bit = 2GB
 # 31-bit required for Node.js/V8 (pointer cage + code spaces need ~1.15GB)
 set(RISCV_ENCOMPASSING_ARENA ON  CACHE BOOL "Pre-allocate guest address space")
-set(RISCV_ENCOMPASSING_ARENA_BITS 30 CACHE STRING "1GB guest address space (leaves ~2.5GB for host C++ heap)")
+set(RISCV_ENCOMPASSING_ARENA_BITS 31 CACHE STRING "2GB guest address space (required for Node.js/V8)")
 set(RISCV_FLAT_RW_ARENA ON  CACHE BOOL "Fast read-write arena")
 set(RISCV_MEMORY_TRAPS OFF CACHE BOOL "Disable page traps (overhead)")
 
@@ -82,6 +87,10 @@ set(RISCV_EXPERIMENTAL ON  CACHE BOOL "Enable experimental features")
 # Node.js dynamically links 16+ shared libraries, and V8's JIT compiler
 # generates many code regions. Each needs its own execute segment.
 add_definitions(-DRISCV_MAX_EXECUTE_SEGS=1024)
+
+# --- VH hypercall syscall range ---
+# VectorHeart harness uses ecalls 600-803. Default RISCV_SYSCALLS_MAX is 512.
+add_definitions(-DRISCV_SYSCALLS_MAX=1024)
 
 # --- Add libriscv ---
 # libriscv is in ../vendor/libriscv (cloned by setup scripts)
@@ -119,6 +128,7 @@ if(FRISCY_PRODUCTION)
             -msimd128              # WASM SIMD
             -mbulk-memory          # Fast memcpy/memset
             -mnontrapping-fptoint  # Faster FP conversions
+            -mtail-call            # Wasm tail call proposal
         )
     else()
         target_compile_options(friscy PRIVATE
@@ -136,6 +146,7 @@ else()
             -O2
             -fwasm-exceptions
             -sWASM_LEGACY_EXCEPTIONS=0
+            -mtail-call            # Wasm tail call proposal
         )
         if(NOT FRISCY_WIZER)
             target_compile_options(friscy PRIVATE
@@ -161,6 +172,7 @@ if(EMSCRIPTEN)
         -fwasm-exceptions
         -sWASM_LEGACY_EXCEPTIONS=0
         -sSUPPORT_LONGJMP=0
+        -mtail-call
         -sALLOW_TABLE_GROWTH
         -sINITIAL_MEMORY=2147483648     # 2GB initial (1GB arena + 1GB host heap)
         -sALLOW_MEMORY_GROWTH
@@ -174,7 +186,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
@@ -212,6 +224,20 @@ if(EMSCRIPTEN)
         )
     endif()
 
+    # VectorHeart hypercall harness: JS library + JSPI for async suspension
+    # Only js_opfs_io, js_net_proxy, js_dns_resolve are async (on JSPI_IMPORTS).
+    # js_compute_offload and js_gettime_ms are synchronous — no JSPI overhead.
+    list(APPEND FRISCY_LINK_FLAGS
+        --js-library ${CMAKE_CURRENT_SOURCE_DIR}/library_vectorheart.js
+        -sJSPI=1                        # WebAssembly JS Promise Integration
+        -sJSPI_IMPORTS=['js_opfs_io','js_net_proxy','js_dns_resolve']
+        -sJSPI_EXPORTS=['main','friscy_resume']  # Exports that may call JSPI imports
+        -sWASM_BIGINT=1                 # Native i64 ↔ BigInt (for js_gettime_ms)
+        # Note: PROXY_TO_PTHREAD not needed — our Worker architecture (worker.js)
+        # already runs the emulator off the main thread. JSPI suspend points only
+        # fire from the Worker, never from the browser main thread.
+    )
+
     target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})
 
     # Output file
@@ -230,3 +256,4 @@ message(STATUS "  Production build: ${FRISCY_PRODUCTION}")
 message(STATUS "  Wizer snapshots: ${FRISCY_WIZER}")
 message(STATUS "  Arena size: ${RISCV_ENCOMPASSING_ARENA_BITS} bits (${RISCV_ENCOMPASSING_ARENA_BITS})")
 message(STATUS "  Threaded dispatch: ${RISCV_THREADED}")
+message(STATUS "  Tail call dispatch: ${RISCV_TAILCALL_DISPATCH}")

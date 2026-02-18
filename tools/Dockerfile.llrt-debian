@@ -1,0 +1,19 @@
+# Dockerfile.llrt-debian - Build minimal riscv64 Ubuntu rootfs with LLRT
+# Uses glibc (matches riscv64-linux-gnu-gcc linked binary)
+#
+# Usage:
+#   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.llrt-debian -t friscy-llrt . --load
+#   CID=$(docker create friscy-llrt) && docker export $CID > demos/medium/llrt-rootfs.tar && docker rm $CID
+
+FROM --platform=linux/riscv64 ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built LLRT binary
+COPY tmp-llrt-riscv64 /usr/local/bin/llrt
+RUN chmod +x /usr/local/bin/llrt
+
+# Copy LLRT-compatible REPL script
+COPY runtime/claude-repl-llrt.js /usr/local/bin/claude-repl-llrt.js
+
+CMD ["/bin/sh"]

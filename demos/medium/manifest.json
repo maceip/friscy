@@ -21,6 +21,13 @@
       "image": "friscy-claude",
       "env": ["ANTHROPIC_API_KEY=PLACEHOLDER"],
       "dns": ["108.61.10.10"]
+    },
+    "claude-llrt": {
+      "rootfs": "./llrt-rootfs.tar",
+      "entrypoint": ["/usr/local/bin/llrt", "/usr/local/bin/claude-repl-llrt.js"],
+      "image": "friscy-llrt",
+      "env": ["ANTHROPIC_API_KEY=PLACEHOLDER"],
+      "dns": ["108.61.10.10"]
     }
   }
 }

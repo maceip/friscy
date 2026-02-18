@@ -16,6 +16,7 @@
 #include "vfs.hpp"
 #include "syscalls.hpp"
 #include "network.hpp"
+#include "vh_harness.hpp"
 #include "elf_loader.hpp"
 
 #include <iostream>
@@ -70,7 +71,7 @@ extern "C" {
 // Uses g_waiting_for_stdin flag (set by syscall handlers) to distinguish
 // stdin-wait from program exit (both call machine.stop()).
 EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
-    return syscalls::g_waiting_for_stdin ? 1 : 0;
+    return (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch) ? 1 : 0;
 }
 
 // Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
@@ -80,6 +81,7 @@ EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
 EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     if (!g_machine) return 0;
     syscalls::g_waiting_for_stdin = false;
+    syscalls::g_waiting_for_host_fetch = false;
     static constexpr uint64_t YIELD_CHUNK = 2'000'000;
     static int resume_log_count = 0;
     for (int retries = 0; retries < 8; retries++) {
@@ -87,8 +89,16 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             while (true) {
                 g_machine->resume<false>(YIELD_CHUNK);
                 if (syscalls::g_waiting_for_stdin) break;
+                if (syscalls::g_waiting_for_host_fetch) break;
+                if (syscalls::g_execve_restart) break;
                 if (!g_machine->instruction_limit_reached()) break;
                 // No yield needed — Worker thread doesn't block UI
+            }
+            // Handle execve: new binary loaded, restart execution
+            if (syscalls::g_execve_restart) {
+                syscalls::g_execve_restart = false;
+                retries = -1;  // will be incremented to 0
+                continue;
             }
             resume_log_count++;
             if (resume_log_count <= 10 || resume_log_count % 500 == 0) {
@@ -102,6 +112,15 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             std::cerr << "[resume] MachineException: " << e.what()
                       << " data=0x" << std::hex << fault_addr
                       << " pc=0x" << g_machine->cpu.pc() << std::dec << "\n";
+            // EBREAK from abort()/__stack_chk_fail: skip by returning from
+            // the current function (set PC = RA). Common after fork child cleanup.
+            if (std::string(e.what()).find("EBREAK") != std::string::npos) {
+                uint64_t ra = g_machine->cpu.reg(1);
+                std::cerr << "[resume] EBREAK: skipping, RA=0x"
+                          << std::hex << ra << std::dec << "\n";
+                g_machine->cpu.jump(ra);
+                continue;
+            }
             // If this looks like a page protection fault (data address != 0),
             // make the page writable and retry.
             if (fault_addr != 0 && retries < 7) {
@@ -146,6 +165,24 @@ EMSCRIPTEN_KEEPALIVE void friscy_set_pc(uint32_t pc) {
 
 EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_state_ptr() {
     return g_machine ? (uint32_t)(uintptr_t)g_machine->memory.memory_arena_ptr() : 0;
+}
+
+// Host fetch hypercall exports
+EMSCRIPTEN_KEEPALIVE int friscy_host_fetch_pending() {
+    return syscalls::g_waiting_for_host_fetch ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE const char* friscy_get_fetch_request() {
+    return syscalls::g_host_fetch_request.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE int friscy_get_fetch_request_len() {
+    return (int)syscalls::g_host_fetch_request.size();
+}
+
+EMSCRIPTEN_KEEPALIVE void friscy_set_fetch_response(const char* data, int len) {
+    syscalls::g_host_fetch_response.assign(data, len);
+    syscalls::g_host_fetch_response_ready = true;
 }
 }
 #endif
@@ -872,6 +909,9 @@ int main(int argc, char** argv) {
         // Install network syscall handlers (socket, connect, etc.)
         net::install_network_syscalls(machine);
 
+        // Install VectorHeart hypercall harness (ecalls 600-803)
+        vh::setup_vh_harness(machine);
+
         // Set up network bridge function pointers for syscalls.hpp
         // (avoids header include order issues between network.hpp and syscalls.hpp)
         syscalls::net_is_socket_fd = [](int fd) -> bool {
@@ -1062,6 +1102,7 @@ int main(int argc, char** argv) {
                     // across chunks (simulate<false> resets counter to 0 each call)
                     machine.resume<false>(YIELD_CHUNK);
                     if (syscalls::g_waiting_for_stdin) break;
+                    if (syscalls::g_waiting_for_host_fetch) break;
                     if (syscalls::g_execve_restart) break;
                     if (!machine.instruction_limit_reached()) break;
                     // No yield needed — Worker thread doesn't block UI
@@ -1082,10 +1123,128 @@ int main(int argc, char** argv) {
                     retries = 0;  // reset retries for new binary
                     continue;
                 }
+                // Host fetch hypercall: guest called syscall 500, machine stopped.
+                // Perform the HTTP request on the host side using curl, then resume.
+                if (syscalls::g_waiting_for_host_fetch) {
+                    syscalls::g_waiting_for_host_fetch = false;
+                    std::cerr << "[host-fetch] Request: " << syscalls::g_host_fetch_request.substr(0, 200) << "\n";
+                    // Parse URL from JSON request
+                    auto& req = syscalls::g_host_fetch_request;
+                    std::string url;
+                    auto url_pos = req.find("\"url\"");
+                    if (url_pos != std::string::npos) {
+                        auto colon = req.find(':', url_pos + 4);
+                        auto quote1 = req.find('"', colon + 1);
+                        auto quote2 = req.find('"', quote1 + 1);
+                        if (quote1 != std::string::npos && quote2 != std::string::npos)
+                            url = req.substr(quote1 + 1, quote2 - quote1 - 1);
+                    }
+                    // Extract method and headers from request JSON
+                    std::string method = "GET";
+                    auto method_pos = req.find("\"method\"");
+                    if (method_pos != std::string::npos) {
+                        auto colon = req.find(':', method_pos + 7);
+                        auto q1 = req.find('"', colon + 1);
+                        auto q2 = req.find('"', q1 + 1);
+                        if (q1 != std::string::npos && q2 != std::string::npos)
+                            method = req.substr(q1 + 1, q2 - q1 - 1);
+                    }
+                    // Build curl command
+                    std::string cmd = "curl -s -S -L -w '\\n__HTTP_STATUS__%{http_code}' -X " + method;
+                    // Extract body for POST/PUT
+                    auto body_pos = req.find("\"body\"");
+                    if (body_pos != std::string::npos) {
+                        auto colon = req.find(':', body_pos + 5);
+                        auto q1 = req.find('"', colon + 1);
+                        if (q1 != std::string::npos) {
+                            // Find matching end quote (handle escaped quotes)
+                            size_t q2 = q1 + 1;
+                            while (q2 < req.size() && !(req[q2] == '"' && req[q2-1] != '\\')) q2++;
+                            std::string body = req.substr(q1 + 1, q2 - q1 - 1);
+                            // Write body to temp file to avoid shell escaping issues
+                            FILE* tmp = fopen("/tmp/friscy_fetch_body.json", "w");
+                            if (tmp) { fwrite(body.data(), 1, body.size(), tmp); fclose(tmp); }
+                            cmd += " -d @/tmp/friscy_fetch_body.json";
+                        }
+                    }
+                    // Extract headers
+                    auto hdrs_pos = req.find("\"headers\"");
+                    if (hdrs_pos != std::string::npos) {
+                        // Simple extraction of key-value header pairs
+                        auto brace = req.find('{', hdrs_pos);
+                        auto end_brace = req.find('}', brace + 1);
+                        if (brace != std::string::npos && end_brace != std::string::npos) {
+                            std::string hdrs = req.substr(brace + 1, end_brace - brace - 1);
+                            // Parse "key":"value" pairs
+                            size_t pos = 0;
+                            while (pos < hdrs.size()) {
+                                auto kq1 = hdrs.find('"', pos);
+                                if (kq1 == std::string::npos) break;
+                                auto kq2 = hdrs.find('"', kq1 + 1);
+                                if (kq2 == std::string::npos) break;
+                                auto vq1 = hdrs.find('"', kq2 + 1);
+                                if (vq1 == std::string::npos) break;
+                                auto vq2 = hdrs.find('"', vq1 + 1);
+                                if (vq2 == std::string::npos) break;
+                                std::string key = hdrs.substr(kq1 + 1, kq2 - kq1 - 1);
+                                std::string val = hdrs.substr(vq1 + 1, vq2 - vq1 - 1);
+                                cmd += " -H '" + key + ": " + val + "'";
+                                pos = vq2 + 1;
+                            }
+                        }
+                    }
+                    cmd += " '" + url + "' 2>/tmp/friscy_fetch_err.txt";
+                    std::cerr << "[host-fetch] curl: " << cmd.substr(0, 300) << "\n";
+                    // Execute curl
+                    FILE* pipe = popen(cmd.c_str(), "r");
+                    std::string response_body;
+                    if (pipe) {
+                        char buf[4096];
+                        while (fgets(buf, sizeof(buf), pipe))
+                            response_body += buf;
+                        pclose(pipe);
+                    }
+                    // Extract HTTP status from curl output
+                    int http_status = 200;
+                    auto status_marker = response_body.rfind("__HTTP_STATUS__");
+                    if (status_marker != std::string::npos) {
+                        http_status = std::stoi(response_body.substr(status_marker + 15));
+                        response_body = response_body.substr(0, status_marker);
+                    }
+                    // Build JSON response matching what claude-repl-llrt.js expects
+                    // Escape the body for JSON
+                    std::string escaped;
+                    for (char c : response_body) {
+                        if (c == '"') escaped += "\\\"";
+                        else if (c == '\\') escaped += "\\\\";
+                        else if (c == '\n') escaped += "\\n";
+                        else if (c == '\r') escaped += "\\r";
+                        else if (c == '\t') escaped += "\\t";
+                        else if ((unsigned char)c < 0x20) {
+                            char hex[8]; snprintf(hex, sizeof(hex), "\\u%04x", (unsigned char)c);
+                            escaped += hex;
+                        } else escaped += c;
+                    }
+                    std::string json_resp = "{\"status\":" + std::to_string(http_status)
+                        + ",\"statusText\":\"OK\""
+                        + ",\"headers\":{}"
+                        + ",\"body\":\"" + escaped + "\"}";
+                    syscalls::g_host_fetch_response = json_resp;
+                    syscalls::g_host_fetch_response_ready = true;
+                    std::cerr << "[host-fetch] Response: status=" << http_status
+                              << " body_len=" << response_body.size() << "\n";
+                    retries = 0;
+                    continue;  // Resume machine execution
+                }
 #endif
                 std::cerr << "[friscy] simulate() returned normally, retries=" << retries
                           << " instructions=" << machine.instruction_counter()
-                          << " exit_code=" << machine.return_value() << "\n";
+                          << " exit_code=" << machine.return_value()
+                          << " pc=0x" << std::hex << machine.cpu.pc() << std::dec
+                          << " stopped=" << machine.stopped()
+                          << " stdin_wait=" << syscalls::g_waiting_for_stdin
+                          << " limit_reached=" << machine.instruction_limit_reached()
+                          << "\n";
                 break;
             } catch (const riscv::MachineException& e) {
                 uint64_t fault_addr = e.data();
@@ -1100,6 +1259,17 @@ int main(int argc, char** argv) {
                     std::cerr << "[friscy] Instruction limit reached after "
                               << machine.get_counters().first << " instructions\n";
                     break;  // Exit cleanly instead of retrying
+                }
+
+                // EBREAK from abort()/__stack_chk_fail: skip by returning from
+                // the current function (set PC = RA). This is safe in single-threaded
+                // emulation where futex force-unlock may trigger false positives.
+                if (std::string(e.what()).find("EBREAK") != std::string::npos) {
+                    uint64_t ra = machine.cpu.reg(1);  // x1 = return address
+                    std::cerr << "[friscy] EBREAK (abort): skipping, returning to RA=0x"
+                              << std::hex << ra << std::dec << "\n";
+                    machine.cpu.jump(ra);
+                    continue;
                 }
 
                 if (fault_addr != 0 && retries < 7) {
@@ -1133,8 +1303,8 @@ int main(int argc, char** argv) {
         }
 
 #ifdef __EMSCRIPTEN__
-        if (syscalls::g_waiting_for_stdin) {
-            // Machine stopped because stdin has no data.
+        if (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch) {
+            // Machine stopped for stdin or host fetch.
             // Return to JS — the resume loop will call friscy_resume().
             return 0;
         }

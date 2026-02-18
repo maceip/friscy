@@ -5,7 +5,7 @@ import puppeteer from 'puppeteer';
 const EXAMPLE = process.argv[2] || 'claude-plain';
 const PORT = process.argv[3] || '9090';
 const URL = `http://localhost:${PORT}?example=${EXAMPLE}`;
-const TIMEOUT = 600_000; // 10 minutes
+const TIMEOUT = Infinity; // No timeout — run until exit or error
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 

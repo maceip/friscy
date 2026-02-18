@@ -1,0 +1,8 @@
+{
+  "name": "friscy-sync-server",
+  "version": "1.0.0",
+  "description": "WebSocket relay for cross-device VFS sync",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "ws": "^8.18.0" }
+}

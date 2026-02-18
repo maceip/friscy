@@ -254,7 +254,7 @@ function maybePostJitStats(force = false) {
  * Between each resume, block on Atomics.wait() for the main thread to provide stdin.
  * Integrates JIT: checks for compiled functions before falling back to interpreter.
  */
-function runResumeLoop() {
+async function runResumeLoop() {
     console.log('[worker] entering resume loop');
     let resumeCount = 0;
     const friscy_stopped = emModule._friscy_stopped;
@@ -262,6 +262,10 @@ function runResumeLoop() {
     const friscy_get_pc = emModule._friscy_get_pc;
     const friscy_set_pc = emModule._friscy_set_pc;
     const friscy_get_state_ptr = emModule._friscy_get_state_ptr;
+    const friscy_host_fetch_pending = emModule._friscy_host_fetch_pending;
+    const friscy_get_fetch_request = emModule._friscy_get_fetch_request;
+    const friscy_get_fetch_request_len = emModule._friscy_get_fetch_request_len;
+    const friscy_set_fetch_response = emModule._friscy_set_fetch_response;
 
     while (friscy_stopped()) {
         // Check if stdin data is available (non-blocking first).
@@ -283,8 +287,9 @@ function runResumeLoop() {
             Atomics.store(controlView, 2, 4096);
             Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
             Atomics.notify(controlView, 0);
-            // Wait briefly for main thread to provide stdin
-            Atomics.wait(controlView, 0, CMD_STDIN_REQUEST, 1);
+            // Wait for main thread to provide stdin.
+            // 100ms is a good balance: responsive typing, low CPU when idle.
+            Atomics.wait(controlView, 0, CMD_STDIN_REQUEST, 100);
             const newCmd = Atomics.load(controlView, 0);
             if (newCmd === CMD_STDIN_READY) {
                 const len = Atomics.load(controlView, 2);
@@ -300,6 +305,60 @@ function runResumeLoop() {
             }
         }
         maybePostJitStats();
+
+        // Host fetch hypercall: machine stopped to let Worker perform fetch()
+        if (friscy_host_fetch_pending && friscy_host_fetch_pending()) {
+            try {
+                // Read request JSON from Wasm memory
+                const reqPtr = friscy_get_fetch_request();
+                const reqLen = friscy_get_fetch_request_len();
+                const reqBytes = new Uint8Array(emModule.HEAPU8.buffer, reqPtr, reqLen);
+                const reqJSON = new TextDecoder().decode(reqBytes.slice());
+                const req = JSON.parse(reqJSON);
+
+                console.log(`[worker] host-fetch: ${req.options?.method || 'GET'} ${req.url}`);
+
+                // Perform the actual fetch
+                const fetchOpts = {};
+                if (req.options) {
+                    if (req.options.method) fetchOpts.method = req.options.method;
+                    if (req.options.headers) fetchOpts.headers = req.options.headers;
+                    if (req.options.body) fetchOpts.body = req.options.body;
+                }
+                const resp = await fetch(req.url, fetchOpts);
+                const body = await resp.text();
+
+                // Serialize response
+                const respHeaders = {};
+                resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+                const respJSON = JSON.stringify({
+                    status: resp.status,
+                    statusText: resp.statusText,
+                    headers: respHeaders,
+                    body: body,
+                });
+
+                // Write response back to Wasm
+                const respBytes = encoder.encode(respJSON);
+                const ptr = emModule._malloc(respBytes.length);
+                emModule.HEAPU8.set(respBytes, ptr);
+                friscy_set_fetch_response(ptr, respBytes.length);
+                emModule._free(ptr);
+            } catch (e) {
+                console.error('[worker] host-fetch error:', e.message);
+                const errResp = JSON.stringify({
+                    status: 0,
+                    statusText: e.message,
+                    headers: {},
+                    body: '',
+                });
+                const errBytes = encoder.encode(errResp);
+                const ptr = emModule._malloc(errBytes.length);
+                emModule.HEAPU8.set(errBytes, ptr);
+                friscy_set_fetch_response(ptr, errBytes.length);
+                emModule._free(ptr);
+            }
+        }
 
         // Try JIT execution before falling back to interpreter.
         // The JIT run() function chains blocks inside Wasm and returns only on:
@@ -352,7 +411,7 @@ function runResumeLoop() {
         if (resumeCount <= 5 || resumeCount % 100 === 0) {
             console.log(`[worker] resume #${resumeCount}`);
         }
-        const stillStopped = friscy_resume();
+        const stillStopped = await friscy_resume();
         maybePostJitStats();
         if (!stillStopped) {
             // Machine finished (guest called exit)
@@ -611,13 +670,13 @@ self.onmessage = async function(e) {
                 emModule.FS.writeFile('/rootfs.tar', new Uint8Array(msg.rootfsData));
             }
 
-            // Run with arguments
-            emModule.callMain(args);
+            // Run with arguments (JSPI makes callMain return a Promise)
+            await emModule.callMain(args);
             console.log('[worker] callMain returned, checking stopped:', emModule._friscy_stopped ? emModule._friscy_stopped() : 'no fn');
 
-            // Enter resume loop if machine stopped for stdin
+            // Enter resume loop if machine stopped for stdin or host fetch
             if (emModule._friscy_stopped && emModule._friscy_stopped()) {
-                runResumeLoop();
+                await runResumeLoop();
             }
 
             // Machine finished — signal exit

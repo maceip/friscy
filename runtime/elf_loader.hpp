@@ -532,11 +532,13 @@ inline uint64_t setup_dynamic_stack(
     machine.memory.memcpy(sp, platform, strlen(platform) + 1);
 
     // Random bytes (16 bytes for AT_RANDOM)
+    // All zeros: disables glibc's stack canary protection (canary = 0).
+    // Required because futex force-unlock in single-threaded emulator can
+    // disrupt glibc's internal state during early init.
     sp -= 16;
     uint64_t random_addr = sp;
-    // In production, use actual random bytes
     for (int i = 0; i < 16; i++) {
-        machine.memory.template write<uint8_t>(sp + i, (uint8_t)(i * 17 + 42));
+        machine.memory.template write<uint8_t>(sp + i, 0);
     }
 
     // Executable name

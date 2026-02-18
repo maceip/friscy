@@ -28,6 +28,13 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // Used by JS resume loop to distinguish stdin-wait from program exit.
 inline bool g_waiting_for_stdin = false;
 
+// Host fetch hypercall (syscall 500): guest does ecall with a7=500,
+// machine stops, Worker performs fetch, writes response, resumes.
+inline bool g_waiting_for_host_fetch = false;
+inline bool g_host_fetch_response_ready = false;
+inline std::string g_host_fetch_request;
+inline std::string g_host_fetch_response;
+
 // Flag: true when machine stopped due to execve loading a new binary.
 // The dispatch loop must re-enter simulate() with the new binary.
 inline bool g_execve_restart = false;
@@ -381,7 +388,9 @@ namespace nr {
     constexpr int rt_sigreturn  = 139;
     constexpr int getresuid     = 148;
     constexpr int getresgid     = 150;
+    constexpr int setpgid       = 154;
     constexpr int getpgid       = 155;
+    constexpr int setsid        = 157;
     constexpr int getgroups     = 158;
     constexpr int umask         = 166;
     constexpr int socketpair    = 199;
@@ -1408,6 +1417,7 @@ static void sys_read(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
+        fprintf(stderr, "[sys_read] fd=0 count=%zu pc=0x%lx\n", (size_t)count, (long)m.cpu.pc());
         // Try non-blocking read from JavaScript stdin buffer
         auto view = m.memory.memview(buf_addr, count);
         int bytes_read = EM_ASM_INT({
@@ -2059,12 +2069,24 @@ static void sys_mmap(Machine& m) {
                             (long)addr_g, (long)length);
             }
             if (our_bump + aligned_len > ARENA_LIMIT) {
-                m.set_result(uint64_t(-12));  // -ENOMEM
-                static int oom_count = 0;
-                if (++oom_count <= 10)
-                    fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx\n",
-                            (long)length, (long)our_bump, (long)ARENA_LIMIT);
-                return;
+                // For huge allocations (>= 64MB), clamp to what fits in the arena.
+                // snmalloc reserves 256GB+ of virtual space but only commits
+                // small pages within it via MAP_FIXED later. Clamping gives it
+                // a smaller but usable region. This also covers PROT_NONE
+                // reservations from Go and other runtimes.
+                if (aligned_len >= (64ULL << 20) && (ARENA_LIMIT > our_bump + (4ULL << 20))) {
+                    uint64_t clamped = (ARENA_LIMIT - our_bump) & ~4095ULL;
+                    fprintf(stderr, "[mmap-clamp] len=0x%lx clamped to 0x%lx prot=%d\n",
+                            (long)length, (long)clamped, prot);
+                    aligned_len = clamped;
+                } else {
+                    m.set_result(uint64_t(-12));  // -ENOMEM
+                    static int oom_count = 0;
+                    if (++oom_count <= 10)
+                        fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx prot=%d\n",
+                                (long)length, (long)our_bump, (long)ARENA_LIMIT, prot);
+                    return;
+                }
             }
             result = our_bump;
             our_bump += aligned_len;
@@ -3400,23 +3422,19 @@ static void sys_futex(Machine& m) {
             cur.waiting = false;
         }
 
-        // Fallback: no cooperative threads (all exited).
-        // If expected == 0, the value was already changed by thread exit.
-        // Return -EAGAIN to break the caller's spin loop.
+        // Fallback: single-threaded (or all threads exited).
+        // No other thread can wake us. Force-unlock the futex word so
+        // glibc's __lll_lock_wait CAS loop can acquire the lock.
+        // Stack canary is zeroed (AT_RANDOM=0) to prevent false positives
+        // from any glibc state disruption this may cause.
         static int futex_wait_count = 0;
         if (++futex_wait_count <= 50) {
             fprintf(stderr, "[futex] WAIT fallback addr=0x%lx exp=0x%x actual=0x%x count=%d pc=0x%lx\n",
                     (long)uaddr, (unsigned)expected, (unsigned)actual,
                     g_sched.count, (long)m.cpu.pc());
         }
-        if (g_sched.count <= 1) {
-            // No other threads can wake us — tell the caller the value changed
-            m.set_result(-11);  // -EAGAIN
-            return;
-        }
-        // Still have other threads but none are runnable (blocked) — write 0 and return
         m.memory.template write<int32_t>(uaddr, 0);
-        m.set_result(0);
+        m.set_result(-11);  // -EAGAIN: value changed, re-check
 
     } else if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
         int max_wake = m.template sysarg<int>(2);
@@ -3683,8 +3701,19 @@ static void sys_umask(Machine& m) {
     m.set_result(old);
 }
 
+static void sys_setpgid(Machine& m) {
+    // setpgid(pid, pgid) — shells call this to manage job control.
+    // Single-process emulation: accept silently.
+    m.set_result(0);
+}
+
 static void sys_getpgid(Machine& m) {
     // Return same as getpid — single process group
+    m.set_result(1);
+}
+
+static void sys_setsid(Machine& m) {
+    // setsid() — create new session. Return "new session id" = our pid.
     m.set_result(1);
 }
 
@@ -4133,6 +4162,39 @@ static void sys_riscv_hwprobe(Machine& m) {
     m.set_result(-38);  // -ENOSYS — musl handles the fallback gracefully
 }
 
+// Syscall 500: Host fetch hypercall
+// Guest calls ecall with a7=500, a0=req_ptr, a1=req_len, a2=resp_buf, a3=resp_cap
+// First invocation: store request, stop machine (Worker performs fetch)
+// Re-entry after resume: copy response to guest buffer, return bytes_written in a0
+static void sys_host_fetch(Machine& m) {
+    if (g_host_fetch_response_ready) {
+        // Re-entry after Worker completed the fetch
+        auto resp_buf = m.sysarg(2);
+        auto resp_cap = m.sysarg(3);
+        size_t to_copy = std::min((size_t)resp_cap, g_host_fetch_response.size());
+        if (to_copy > 0) {
+            m.memory.memcpy(resp_buf,
+                reinterpret_cast<const uint8_t*>(g_host_fetch_response.data()),
+                to_copy);
+        }
+        m.set_result(to_copy);
+        g_host_fetch_response_ready = false;
+        g_host_fetch_response.clear();
+        g_host_fetch_request.clear();
+        return;
+    }
+    // First call: store request, stop machine for Worker to handle
+    auto req_addr = m.sysarg(0);
+    auto req_len = m.sysarg(1);
+    std::vector<uint8_t> buf(req_len);
+    m.memory.memcpy_out(buf.data(), req_addr, req_len);
+    g_host_fetch_request.assign(reinterpret_cast<const char*>(buf.data()), req_len);
+    g_host_fetch_response.clear();
+    g_waiting_for_host_fetch = true;
+    m.cpu.increment_pc(-4);  // Rewind to ecall for re-entry
+    m.stop();
+}
+
 // Install all syscall handlers
 inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     // Create and store context
@@ -4233,7 +4295,9 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
 
     // Round 2: discovered from strace of curl/git/python/vim/bash/ssh
     machine.install_syscall_handler(nr::umask, sys_umask);
+    machine.install_syscall_handler(nr::setpgid, sys_setpgid);
     machine.install_syscall_handler(nr::getpgid, sys_getpgid);
+    machine.install_syscall_handler(nr::setsid, sys_setsid);
     machine.install_syscall_handler(nr::getresuid, sys_getresuid);
     machine.install_syscall_handler(nr::getresgid, sys_getresgid);
     machine.install_syscall_handler(nr::sigaltstack, sys_sigaltstack);
@@ -4263,6 +4327,9 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     // getsockname (204) is handled by network.hpp — installed via install_network_syscalls
     machine.install_syscall_handler(nr::getsockopt, sys_getsockopt);
     machine.install_syscall_handler(nr::riscv_hwprobe, sys_riscv_hwprobe);
+
+    // Custom hypercalls (500+)
+    machine.install_syscall_handler(500, sys_host_fetch);
 }
 
 }  // namespace syscalls

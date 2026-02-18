@@ -70,7 +70,7 @@ set(RISCV_TAILCALL_DISPATCH ON  CACHE BOOL "musttail → Wasm return_call dispat
 # 28-bit = 256MB, 29-bit = 512MB, 30-bit = 1GB, 31-bit = 2GB
 # 31-bit required for Node.js/V8 (pointer cage + code spaces need ~1.15GB)
 set(RISCV_ENCOMPASSING_ARENA ON  CACHE BOOL "Pre-allocate guest address space")
-set(RISCV_ENCOMPASSING_ARENA_BITS 30 CACHE STRING "1GB guest address space (leaves ~2.5GB for host C++ heap)")
+set(RISCV_ENCOMPASSING_ARENA_BITS 31 CACHE STRING "2GB guest address space (required for Node.js/V8)")
 set(RISCV_FLAT_RW_ARENA ON  CACHE BOOL "Fast read-write arena")
 set(RISCV_MEMORY_TRAPS OFF CACHE BOOL "Disable page traps (overhead)")
 
@@ -87,6 +87,10 @@ set(RISCV_EXPERIMENTAL ON  CACHE BOOL "Enable experimental features")
 # Node.js dynamically links 16+ shared libraries, and V8's JIT compiler
 # generates many code regions. Each needs its own execute segment.
 add_definitions(-DRISCV_MAX_EXECUTE_SEGS=1024)
+
+# --- VH hypercall syscall range ---
+# VectorHeart harness uses ecalls 600-803. Default RISCV_SYSCALLS_MAX is 512.
+add_definitions(-DRISCV_SYSCALLS_MAX=1024)
 
 # --- Add libriscv ---
 # libriscv is in ../vendor/libriscv (cloned by setup scripts)
@@ -182,7 +186,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
@@ -219,6 +223,20 @@ if(EMSCRIPTEN)
             -mbulk-memory                   # memory.copy, memory.fill intrinsics
         )
     endif()
+
+    # VectorHeart hypercall harness: JS library + JSPI for async suspension
+    # Only js_opfs_io, js_net_proxy, js_dns_resolve are async (on JSPI_IMPORTS).
+    # js_compute_offload and js_gettime_ms are synchronous — no JSPI overhead.
+    list(APPEND FRISCY_LINK_FLAGS
+        --js-library ${CMAKE_CURRENT_SOURCE_DIR}/library_vectorheart.js
+        -sJSPI=1                        # WebAssembly JS Promise Integration
+        -sJSPI_IMPORTS=['js_opfs_io','js_net_proxy','js_dns_resolve']
+        -sJSPI_EXPORTS=['main','friscy_resume']  # Exports that may call JSPI imports
+        -sWASM_BIGINT=1                 # Native i64 ↔ BigInt (for js_gettime_ms)
+        # Note: PROXY_TO_PTHREAD not needed — our Worker architecture (worker.js)
+        # already runs the emulator off the main thread. JSPI suspend points only
+        # fire from the Worker, never from the browser main thread.
+    )
 
     target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})
 

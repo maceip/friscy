@@ -1,9 +1,12 @@
 # Build directories
+dist/
+friscy-bundle/dist/
 build/
 build-native/
 build-wasm/
 runtime/build/
 runtime/build-native/
+runtime/build-tailcall/
 node_modules/
 target/
 

@@ -5,6 +5,26 @@
 const fs = require('fs');
 const { spawn } = require('child_process');
 
+// Override globalThis.fetch with host fetch hypercall.
+// __host_fetch is a native Rust function exposed by patched LLRT that
+// does ecall with a7=500 (syscall 500) — the emulator stops, the Worker
+// performs the real fetch(), writes the response, and resumes the machine.
+if (typeof globalThis.__host_fetch === 'function') {
+    globalThis.fetch = async function(url, options) {
+        const reqPayload = JSON.stringify({
+            url: typeof url === 'string' ? url : url.toString(),
+            ...(options || {})
+        });
+        const rawResponse = globalThis.__host_fetch(reqPayload);
+        const data = JSON.parse(rawResponse);
+        return new Response(data.body, {
+            status: data.status,
+            statusText: data.statusText || '',
+            headers: new Headers(data.headers || {}),
+        });
+    };
+}
+
 const messages = [];
 const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
 const SYSTEM = 'You are Claude Code, an AI assistant running inside a Linux environment. '

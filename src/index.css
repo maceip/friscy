@@ -1,0 +1,157 @@
+@import "tailwindcss";
+
+@theme {
+  --color-friscy-orange: #ff8f40;
+  --color-friscy-blue: #59c2ff;
+  --color-friscy-magenta: #d2a6ff;
+
+  --font-mono: "Maple Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+}
+
+:root {
+  --bg-app: #050810;
+  --bg-panel: #0a0e14;
+  --bg-frame: #0f131a;
+  --text-main: #e6e1cf;
+  --text-muted: #64748b;
+  --border-subtle: rgba(89, 194, 255, 0.05);
+}
+
+.light {
+  --bg-app: #f1f5f9;
+  --bg-panel: #ffffff;
+  --bg-frame: #e2e8f0;
+  --text-main: #0f172a;
+  --text-muted: #64748b;
+  --border-subtle: rgba(0, 0, 0, 0.05);
+}
+
+@layer base {
+  body {
+    background-color: var(--bg-app);
+    /* Ultra-minimal scanlines - barely visible */
+    background-image: 
+        linear-gradient(rgba(18, 16, 16, 0) 90%, rgba(0, 0, 0, 0.02) 90%);
+    background-size: 100% 4px;
+    color: var(--text-main);
+    @apply font-mono min-h-screen overflow-hidden transition-colors duration-500;
+  }
+}
+
+/* Buffed Material / Metallic - Ultra subtle */
+.buffed-material {
+    background: linear-gradient(180deg, var(--bg-frame) 0%, var(--bg-panel) 100%);
+    position: relative;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+}
+.buffed-material::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    /* Subtle noise for brushed texture */
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+    opacity: 0.02;
+    pointer-events: none;
+    mix-blend-mode: overlay;
+}
+
+/* Light Mode: Brushed Aluminum */
+.light .buffed-material {
+    background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+.light .buffed-material::before {
+    opacity: 0.04;
+    mix-blend-mode: multiply;
+}
+
+/* Bottom-up Steam Rise */
+@keyframes steam-rise {
+    0% { transform: translateY(100%) scale(1); opacity: 0; }
+    20% { opacity: 0.1; }
+    100% { transform: translateY(-50px) scale(1.5); opacity: 0; }
+}
+
+.steam-container {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 100px;
+    pointer-events: none;
+    z-index: 1;
+    transition: opacity 2s ease-in;
+}
+
+.steam-wisp {
+    position: absolute;
+    bottom: -20px;
+    width: 30px;
+    height: 100px;
+    background: radial-gradient(circle at center, var(--text-main) 0%, transparent 70%);
+    filter: blur(20px);
+    animation: steam-rise 12s infinite ease-out;
+    opacity: 0;
+}
+
+/* Tiny Japanese text styling - Underground vibe */
+.jp-underground {
+    font-size: 8px;
+    opacity: 0.15;
+    letter-spacing: 1px;
+    pointer-events: none;
+    user-select: none;
+    font-family: "Yu Gothic", "Hiragino Kaku Gothic ProN", sans-serif;
+}
+
+@font-face {
+  font-family: "Maple Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/maple-mono@latest/latin-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Maple Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/maple-mono@latest/latin-700-normal.woff2")
+    format("woff2");
+}
+
+@layer base {
+  body {
+    background-color: var(--bg-app);
+    color: var(--text-main);
+    @apply font-mono min-h-screen overflow-hidden transition-colors duration-300;
+  }
+}
+
+@keyframes mic-glow {
+  0% { box-shadow: 0 0 5px rgba(239, 68, 68, 0.5), inset 0 0 5px rgba(239, 68, 68, 0.2); border-color: rgba(248, 113, 113, 0.5); }
+  50% { box-shadow: 0 0 20px rgba(239, 68, 68, 0.8), inset 0 0 10px rgba(239, 68, 68, 0.4); border-color: rgba(248, 113, 113, 1); }
+  100% { box-shadow: 0 0 5px rgba(239, 68, 68, 0.5), inset 0 0 5px rgba(239, 68, 68, 0.2); border-color: rgba(248, 113, 113, 0.5); }
+}
+
+.animate-mic-pulse {
+  animation: mic-glow 2s ease-in-out infinite;
+}
+
+.xterm .xterm-viewport {
+  overflow-y: hidden !important;
+  scrollbar-width: none !important;
+}
+
+/* Mobile Optimizations */
+@media (max-width: 768px) {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}

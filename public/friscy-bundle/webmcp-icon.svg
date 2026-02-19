@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 268 82">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Goldman:wght@700&amp;display=swap');
+    </style>
+  </defs>
+  <text x="134" y="58" text-anchor="middle" font-family="'Goldman', sans-serif" font-weight="700" font-size="52" fill="#fff" letter-spacing="2">WebMCP</text>
+</svg>

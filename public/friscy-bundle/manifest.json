@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "image": "friscy-alpine",
+  "entrypoint": ["/bin/sh"],
+  "rootfs": "./rootfs.tar",
+  "workdir": "/root",
+  "env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/root",
+    "TERM=xterm-256color",
+    "COLORTERM=truecolor",
+    "COLORFGBG=15;0",
+    "LD_PRELOAD=/usr/lib/vh_preload.so"
+  ],
+  "aot": [],
+  "examples": {
+    "nodejs": {
+      "rootfs": "./nodejs.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "-i"],
+      "image": "friscy-nodejs"
+    },
+    "server": {
+      "rootfs": "./goserver.tar",
+      "entrypoint": ["/bin/echo_server"],
+      "image": "friscy-goserver"
+    },
+    "dns-test": {
+      "rootfs": "./claude-slim.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "/usr/local/bin/dns-test.js"],
+      "image": "friscy-claude",
+      "dns": ["108.61.10.10"]
+    },
+    "claude": {
+      "rootfs": "./claude-slim-snap.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "--snapshot-blob", "/tmp/snapshot-fast.blob", "--", "Write a haiku about RISC-V emulation running in WebAssembly"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    },
+    "claude-nosnapshot": {
+      "rootfs": "./claude-slim.tar",
+      "entrypoint": ["/usr/local/bin/claude-fast.js", "Write a haiku about RISC-V emulation running in WebAssembly"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    },
+    "claude-cli": {
+      "rootfs": "./claude-slim.tar",
+      "entrypoint": ["/usr/local/bin/claude", "-p", "Write a haiku about RISC-V emulation running in WebAssembly"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    },
+    "claude-api": {
+      "rootfs": "./claude-slim.tar",
+      "entrypoint": ["/usr/bin/node", "-e", "const h=require('https');const d=JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:200,messages:[{role:'user',content:'Write a haiku about RISC-V emulation running in WebAssembly'}]});const q=h.request({hostname:'api.anthropic.com',port:443,path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':process.env.ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(d)}},s=>{let b='';s.on('data',c=>b+=c);s.on('end',()=>{try{const j=JSON.parse(b);console.log(j.content?j.content[0].text:b.substring(0,500))}catch(x){console.log(b.substring(0,200))}process.exit(0)})});q.on('error',x=>{console.log('Error:',x.message);process.exit(1)});q.write(d);q.end();setTimeout(()=>{console.log('Timeout');process.exit(1)},60000)"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    },
+    "vh-test": {
+      "rootfs": "./nodejs.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "/usr/local/bin/test_vh_shims.js"],
+      "image": "friscy-nodejs"
+    },
+    "claude-demo": {
+      "rootfs": "./claude-slim-snap.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "/usr/local/bin/claude-repl.js"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=PLACEHOLDER"],
+      "dns": ["108.61.10.10"]
+    },
+    "claude-plain": {
+      "rootfs": "./claude-slim-snap.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "/usr/local/lib/node_modules/@anthropic-ai/claude-code/claude-cjs.cjs", "-p", "Write me a haiku about RISC-V emulation"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    },
+    "claude-snap": {
+      "rootfs": "./claude-slim-snap.tar",
+      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "--snapshot-blob", "/tmp/claude-cli.blob", "--", "-p", "Write me a haiku about RISC-V emulation"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    }
+  }
+}

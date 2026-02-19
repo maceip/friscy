@@ -8,11 +8,31 @@
 
 FROM --platform=linux/riscv64 alpine:edge
 
-# Install Node.js, npm, and essential tools
-RUN apk add --no-cache nodejs npm curl bash
+# Install Node.js, npm, and essential engineering tools
+RUN apk add --no-cache \
+    nodejs \
+    npm \
+    curl \
+    bash \
+    git \
+    ripgrep \
+    python3 \
+    py3-pip \
+    ca-certificates \
+    nano \
+    gnupg
+
+# Install uv (Fast Python package manager)
+# Note: Check for riscv64 binary availability, else fallback to pip or script
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    ln -s /root/.local/bin/uv /usr/local/bin/uv || \
+    pip install uv --break-system-packages
 
 # Install Claude Code globally via npm (pure JS, no native addons)
 RUN npm install -g @anthropic-ai/claude-code
+
+# Create shared mount point
+RUN mkdir -p /mnt/host
 
 # Default shell
 CMD ["/bin/sh"]

@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Code</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            background: #1e1e2e;
+            color: #eee;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            height: 100vh;
+            height: 100dvh;
+            width: 100vw;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            -webkit-overflow-scrolling: touch;
+            touch-action: manipulation;
+        }
+        header {
+            padding: 0.75rem 1rem;
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        header h1 { font-size: 1.2rem; font-weight: 500; }
+        header h1 a { color: inherit; text-decoration: none; }
+        header h1 a:hover { text-decoration: underline; }
+        .status { font-size: 0.85rem; color: #888; margin-top: 0.15rem; }
+        .net-status {
+            font-size: 0.75rem; padding: 0.2rem 0.5rem; border-radius: 3px; margin-left: 0.5rem;
+        }
+        .net-status.connected { background: #1a4d2e; color: #a6e3a1; }
+        .net-status.disconnected { background: #4d1a1a; color: #f38ba8; }
+        .net-status.connecting { background: #4d3d1a; color: #f9e2af; }
+        .header-logo { height: 24px; width: auto; opacity: 0.8; }
+        .tab-bar {
+            display: flex; background: #16213e; padding: 0 1rem; gap: 0; flex-shrink: 0;
+            overflow-x: auto; scrollbar-width: none;
+        }
+        .tab-bar::-webkit-scrollbar { display: none; }
+        .tab {
+            padding: 0.5rem 1rem; border: none; background: transparent; color: #8b949e;
+            cursor: pointer; font-size: 0.85rem; font-family: inherit;
+            border-bottom: 2px solid transparent; white-space: nowrap;
+            display: flex; align-items: center; gap: 0.4rem; transition: color 0.15s;
+        }
+        .tab:hover { color: #e6edf3; }
+        .tab.active { color: #e6edf3; border-bottom-color: #D97757; }
+        .tab-icon { height: 16px; width: 16px; object-fit: contain; }
+        .tab-strip-border { height: 1px; background: #0f3460; flex-shrink: 0; }
+        #terminal-container {
+            flex: 1; display: flex; flex-direction: column; overflow: hidden;
+            background: #0d1117;
+        }
+        #terminal {
+            flex: 1; overflow: hidden;
+        }
+        .xterm .xterm-viewport {
+            overflow-y: hidden !important; scrollbar-width: none !important;
+        }
+        .xterm .xterm-viewport::-webkit-scrollbar { display: none !important; }
+        .xterm-screen { -webkit-user-select: none; user-select: none; }
+        @supports (padding: env(safe-area-inset-bottom)) {
+            #terminal-container {
+                padding-bottom: env(safe-area-inset-bottom);
+                padding-left: env(safe-area-inset-left);
+                padding-right: env(safe-area-inset-right);
+            }
+        }
+        @media (max-width: 600px) {
+            header { padding: 0.5rem 0.75rem; }
+            header h1 { font-size: 1rem; }
+            .tab { padding: 0.4rem 0.7rem; font-size: 0.8rem; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1><a href="https://github.com/maceip/friscy">friscy</a></h1>
+            <div class="status" id="status">fast risc-v runtime for the browser &amp; wasm<span id="net-status" class="net-status disconnected">net: off</span></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.5rem;">
+            <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
+        </div>
+    </header>
+    <div class="tab-bar">
+        <button class="tab" data-example="alpine" title="Alpine Linux shell">
+            <img src="./alpine-icon.svg" alt="" class="tab-icon">Alpine
+        </button>
+        <button class="tab" data-example="nodejs" title="Interactive Node.js REPL">
+            <img src="./nodejs-icon.svg" alt="" class="tab-icon">Node.js
+        </button>
+        <button class="tab" data-example="server" title="HTTP echo server">
+            <img src="./go-icon.svg" alt="" class="tab-icon">Go Server
+        </button>
+        <button class="tab active" data-example="claude-demo" title="Claude Code (AI assistant)">
+            <img src="./claude-sparkle.svg" alt="" class="tab-icon">Claude
+        </button>
+    </div>
+    <div class="tab-strip-border"></div>
+    <div id="terminal-container">
+        <div id="terminal"></div>
+    </div>
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('./service-worker.js').then(reg => {
+                if (!crossOriginIsolated && reg.active) {
+                    location.reload();
+                }
+            }).catch(e => console.error('SW failed:', e));
+        }
+    </script>
+
+    <script type="module">
+        import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm';
+        import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm';
+        import { WebglAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/+esm';
+        import { Unicode11Addon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-unicode11@0.6.0/+esm';
+        import { FriscyNetworkBridge } from './network_bridge.js';
+        import { NetworkRPCHost } from './network_rpc_host.js';
+
+        // ──── State ────
+        const MODES = ['\x1b[90m  \u23F5\u23F5 don\'t ask on\x1b[0m \x1b[2m(shift+tab to cycle)\x1b[0m', '\x1b[90m  \u23F5\u23F5 accept edits on\x1b[0m \x1b[2m(shift+tab to cycle)\x1b[0m', '\x1b[90m  || plan mode on\x1b[0m \x1b[2m(shift+tab to cycle)\x1b[0m'];
+        let modeIdx = 0;
+        let apiKey = '';
+        let phase = 'boot'; // boot, apikey, ready, prompt, working, streaming, slash
+        let inputBuf = '';
+        let cursorPos = 0;
+        let history = [];
+        let historyIdx = -1;
+        let workingTimer = null;
+        let workingFrame = 0;
+        let slashMenuVisible = false;
+        let slashMenuIdx = 0;
+        let rawOutputBuf = '';
+
+        // Slash commands
+        const SLASH_CMDS = [
+            { cmd: '/add-dir', desc: 'Add a new working directory' },
+            { cmd: '/agents', desc: 'Manage agent configurations' },
+            { cmd: '/chrome', desc: 'Claude in Chrome (Beta) settings' },
+            { cmd: '/clear', desc: 'Clear conversation history and free up context' },
+            { cmd: '/compact', desc: 'Clear conversation history but keep a summary in context.\u2026' },
+            { cmd: '/config', desc: 'Open config panel' },
+            { cmd: '/exit', desc: 'Exit Claude Code and return to shell' },
+            { cmd: '/help', desc: 'Show help information' },
+            { cmd: '/init', desc: 'Initialize a new CLAUDE.md file' },
+            { cmd: '/login', desc: 'Sign in with your Anthropic account' },
+            { cmd: '/model', desc: 'Change the AI model' },
+        ];
+
+        // ──── Terminal setup ────
+        // Responsive font: smaller on narrow screens (mobile, Pixel Fold inner)
+        const isMobile = window.innerWidth < 600;
+        const isNarrow = window.innerWidth < 900;
+        const baseFontSize = isMobile ? 11 : isNarrow ? 12 : 14;
+
+        window.term = new Terminal({
+            cursorBlink: true,
+            cursorStyle: 'bar',
+            fontSize: baseFontSize,
+            fontFamily: "'JetBrains Mono', 'Menlo', 'Monaco', monospace",
+            allowProposedApi: true,
+            theme: {
+                background: '#0d1117',
+                foreground: '#e6edf3',
+                cursor: '#e6edf3',
+                selectionBackground: '#264f78',
+                black: '#0d1117',
+                red: '#ff7b72',
+                green: '#7ee787',
+                yellow: '#d29922',
+                blue: '#58a6ff',
+                magenta: '#bc8cff',
+                cyan: '#39c5cf',
+                white: '#e6edf3',
+                brightBlack: '#484f58',
+                brightRed: '#ffa198',
+                brightGreen: '#56d364',
+                brightYellow: '#e3b341',
+                brightBlue: '#79c0ff',
+                brightMagenta: '#d2a8ff',
+                brightCyan: '#56d4dd',
+                brightWhite: '#f0f6fc',
+            },
+            allowTransparency: false,
+            scrollback: 5000,
+            convertEol: true,
+        });
+        const term = window.term;
+        const fitAddon = new FitAddon();
+        term.loadAddon(fitAddon);
+        try { term.loadAddon(new Unicode11Addon()); term.unicode.activeVersion = '11'; } catch(e) { console.warn('[xterm] Unicode11 addon failed:', e); }
+        term.open(document.getElementById('terminal'));
+        try { term.loadAddon(new WebglAddon()); } catch(e) { console.warn('[xterm] WebGL addon failed:', e); }
+        fitAddon.fit();
+
+        // Responsive resize: handle window resize, orientation change, and
+        // visual viewport changes (mobile keyboard show/hide)
+        function handleResize() {
+            fitAddon.fit();
+            if (worker) worker.postMessage({ type: 'resize', rows: term.rows, cols: term.cols });
+        }
+        window.addEventListener('resize', handleResize);
+        window.addEventListener('orientationchange', () => setTimeout(handleResize, 200));
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', handleResize);
+        }
+
+        // ──── Worker + SAB setup ────
+        const RING_HEADER = 8;
+        const RING_SIZE = 65528;
+        const CMD_IDLE = 0;
+        const CMD_STDIN_REQUEST = 2;
+        const CMD_STDIN_READY = 3;
+        const CMD_EXIT = 4;
+
+        let worker = null;
+        let controlSab, stdoutSab, netSab;
+        let controlView, stdoutView, stdoutBytes;
+        let machineRunning = false;
+        const stdinQueue = [];
+        let bootContext = null; // Set by boot(), used by startEmulator()
+        let cachedRootfs = null; // Kept for shell restart
+        let pendingShellRestart = false;
+        let pollInterval = null;
+
+        // Called when user provides API key — starts the actual emulator
+        function startEmulator(userApiKey) {
+            if (!bootContext) return;
+            const { example, rootfs, netRPCHost } = bootContext;
+
+            // Build args — replace PLACEHOLDER API key with real one
+            const envVars = (example.env || []).map(e =>
+                e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + userApiKey : e
+            );
+            const envArgs = envVars.flatMap(e => ['--env', e]);
+            const args = [...envArgs, '--rootfs', '/rootfs.tar', ...(example.entrypoint || ['/bin/sh'])];
+
+            launchWorkerRun(args, rootfs);
+        }
+
+        function launchWorkerRun(args, rootfs) {
+            // Cache rootfs for potential shell restart
+            cachedRootfs = rootfs.slice(0);
+
+            machineRunning = true;
+            pendingShellRestart = false;
+            console.log('[friscy] launchWorkerRun args:', JSON.stringify(args));
+            const rootfsArray = new Uint8Array(rootfs);
+            worker.postMessage({
+                type: 'run',
+                args,
+                rootfsData: rootfsArray.buffer,
+            }, [rootfsArray.buffer]);
+
+            // Start polling (clear previous interval if any)
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(() => {
+                drainStdout();
+                checkStdinRequest();
+                checkExit();
+            }, 4);
+        }
+
+        function sendStdin(text) {
+            const bytes = new TextEncoder().encode(text);
+            for (const b of bytes) stdinQueue.push(b);
+            checkStdinRequest();
+        }
+
+        function checkStdinRequest() {
+            if (!controlView) return;
+            if (Atomics.load(controlView, 0) !== CMD_STDIN_REQUEST) return;
+            if (stdinQueue.length === 0) return;
+            const maxLen = Atomics.load(controlView, 2);
+            const cb = new Uint8Array(controlSab);
+            const toSend = Math.min(stdinQueue.length, maxLen, 3968);
+            for (let i = 0; i < toSend; i++) cb[64 + i] = stdinQueue.shift();
+            Atomics.store(controlView, 2, toSend);
+            Atomics.store(controlView, 0, CMD_STDIN_READY);
+            Atomics.notify(controlView, 0);
+        }
+
+        function drainStdout() {
+            if (!stdoutView || !stdoutBytes) return;
+            const wh = Atomics.load(stdoutView, 0);
+            const rt = Atomics.load(stdoutView, 1);
+            if (wh === rt) return;
+            let avail = wh >= rt ? wh - rt : RING_SIZE - rt + wh;
+            if (avail <= 0) return;
+            const buf = new Uint8Array(avail);
+            let pos = rt;
+            for (let i = 0; i < avail; i++) {
+                buf[i] = stdoutBytes[RING_HEADER + pos];
+                pos = (pos + 1) % RING_SIZE;
+            }
+            Atomics.store(stdoutView, 1, pos);
+            const copied = new Uint8Array(buf.length);
+            copied.set(buf);
+            const text = new TextDecoder().decode(copied);
+            handleEmulatorOutput(text);
+        }
+
+        function checkExit() {
+            if (!controlView) return;
+            if (Atomics.load(controlView, 0) === CMD_EXIT) {
+                machineRunning = false;
+                Atomics.store(controlView, 0, CMD_IDLE);
+
+                if (pendingShellRestart && cachedRootfs) {
+                    // Restart emulator with /bin/sh -i for a real Alpine shell
+                    console.log('[friscy] Restarting emulator with /bin/sh -i');
+                    restartWithShell();
+                }
+            }
+        }
+
+        async function restartWithShell() {
+            // Terminate old worker, create fresh one
+            if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+            worker.terminate();
+
+            // Reset SABs
+            controlView.fill(0);
+            stdoutView.fill(0);
+
+            // Create new worker
+            worker = new Worker('./worker.js', { type: 'module' });
+            const workerReady = new Promise((resolve, reject) => {
+                const onMsg = (e) => {
+                    if (e.data.type === 'ready') { resolve(); worker.onmessage = null; }
+                    else if (e.data.type === 'error') { reject(e.data.message); }
+                };
+                worker.onmessage = onMsg;
+                worker.onerror = (e) => reject(new Error('Worker failed: ' + (e.message || 'unknown')));
+                setTimeout(() => reject('Worker timeout (30s)'), 30000);
+            });
+            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            await workerReady;
+
+            // Build args for /bin/sh -i (keep env vars from original example)
+            const example = bootContext?.example || {};
+            const envVars = (example.env || []).map(e =>
+                e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + apiKey : e
+            );
+            const envArgs = envVars.flatMap(e => ['--env', e]);
+            const args = [...envArgs, '--rootfs', '/rootfs.tar', '/bin/sh', '-i'];
+
+            // Phase is already 'shell' — raw passthrough
+            launchWorkerRun(args, cachedRootfs);
+        }
+
+        // ──── Emulator output filtering ────
+        // During boot: show filtered boot messages (looks like real Linux boot).
+        // During prompt/streaming: only show text between START/END sentinels.
+        // Debug lines ([friscy], [friscy-err], [dns], [resume]) always suppressed.
+        const SUPPRESS_RE = /\[friscy[^\]]*\]|\[dns[^\]]*\]|\[resume[^\]]*\]|\[claude-fast\]|\[repl\]|\[snapshot\]/;
+
+        function handleEmulatorOutput(text) {
+            rawOutputBuf += text;
+            processOutputBuffer();
+        }
+
+        function processOutputBuffer() {
+            while (rawOutputBuf.length > 0) {
+                if (phase === 'boot' || phase === 'apikey') {
+                    // Look for READY sentinel
+                    const readyIdx = rawOutputBuf.indexOf('\x02READY\x02');
+                    if (readyIdx === -1) {
+                        // Show boot output lines (filtered) while waiting
+                        const lines = rawOutputBuf.split('\n');
+                        // Keep last partial line in buffer
+                        rawOutputBuf = lines.pop() || '';
+                        for (const line of lines) {
+                            if (line.trim() && !SUPPRESS_RE.test(line)) {
+                                // Style boot lines as dim
+                                term.write('\x1b[2m' + line + '\x1b[0m\r\n');
+                            }
+                        }
+                        if (rawOutputBuf.length > 10000) rawOutputBuf = rawOutputBuf.slice(-1000);
+                        return;
+                    }
+                    // Discard everything up to and including READY
+                    rawOutputBuf = rawOutputBuf.slice(readyIdx + 8);
+                    onReady();
+                    continue;
+                }
+                if (phase === 'working' || phase === 'streaming') {
+                    // Look for START sentinel
+                    const startIdx = rawOutputBuf.indexOf('\x02START\x02');
+                    if (startIdx !== -1 && phase === 'working') {
+                        rawOutputBuf = rawOutputBuf.slice(startIdx + 8);
+                        onStreamStart();
+                        continue;
+                    }
+                    // Look for END sentinel
+                    const endIdx = rawOutputBuf.indexOf('\x02END\x02');
+                    if (endIdx !== -1) {
+                        // Write everything before END to terminal
+                        const content = rawOutputBuf.slice(0, endIdx);
+                        if (content && phase === 'streaming') {
+                            term.write(content);
+                        }
+                        rawOutputBuf = rawOutputBuf.slice(endIdx + 6);
+                        onStreamEnd();
+                        continue;
+                    }
+                    // No sentinel found - if streaming, write what we have
+                    // (keep last 20 chars in case sentinel is split across chunks)
+                    if (phase === 'streaming' && rawOutputBuf.length > 20) {
+                        const safe = rawOutputBuf.slice(0, -20);
+                        term.write(safe);
+                        rawOutputBuf = rawOutputBuf.slice(-20);
+                    }
+                    return;
+                }
+                if (phase === 'shell') {
+                    // Raw passthrough — write everything to terminal
+                    if (rawOutputBuf.length > 0) {
+                        // Filter out debug noise, pass everything else
+                        const lines = rawOutputBuf.split('\n');
+                        rawOutputBuf = lines.pop() || '';
+                        for (const line of lines) {
+                            if (!SUPPRESS_RE.test(line)) {
+                                term.write(line + '\r\n');
+                            }
+                        }
+                        // Flush partial lines quickly (prompts don't end with \n)
+                        if (rawOutputBuf.length > 0) {
+                            if (!SUPPRESS_RE.test(rawOutputBuf)) term.write(rawOutputBuf);
+                            rawOutputBuf = '';
+                        }
+                    }
+                    return;
+                }
+                // In prompt phase, check for SHELL sentinel (user typed /exit)
+                if (phase === 'prompt') {
+                    const shellIdx = rawOutputBuf.indexOf('\x02SHELL\x02');
+                    if (shellIdx !== -1) {
+                        rawOutputBuf = rawOutputBuf.slice(shellIdx + 8);
+                        onShellMode();
+                        continue;
+                    }
+                }
+                // In other phases, discard emulator output
+                rawOutputBuf = '';
+                return;
+            }
+        }
+
+        // ──── UI rendering helpers ────
+        function clearLine() {
+            term.write('\x1b[2K\r');
+        }
+
+        function writePrompt() {
+            term.write('\x1b[38;2;204;120;50m\u276F\x1b[0m ');
+        }
+
+        function writeFooter() {
+            // Save cursor, go to last row, clear, write mode, restore
+            term.write(`\x1b[s\x1b[${term.rows};1H\x1b[2K${MODES[modeIdx]}\x1b[u`);
+        }
+
+        function writeSeparator() {
+            const w = term.cols;
+            term.write('\x1b[90m' + '\u2500'.repeat(w) + '\x1b[0m\r\n');
+        }
+
+        function showWelcome() {
+            term.clear();
+            const w = term.cols;
+            const narrow = w < 50; // Mobile/narrow: single-column layout
+            const boxW = Math.min(w - 2, 86);
+
+            const pad = (s, len) => {
+                const vis = s.replace(/\x1b\[[0-9;]*m/g, '');
+                return s + ' '.repeat(Math.max(0, len - vis.length));
+            };
+
+            const logo = [
+                '     \x1b[38;2;204;120;50m\u2590\u259B\u2588\u2588\u2588\u259C\u258C\x1b[0m',
+                '    \x1b[38;2;204;120;50m\u259D\u259C\u2588\u2588\u2588\u2588\u2588\u259B\u2598\x1b[0m',
+                '      \x1b[38;2;204;120;50m\u2598\u2598 \u259D\u259D\x1b[0m',
+            ];
+
+            // Top border
+            term.write('\x1b[90m\u256D\u2500\u2500\u2500 \x1b[0mClaude Code \x1b[2mv2.1.44\x1b[0m\x1b[90m ' + '\u2500'.repeat(Math.max(0, boxW - 22)) + '\u256E\x1b[0m\r\n');
+
+            if (narrow) {
+                // Narrow layout: single column, no right panel
+                const innerW = boxW - 2;
+                const nRows = [
+                    '', '\x1b[1m    Welcome back!\x1b[0m', '',
+                    logo[0], logo[1], logo[2], '',
+                    '  \x1b[1mOpus 4.6\x1b[0m \x1b[2m\u00B7\x1b[0m \x1b[1mClaude Max\x1b[0m',
+                    '  \x1b[2m~/\x1b[0m',
+                ];
+                for (const row of nRows) {
+                    term.write('\x1b[90m\u2502\x1b[0m ' + pad(row, innerW) + ' \x1b[90m\u2502\x1b[0m\r\n');
+                }
+            } else {
+                // Wide layout: two-column with divider
+                const leftW = Math.floor(boxW * 0.55);
+                const rightW = boxW - leftW - 3;
+                const rows = [
+                    ['', 'Tips for getting started'],
+                    ['\x1b[1m         Welcome back!\x1b[0m', 'Run /init to create a CLAUDE.md \u2026'],
+                    ['', '\u2500'.repeat(rightW)],
+                    ['', 'Recent activity'],
+                    [logo[0], 'No recent activity'],
+                    [logo[1], ''],
+                    [logo[2], ''],
+                    ['     \x1b[1mOpus 4.6\x1b[0m \x1b[2m\u00B7\x1b[0m \x1b[1mClaude Max\x1b[0m', ''],
+                    ['   \x1b[2m~/\x1b[0m', ''],
+                ];
+                for (const [left, right] of rows) {
+                    term.write('\x1b[90m\u2502\x1b[0m ' + pad(left, leftW) + ' \x1b[90m\u2502\x1b[0m ' + pad(right, rightW) + ' \x1b[90m\u2502\x1b[0m\r\n');
+                }
+            }
+
+            // Bottom border
+            term.write('\x1b[90m\u2570' + '\u2500'.repeat(boxW) + '\u256F\x1b[0m\r\n');
+
+            term.write('\r\n');
+            writeSeparator();
+            writePrompt();
+            term.write('\x1b[2mTry "edit <filepath> to..."\x1b[0m');
+            term.write('\r\n');
+            writeSeparator();
+            writeFooter();
+
+            // Position cursor at prompt
+            // Go to the line with the prompt (3 lines up from bottom: separator + footer + separator above)
+            term.write(`\x1b[${term.rows - 3};3H`);
+        }
+
+        function showPromptLine() {
+            // Move to prompt row, clear, write prompt + input
+            clearLine();
+            writePrompt();
+            term.write(inputBuf);
+        }
+
+        function redrawInput() {
+            clearLine();
+            writePrompt();
+            term.write(inputBuf);
+            // Position cursor
+            const offset = inputBuf.length - cursorPos;
+            if (offset > 0) term.write(`\x1b[${offset}D`);
+        }
+
+        // ──── Working animation ────
+        function startWorking() {
+            phase = 'working';
+            workingFrame = 0;
+            term.write('\r\n');
+            renderWorkingFrame();
+            workingTimer = setInterval(() => {
+                workingFrame = (workingFrame + 1) % 2;
+                renderWorkingFrame();
+            }, 200);
+        }
+
+        function renderWorkingFrame() {
+            clearLine();
+            const sym = workingFrame === 0 ? '\x1b[38;2;204;120;50m\u273B\x1b[0m' : '\x1b[38;2;204;120;50m\u2722\x1b[0m';
+            term.write(sym + ' Working\u2026');
+        }
+
+        function stopWorking() {
+            if (workingTimer) {
+                clearInterval(workingTimer);
+                workingTimer = null;
+            }
+            clearLine();
+        }
+
+        function onStreamStart() {
+            stopWorking();
+            phase = 'streaming';
+            term.write('\r\n');
+        }
+
+        function onStreamEnd() {
+            phase = 'prompt';
+            inputBuf = '';
+            cursorPos = 0;
+            term.write('\r\n\r\n');
+            writeSeparator();
+            writePrompt();
+            writeFooter();
+        }
+
+        // ──── Slash menu ────
+        function showSlashMenu() {
+            slashMenuVisible = true;
+            slashMenuIdx = 0;
+            phase = 'slash';
+            renderSlashMenu();
+        }
+
+        function renderSlashMenu() {
+            // Draw menu below prompt line
+            clearLine();
+            writePrompt();
+            term.write('/');
+            term.write('\r\n');
+            writeSeparator();
+            for (let i = 0; i < SLASH_CMDS.length; i++) {
+                const { cmd, desc } = SLASH_CMDS[i];
+                const highlight = i === slashMenuIdx;
+                if (highlight) {
+                    term.write(`\x1b[7m  ${cmd.padEnd(22)}${desc}\x1b[0m\r\n`);
+                } else {
+                    term.write(`  \x1b[36m${cmd.padEnd(22)}\x1b[0m${desc}\r\n`);
+                }
+            }
+        }
+
+        function hideSlashMenu() {
+            slashMenuVisible = false;
+            phase = 'prompt';
+            // Clear the menu lines
+            term.clear();
+            showPromptAfterClear();
+        }
+
+        function showPromptAfterClear() {
+            writeSeparator();
+            writePrompt();
+            writeFooter();
+            inputBuf = '';
+            cursorPos = 0;
+        }
+
+        function executeSlashCmd(cmd) {
+            hideSlashMenu();
+            if (cmd === '/exit') {
+                term.write('\r\n');
+                sendStdin('/exit\n');
+                // Phase will transition to 'shell' when SHELL sentinel arrives
+                return;
+            }
+            if (cmd === '/clear') {
+                term.clear();
+                showPromptAfterClear();
+            } else if (cmd === '/login') {
+                term.write('\r\n\x1b[1mTo log in, visit:\x1b[0m\r\n');
+                term.write('\x1b[36mhttps://console.anthropic.com/oauth/authorize?client_id=friscy\x1b[0m\r\n\r\n');
+                term.write('\x1b[2mPress Enter to continue...\x1b[0m');
+                phase = 'login_wait';
+            } else if (cmd === '/model') {
+                term.write('\r\n\x1b[1mAvailable models:\x1b[0m\r\n');
+                term.write('  \x1b[7m claude-opus-4-6 \x1b[0m\r\n');
+                term.write('  claude-sonnet-4-5-20250929\r\n');
+                term.write('  claude-haiku-4-5-20251001\r\n');
+                term.write('\r\n\x1b[2mModel selection coming soon.\x1b[0m\r\n\r\n');
+                writeSeparator();
+                writePrompt();
+                writeFooter();
+            } else {
+                term.write(`\r\n\x1b[2m${cmd}: Not yet implemented.\x1b[0m\r\n\r\n`);
+                writeSeparator();
+                writePrompt();
+                writeFooter();
+            }
+        }
+
+        // ──── Phase: API key ────
+        let apiKeyBuf = '';
+        function showApiKeyPrompt() {
+            phase = 'apikey';
+            apiKeyBuf = '';
+            term.write('\r\n\x1b[1mEnter your Anthropic API key:\x1b[0m ');
+        }
+
+        function onReady() {
+            phase = 'prompt';
+            showWelcome();
+        }
+
+        function onShellMode() {
+            phase = 'shell';
+            pendingShellRestart = true;
+            term.write('\r\n\x1b[2mExited Claude Code. Restarting with Alpine shell...\x1b[0m\r\n');
+        }
+
+        // ──── Input handler ────
+        term.onData((data) => {
+            if (phase === 'boot') return; // Ignore input during boot
+
+            // Shell mode: raw passthrough — everything goes to stdin
+            if (phase === 'shell') {
+                sendStdin(data);
+                return;
+            }
+
+            if (phase === 'apikey') {
+                for (const ch of data) {
+                    if (ch === '\r' || ch === '\n') {
+                        apiKey = apiKeyBuf;
+                        term.write('\r\n');
+                        if (!apiKey) {
+                            term.write('\x1b[31mNo API key provided.\x1b[0m\r\n');
+                            showApiKeyPrompt();
+                            return;
+                        }
+                        term.write('\x1b[2mConnecting...\x1b[0m\r\n');
+                        startEmulator(apiKey);
+                        phase = 'boot'; // Wait for READY sentinel
+                        return;
+                    } else if (ch === '\x7f' || ch === '\b') {
+                        if (apiKeyBuf.length > 0) {
+                            apiKeyBuf = apiKeyBuf.slice(0, -1);
+                            term.write('\b \b');
+                        }
+                    } else if (ch.charCodeAt(0) >= 32) {
+                        apiKeyBuf += ch;
+                        term.write('*');
+                    }
+                }
+                return;
+            }
+
+            if (phase === 'login_wait') {
+                if (data === '\r' || data === '\n') {
+                    term.write('\r\n\x1b[32m\u2713 Logged in successfully.\x1b[0m\r\n\r\n');
+                    phase = 'prompt';
+                    writeSeparator();
+                    writePrompt();
+                    writeFooter();
+                }
+                return;
+            }
+
+            if (phase === 'slash') {
+                if (data === '\x1b[A') { // Up
+                    slashMenuIdx = Math.max(0, slashMenuIdx - 1);
+                    renderSlashMenu();
+                } else if (data === '\x1b[B') { // Down
+                    slashMenuIdx = Math.min(SLASH_CMDS.length - 1, slashMenuIdx + 1);
+                    renderSlashMenu();
+                } else if (data === '\r' || data === '\n') {
+                    executeSlashCmd(SLASH_CMDS[slashMenuIdx].cmd);
+                } else if (data === '\x1b' || data === '\x03') { // Escape or Ctrl-C
+                    hideSlashMenu();
+                }
+                return;
+            }
+
+            if (phase === 'working' || phase === 'streaming') return; // Ignore input while working
+
+            if (phase !== 'prompt') return;
+
+            // Check for shift-tab (ESC [ Z)
+            if (data === '\x1b[Z') {
+                modeIdx = (modeIdx + 1) % MODES.length;
+                writeFooter();
+                return;
+            }
+
+            for (let i = 0; i < data.length; i++) {
+                const ch = data[i];
+                const code = ch.charCodeAt(0);
+
+                if (ch === '\r' || ch === '\n') {
+                    const trimmed = inputBuf.trim();
+                    if (!trimmed) continue;
+                    if (trimmed.startsWith('/')) {
+                        // Check if it's a known slash command
+                        const match = SLASH_CMDS.find(c => c.cmd === trimmed);
+                        if (match) {
+                            executeSlashCmd(match.cmd);
+                        } else {
+                            term.write(`\r\n\x1b[31mUnknown command: ${trimmed}\x1b[0m\r\n\r\n`);
+                            writeSeparator();
+                            writePrompt();
+                            writeFooter();
+                            inputBuf = '';
+                            cursorPos = 0;
+                        }
+                    } else {
+                        // Send prompt to emulator
+                        history.push(trimmed);
+                        historyIdx = -1;
+                        sendStdin(trimmed + '\n');
+                        startWorking();
+                    }
+                    inputBuf = '';
+                    cursorPos = 0;
+                    continue;
+                }
+
+                if (code === 127 || code === 8) { // Backspace
+                    if (cursorPos > 0) {
+                        inputBuf = inputBuf.slice(0, cursorPos - 1) + inputBuf.slice(cursorPos);
+                        cursorPos--;
+                        redrawInput();
+                    }
+                    continue;
+                }
+
+                if (code === 3) { // Ctrl-C
+                    inputBuf = '';
+                    cursorPos = 0;
+                    term.write('^C\r\n');
+                    writePrompt();
+                    continue;
+                }
+
+                // Escape sequences
+                if (code === 27 && i + 2 < data.length) {
+                    const seq = data.slice(i, i + 3);
+                    if (seq === '\x1b[D') { // Left
+                        if (cursorPos > 0) { cursorPos--; term.write('\x1b[D'); }
+                        i += 2;
+                        continue;
+                    }
+                    if (seq === '\x1b[C') { // Right
+                        if (cursorPos < inputBuf.length) { cursorPos++; term.write('\x1b[C'); }
+                        i += 2;
+                        continue;
+                    }
+                    if (seq === '\x1b[A') { // Up (history)
+                        if (history.length > 0) {
+                            if (historyIdx === -1) historyIdx = history.length;
+                            historyIdx = Math.max(0, historyIdx - 1);
+                            inputBuf = history[historyIdx];
+                            cursorPos = inputBuf.length;
+                            redrawInput();
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if (seq === '\x1b[B') { // Down (history)
+                        if (historyIdx >= 0) {
+                            historyIdx = Math.min(history.length, historyIdx + 1);
+                            inputBuf = historyIdx < history.length ? history[historyIdx] : '';
+                            cursorPos = inputBuf.length;
+                            redrawInput();
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+
+                // Check if typing '/' at start of empty buffer
+                if (ch === '/' && inputBuf.length === 0) {
+                    showSlashMenu();
+                    return;
+                }
+
+                // Regular character
+                if (code >= 32) {
+                    inputBuf = inputBuf.slice(0, cursorPos) + ch + inputBuf.slice(cursorPos);
+                    cursorPos++;
+                    redrawInput();
+                }
+            }
+        });
+
+        // ──── Boot sequence ────
+        async function boot() {
+            term.writeln('\x1b[2m[friscy] Booting Alpine Linux...\x1b[0m');
+
+            // Read manifest
+            const params = new URLSearchParams(location.search);
+            const exampleName = params.get('example') || 'claude-demo';
+
+            const mResp = await fetch('./manifest.json');
+            const manifest = await mResp.json();
+            const example = manifest.examples?.[exampleName];
+            if (!example) {
+                term.writeln('\x1b[31mError: example "' + exampleName + '" not found in manifest.\x1b[0m');
+                return;
+            }
+
+            // Fetch rootfs
+            term.writeln('\x1b[2m[friscy] Downloading rootfs...\x1b[0m');
+            const rootfsResp = await fetch(example.rootfs);
+            if (!rootfsResp.ok) {
+                term.writeln('\x1b[31mError: failed to download rootfs\x1b[0m');
+                return;
+            }
+            const rootfs = await rootfsResp.arrayBuffer();
+            term.writeln('\x1b[2m[friscy] Rootfs loaded (' + (rootfs.byteLength / 1048576).toFixed(1) + ' MB)\x1b[0m');
+
+            // Allocate SABs
+            controlSab = new SharedArrayBuffer(4096);
+            stdoutSab = new SharedArrayBuffer(65536);
+            netSab = new SharedArrayBuffer(65536);
+            controlView = new Int32Array(controlSab);
+            stdoutView = new Int32Array(stdoutSab);
+            stdoutBytes = new Uint8Array(stdoutSab);
+
+            // Set terminal dimensions
+            Atomics.store(controlView, 6, term.cols);
+            Atomics.store(controlView, 7, term.rows);
+
+            // Start worker — send init immediately, then wait for ready
+            worker = new Worker('./worker.js', { type: 'module' });
+            const workerReady = new Promise((resolve, reject) => {
+                const onMsg = (e) => {
+                    if (e.data.type === 'ready') { resolve(); worker.onmessage = null; }
+                    else if (e.data.type === 'error') { reject(e.data.message); }
+                };
+                worker.onmessage = onMsg;
+                worker.onerror = (e) => reject(new Error('Worker failed: ' + (e.message || 'unknown')));
+                setTimeout(() => reject('Worker timeout (30s)'), 30000);
+            });
+            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            await workerReady;
+
+            // Network bridge (same auto-detection as index.html)
+            const DEFAULT_PROXY = 'https://78.141.219.102:4433/connect';
+            const proxyUrl = params.has('noproxy') ? null
+                : params.get('proxy')
+                  || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+                      ? `https://${location.hostname}:4433/connect` : DEFAULT_PROXY);
+            const proxyCertHash = params.get('proxycert') || null;
+            let netBridge = null, netRPCHost = null;
+            if (proxyUrl) {
+                try {
+                    updateNetStatus('connecting');
+                    netBridge = new FriscyNetworkBridge(proxyUrl, { certHash: proxyCertHash });
+                    await netBridge.connect();
+                    updateNetStatus('connected');
+                } catch(e) {
+                    console.warn('[net] Bridge failed:', e);
+                    updateNetStatus('disconnected');
+                }
+            } else {
+                updateNetStatus('disconnected');
+            }
+            if (netBridge) {
+                netRPCHost = new NetworkRPCHost(netSab, netBridge);
+                netRPCHost.start();
+            }
+
+            // Store boot context for startEmulator()
+            bootContext = { example, rootfs, netRPCHost };
+            console.log('[friscy] Boot complete. rootfs size:', rootfs.byteLength, 'detached:', rootfs.detached || false);
+
+            // Show API key prompt — emulator starts when user provides key
+            showApiKeyPrompt();
+        }
+
+        boot().catch(e => {
+            console.error('Boot failed:', e);
+            term.writeln('\x1b[31mBoot failed: ' + e + '\x1b[0m');
+        });
+
+        // Tab navigation: other tabs go to index.html with the right example
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const ex = tab.dataset.example;
+                if (ex === 'claude-demo') return; // Already here
+                const proxy = new URLSearchParams(location.search).get('proxy');
+                const url = './index.html?example=' + ex + (proxy ? '&proxy=' + encodeURIComponent(proxy) : '');
+                location.href = url;
+            });
+        });
+
+        // Expose state for testing (Puppeteer)
+        window._friscy = {
+            get phase() { return phase; },
+            get stdinQueue() { return stdinQueue; },
+            get machineRunning() { return machineRunning; },
+            get apiKey() { return apiKey; },
+            get rawOutputBuf() { return rawOutputBuf; },
+            sendStdin,
+        };
+
+        // Update net status indicator
+        function updateNetStatus(state) {
+            const el = document.getElementById('net-status');
+            if (!el) return;
+            el.className = 'net-status ' + state;
+            el.textContent = state === 'connected' ? 'net: on' : state === 'connecting' ? 'net: ...' : 'net: off';
+        }
+    </script>
+</body>
+</html>

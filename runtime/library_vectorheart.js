@@ -34,28 +34,105 @@ mergeInto(LibraryManager.library, {
   js_opfs_io__deps: ['$vhState'],
   js_opfs_io: async function(fd, ptr, len, op, off) {
     try {
-      var root = await navigator.storage.getDirectory();
-
       if (op === 600) { // Open
-        var path = UTF8ToString(ptr).replace(/\//g, '_');
-        var handle = await root.getFileHandle(path, { create: true });
+        var fullPath = UTF8ToString(ptr);
+        var handle;
+        
+        if (fullPath.startsWith('/mnt/host/') && Module.hostDirectoryHandle) {
+            // Local Host Folder Access
+            var relativePath = fullPath.substring(10); // strip /mnt/host/
+            var parts = relativePath.split('/');
+            var dir = Module.hostDirectoryHandle;
+            // Traverse to the file
+            for (var i = 0; i < parts.length - 1; i++) {
+                if (!parts[i]) continue;
+                dir = await dir.getDirectoryHandle(parts[i]);
+            }
+            handle = await dir.getFileHandle(parts[parts.length - 1], { create: (len & 0100) !== 0 }); // O_CREAT check
+        } else {
+            // Standard OPFS Access
+            var root = await navigator.storage.getDirectory();
+            var path = fullPath.replace(/\//g, '_');
+            handle = await root.getFileHandle(path, { create: true });
+        }
+
         var access = await handle.createSyncAccessHandle();
         var newFd = Math.floor(Math.random() * 1000) + 100;
-        vhState.files.set(newFd, access);
+        vhState.files.set(newFd, { access: access, offset: 0, handle: handle, isDir: fullPath.endsWith('/') });
         return newFd;
       }
 
-      var handle = vhState.files.get(fd);
-      if (!handle) return -9; // EBADF
+      var entry = vhState.files.get(fd);
+      if (!entry) return -9; // EBADF
+      var access = entry.access;
 
       var buf = new Uint8Array(HEAPU8.buffer, ptr, len);
 
-      if (op === 601) return handle.write(buf);
-      if (op === 602) return handle.read(buf);
-      if (op === 604) return handle.read(buf, { at: Number(off) });
+      if (op === 601) { // Write
+        var n = access.write(buf, { at: entry.offset });
+        entry.offset += n;
+        return n;
+      }
+      if (op === 602) { // Read
+        var n = access.read(buf, { at: entry.offset });
+        entry.offset += n;
+        return n;
+      }
+      if (op === 604) { // Pread
+        return access.read(buf, { at: Number(off) });
+      }
+      if (op === 605) { // Lseek
+        // off is the new offset
+        var size = access.getSize();
+        if (off < 0) return -22; // EINVAL
+        entry.offset = Number(off);
+        return entry.offset;
+      }
+      if (op === 606) { // Fstat
+        var size = access.getSize();
+        // Pack linux_stat64 (minimal)
+        // st_mode (offset 16): 4 bytes
+        // st_size (offset 48): 8 bytes
+        var view = new DataView(HEAPU8.buffer, ptr, len);
+        view.setUint32(16, entry.isDir ? 0040755 : 0100644, true);
+        view.setBigUint64(48, BigInt(size), true);
+        return 0;
+      }
+      if (op === 607) { // Getdents64
+        if (!entry.isDir || !entry.handle) return -20; // ENOTDIR
+        if (!entry.dirEntries) {
+            entry.dirEntries = [];
+            for await (const [name, handle] of entry.handle.entries()) {
+                entry.dirEntries.push({ name: name, isDir: handle.kind === 'directory' });
+            }
+        }
+        
+        var written = 0;
+        var view = new Uint8Array(HEAPU8.buffer, ptr, len);
+        var dv = new DataView(HEAPU8.buffer, ptr, len);
+        
+        while (entry.offset < entry.dirEntries.length) {
+            var ent = entry.dirEntries[entry.offset];
+            var nameBytes = new TextEncoder().encode(ent.name);
+            var reclen = (8 + 8 + 2 + 1 + nameBytes.length + 1 + 7) & ~7;
+            
+            if (written + reclen > len) break;
+            
+            dv.setBigUint64(written, BigInt(entry.offset + 1), true); // d_ino
+            dv.setBigUint64(written + 8, BigInt(entry.offset + 1), true); // d_off
+            dv.setUint16(written + 16, reclen, true); // d_reclen
+            view[written + 18] = ent.isDir ? 4 : 8; // d_type
+            view.set(nameBytes, written + 19);
+            view[written + 19 + nameBytes.length] = 0;
+            
+            written += reclen;
+            entry.offset++;
+        }
+        return written;
+      }
 
       if (op === 603) {
-        handle.close();
+        access.close();
         vhState.files.delete(fd);
         return 0;
       }

@@ -1,0 +1,28 @@
+# Dockerfile.codex - Build riscv64 Alpine rootfs with OpenAI Codex CLI
+#
+# Codex CLI is Rust — no riscv64 npm binary published.
+# Build from source on riscv64.
+#
+# Usage:
+#   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.codex -t friscy-codex . --load
+
+FROM --platform=linux/riscv64 alpine:edge
+
+# Install build dependencies
+RUN apk add --no-cache cargo rust git nodejs npm bash curl openssl-dev
+
+# Clone Codex source
+RUN git clone --depth 1 https://github.com/openai/codex.git /tmp/codex
+
+# Build the Rust binary
+WORKDIR /tmp/codex/codex-rs
+RUN cargo build --release 2>&1 | tail -20 && \
+    cp target/release/codex /usr/local/bin/codex && \
+    strip /usr/local/bin/codex
+
+# Clean up build artifacts
+RUN rm -rf /tmp/codex /root/.cargo/registry /root/.cargo/git && \
+    apk del cargo rust git openssl-dev
+
+WORKDIR /root
+CMD ["/bin/sh"]

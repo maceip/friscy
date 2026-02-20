@@ -55,3 +55,7 @@ friscy-bundle/*.tar
 .DS_Store
 Thumbs.db
 public/friscy-bundle/*.tar
+
+# Workspace / Nested
+AEON/
+

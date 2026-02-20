@@ -241,6 +241,82 @@ cd aot && cargo build --release
 | Shared memory | Enabled | Worker + SharedArrayBuffer |
 | Exception handling | Wasm exceptions | `-fwasm-exceptions` (not legacy) |
 
+## Alpha Checkpoint
+
+Save the entire emulator state (2GB arena, registers, threads, epoll, exec pages) at the "idle waiting for stdin" point. On restore, skip all boot overhead — the guest machine resumes instantly.
+
+### Prerequisites
+
+```bash
+# Native build
+cd runtime && mkdir -p build-native && cd build-native
+cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+
+# Rootfs — needs claude-slim-snap.tar (or any tar with Node.js + claude-repl.js)
+# Already in friscy-bundle/ if cloned with LFS:
+git lfs pull
+```
+
+### Generate a checkpoint
+
+```bash
+# Boot Node.js + REPL, save state when it first waits for stdin
+./runtime/build-native/friscy \
+  --rootfs friscy-bundle/claude-slim-snap.tar \
+  --env ANTHROPIC_API_KEY=sk-ant-dummy \
+  --export-checkpoint /tmp/claude-repl.ckpt \
+  /usr/bin/node --jitless --max-old-space-size=256 /usr/local/bin/claude-repl.js
+
+# Takes ~20 seconds (340M RISC-V instructions), produces ~82MB checkpoint
+```
+
+### Load and resume from checkpoint
+
+```bash
+# Native — pipe stdin, get output (skips all boot, resumes at stdin wait)
+echo "Hello" | ./runtime/build-native/friscy \
+  --rootfs friscy-bundle/claude-slim-snap.tar \
+  --env ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  --load-checkpoint /tmp/claude-repl.ckpt \
+  /usr/bin/node --jitless --max-old-space-size=256 /usr/local/bin/claude-repl.js
+```
+
+### Browser / Wasm
+
+The pre-generated checkpoint ships in the bundle as `friscy-bundle/claude-repl.ckpt`.
+When the `claude-demo` example is selected, `claude-demo.html` fetches the checkpoint
+in parallel with the rootfs and passes it to the Web Worker. The worker writes it to
+the Emscripten VFS and adds `--load-checkpoint /checkpoint.ckpt` to the args.
+
+```bash
+# Serve the bundle locally
+cd friscy-bundle && node serve.js
+# Open http://localhost:8080/claude-demo.html?example=claude-demo
+```
+
+### Checkpoint format (v2)
+
+| Section | Contents |
+|---------|----------|
+| Header | Magic `FRISCYCK` (8B) + version (4B) + flags (4B) |
+| CPU | PC, FCSR, x0-x31 (int regs), f0-f31 (FP regs) |
+| Memory | mmap_address, brk_base, brk_current |
+| Exec context | Base addresses, heap, stack, dynamic linker state |
+| Scheduler | Thread table (g_sched), next_pid, next_epoll_fd |
+| Epoll | All epoll instances + registered interests |
+| Eventfd | All eventfd counters |
+| Exec pages | Page numbers with execute permission (for dynamic libs) |
+| Arena | Sparse 64KB chunks — only non-zero regions stored |
+
+### Performance
+
+| Metric | Cold boot | Checkpoint resume |
+|--------|-----------|-------------------|
+| Guest instructions | 340M | 0 |
+| Time (native) | ~20s | <1s |
+| Time (Wasm, Node 23) | ~40s | ~2.2s |
+| Download (gzipped) | 55MB rootfs | 55MB rootfs + 29MB checkpoint |
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) - System design and data flow

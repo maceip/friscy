@@ -15,18 +15,27 @@ console.log('[worker] Module loading...');
 // JIT manager — loaded lazily inside init
 let jitManager = {
     jitCompiler: null,
-    init() {},
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    init(_m) {},
     loadCompiler() { return Promise.resolve(); },
-    execute() { return null; },
-    recordExecution() {},
-    recordTraceTransition() {},
-    configureTiering() {},
-    configureScheduler() {},
-    configurePredictor() {},
-    configureTrace() {},
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    execute(_p, _s) { return null; },
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    recordExecution(_p) {},
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    recordTraceTransition(_f, _t) {},
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    configureTiering(_c) {},
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    configureScheduler(_c) {},
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    configurePredictor(_c) {},
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    configureTrace(_c) {},
     getStats() { return null; },
 };
-let installInvalidationHook = () => {};
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+let installInvalidationHook = (_m) => {};
 let lastJitStatsPostMs = 0;
 const JIT_STATS_POST_INTERVAL_MS = 250;
 
@@ -43,16 +52,18 @@ const JIT_STATS_POST_INTERVAL_MS = 250;
 //   [64+] u8[3968]: payload
 
 const CMD_IDLE = 0;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const CMD_STDOUT = 1;
 const CMD_STDIN_REQUEST = 2;
 const CMD_STDIN_READY = 3;
 const CMD_EXIT = 4;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const CMD_NETWORK_RPC = 5;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const CMD_RESIZE = 6;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const CMD_NETWORK_RPC_DONE = 7;
-
-const STATUS_PENDING = 0;
-const STATUS_READY = 1;
+const CMD_EXPORT_VFS = 8;
 
 // Network RPC operation codes (stored in payload[0])
 const NET_OP_SOCKET_CREATE = 1;
@@ -65,7 +76,9 @@ const NET_OP_RECV = 7;
 const NET_OP_CLOSE = 8;
 const NET_OP_HAS_DATA = 9;
 const NET_OP_HAS_PENDING_ACCEPT = 10;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const NET_OP_SETSOCKOPT = 11;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const NET_OP_GETSOCKOPT = 12;
 const NET_OP_SHUTDOWN = 13;
 
@@ -102,7 +115,6 @@ const encoder = new TextEncoder();
 
 /**
  * Write bytes to the stdout ring buffer.
- * Non-blocking: if ring is full, drops data (should not happen with 64KB buffer).
  */
 function writeStdoutRing(data) {
     if (!stdoutView || !stdoutBytes) return;
@@ -127,62 +139,44 @@ function writeStdoutRing(data) {
         pos = (pos + 1) % RING_SIZE;
     }
 
-    // Update write head (atomic store)
     Atomics.store(stdoutView, 0, pos);
-
-    // Notify main thread that stdout data is available
     Atomics.notify(stdoutView, 0);
 }
 
 /**
  * Request stdin data from main thread.
- * Blocks until main thread provides input via CMD_STDIN_READY.
- * Returns Uint8Array of input bytes.
  */
 function requestStdin(maxLen) {
-    if (!controlView) return new Uint8Array(0);
+    if (!controlView || !controlBytes) return new Uint8Array(0);
 
-    // Write stdin request
-    Atomics.store(controlView, 2, maxLen); // length = max bytes wanted
+    Atomics.store(controlView, 2, maxLen);
     Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
-    Atomics.notify(controlView, 0); // wake main thread
+    Atomics.notify(controlView, 0);
 
-    // Block until main thread sets command to CMD_STDIN_READY
     while (true) {
         const cmd = Atomics.load(controlView, 0);
         if (cmd === CMD_STDIN_READY) break;
-        Atomics.wait(controlView, 0, cmd, 100); // 100ms timeout, retry
+        Atomics.wait(controlView, 0, cmd, 100);
     }
 
     const len = Atomics.load(controlView, 2);
     if (len <= 0) return new Uint8Array(0);
 
-    // Read payload
     const result = new Uint8Array(len);
     for (let i = 0; i < len; i++) {
         result[i] = controlBytes[64 + i];
     }
 
-    // Reset to idle
     Atomics.store(controlView, 0, CMD_IDLE);
     return result;
 }
 
 /**
  * Send a network RPC to the main thread and block until response.
- * The main thread handles the actual WebTransport/network operations.
- *
- * @param {number} op - NET_OP_* code
- * @param {number} fd - socket file descriptor
- * @param {number} arg1 - operation-specific argument
- * @param {number} arg2 - operation-specific argument
- * @param {Uint8Array|null} data - optional payload data
- * @returns {{ result: number, data: Uint8Array|null }}
  */
 function networkRPC(op, fd, arg1, arg2, data) {
-    if (!netView) return { result: -38, data: null }; // ENOSYS
+    if (!netView || !netBytes) return { result: -38, data: null };
 
-    // Write RPC request to network SAB
     Atomics.store(netView, 1, op);
     Atomics.store(netView, 2, fd);
     Atomics.store(netView, 3, arg1);
@@ -196,18 +190,15 @@ function networkRPC(op, fd, arg1, arg2, data) {
         Atomics.store(netView, 6, 0);
     }
 
-    // Signal main thread: RPC request ready
-    Atomics.store(netView, 0, 1); // lock = 1 (request pending)
+    Atomics.store(netView, 0, 1);
     Atomics.notify(netView, 0);
 
-    // Block until main thread sets lock = 2 (response ready)
     while (true) {
         const lock = Atomics.load(netView, 0);
         if (lock === 2) break;
-        Atomics.wait(netView, 0, lock, 100); // 100ms timeout, retry
+        Atomics.wait(netView, 0, lock, 100);
     }
 
-    // Read response
     const result = Atomics.load(netView, 5);
     const respLen = Atomics.load(netView, 6);
     let respData = null;
@@ -218,9 +209,7 @@ function networkRPC(op, fd, arg1, arg2, data) {
         }
     }
 
-    // Reset lock to idle
     Atomics.store(netView, 0, 0);
-
     return { result, data: respData };
 }
 
@@ -229,7 +218,7 @@ function networkRPC(op, fd, arg1, arg2, data) {
  */
 function signalExit(exitCode) {
     if (!controlView) return;
-    Atomics.store(controlView, 5, exitCode); // exit_code at offset 20
+    Atomics.store(controlView, 5, exitCode);
     Atomics.store(controlView, 0, CMD_EXIT);
     Atomics.notify(controlView, 0);
 }
@@ -244,15 +233,13 @@ function maybePostJitStats(force = false) {
         if (stats) {
             self.postMessage({ type: 'jit_stats', stats, ts: now });
         }
-    } catch (e) {
-        // Non-fatal telemetry path.
+    } catch (_e) {
+        // ignore
     }
 }
 
 /**
- * Run the resume loop: call friscy_resume() while machine is stopped for stdin.
- * Between each resume, block on Atomics.wait() for the main thread to provide stdin.
- * Integrates JIT: checks for compiled functions before falling back to interpreter.
+ * Run the resume loop.
  */
 async function runResumeLoop() {
     console.log('[worker] entering resume loop');
@@ -268,12 +255,30 @@ async function runResumeLoop() {
     const friscy_set_fetch_response = emModule._friscy_set_fetch_response;
 
     while (friscy_stopped()) {
-        // Check if stdin data is available (non-blocking first).
-        // The machine may stop for epoll yields (cooperative threading),
-        // not just stdin — so we can't block forever waiting for stdin.
+        if (!controlView || !controlBytes) break;
+
+        const currentCmd = Atomics.load(controlView, 0);
+        if (currentCmd === CMD_EXPORT_VFS) {
+            Atomics.store(controlView, 0, CMD_IDLE);
+            if (emModule._friscy_export_tar) {
+                try {
+                    const sizePtr = emModule._malloc(4);
+                    const dataPtr = emModule._friscy_export_tar(sizePtr);
+                    const size = emModule.HEAPU32[sizePtr >> 2];
+                    emModule._free(sizePtr);
+                    if (dataPtr && size > 0) {
+                        const tarData = emModule.HEAPU8.slice(dataPtr, dataPtr + size).buffer;
+                        emModule._free(dataPtr);
+                        self.postMessage({ type: 'vfs_export', tarData }, [tarData]);
+                    }
+                } catch (e) {
+                    console.error('[worker] VFS export failed:', e.message);
+                }
+            }
+        }
+
         const cmd = Atomics.load(controlView, 0);
         if (cmd === CMD_STDIN_READY) {
-            // Main thread already has stdin data ready — consume it
             const len = Atomics.load(controlView, 2);
             if (len > 0) {
                 for (let i = 0; i < len; i++) {
@@ -282,13 +287,9 @@ async function runResumeLoop() {
             }
             Atomics.store(controlView, 0, CMD_IDLE);
         } else {
-            // Request stdin with a short timeout so we don't block on epoll yields.
-            // If no stdin arrives within 1ms, resume anyway (epoll yield path).
             Atomics.store(controlView, 2, 4096);
             Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
             Atomics.notify(controlView, 0);
-            // Wait for main thread to provide stdin.
-            // 100ms is a good balance: responsive typing, low CPU when idle.
             Atomics.wait(controlView, 0, CMD_STDIN_REQUEST, 100);
             const newCmd = Atomics.load(controlView, 0);
             if (newCmd === CMD_STDIN_READY) {
@@ -300,16 +301,13 @@ async function runResumeLoop() {
                 }
                 Atomics.store(controlView, 0, CMD_IDLE);
             } else {
-                // No stdin — reset to idle and resume (epoll yield or timer)
                 Atomics.store(controlView, 0, CMD_IDLE);
             }
         }
         maybePostJitStats();
 
-        // Host fetch hypercall: machine stopped to let Worker perform fetch()
         if (friscy_host_fetch_pending && friscy_host_fetch_pending()) {
             try {
-                // Read request JSON from Wasm memory
                 const reqPtr = friscy_get_fetch_request();
                 const reqLen = friscy_get_fetch_request_len();
                 const reqBytes = new Uint8Array(emModule.HEAPU8.buffer, reqPtr, reqLen);
@@ -318,7 +316,6 @@ async function runResumeLoop() {
 
                 console.log(`[worker] host-fetch: ${req.options?.method || 'GET'} ${req.url}`);
 
-                // Perform the actual fetch
                 const fetchOpts = {};
                 if (req.options) {
                     if (req.options.method) fetchOpts.method = req.options.method;
@@ -328,7 +325,6 @@ async function runResumeLoop() {
                 const resp = await fetch(req.url, fetchOpts);
                 const body = await resp.text();
 
-                // Serialize response
                 const respHeaders = {};
                 resp.headers.forEach((v, k) => { respHeaders[k] = v; });
                 const respJSON = JSON.stringify({
@@ -338,7 +334,6 @@ async function runResumeLoop() {
                     body: body,
                 });
 
-                // Write response back to Wasm
                 const respBytes = encoder.encode(respJSON);
                 const ptr = emModule._malloc(respBytes.length);
                 emModule.HEAPU8.set(respBytes, ptr);
@@ -360,11 +355,6 @@ async function runResumeLoop() {
             }
         }
 
-        // Try JIT execution before falling back to interpreter.
-        // The JIT run() function chains blocks inside Wasm and returns only on:
-        //   - halt
-        //   - syscall
-        //   - region miss (PC not compiled in this region)
         if (jitManager.jitCompiler) {
             let pc = friscy_get_pc() >>> 0;
             const statePtr = friscy_get_state_ptr();
@@ -374,8 +364,6 @@ async function runResumeLoop() {
             while (chainCount < MAX_CHAIN) {
                 const jitResult = jitManager.execute(pc, statePtr);
                 if (!jitResult) {
-                    // No compiled region for this PC. Keep interpreter PC aligned
-                    // with the latest miss target before falling back.
                     jitManager.recordExecution(pc);
                     friscy_set_pc(pc);
                     break;
@@ -395,18 +383,15 @@ async function runResumeLoop() {
                     continue;
                 }
 
-                // Defensive fallback: unexpected plain return.
                 friscy_set_pc(jitResult.nextPC >>> 0);
                 break;
             }
 
-            // Avoid getting stuck in pathological miss cycles.
             if (chainCount >= MAX_CHAIN) {
                 friscy_set_pc(pc >>> 0);
             }
         }
 
-        // Resume interpreter
         resumeCount++;
         if (resumeCount <= 5 || resumeCount % 100 === 0) {
             console.log(`[worker] resume #${resumeCount}`);
@@ -414,14 +399,12 @@ async function runResumeLoop() {
         const stillStopped = await friscy_resume();
         maybePostJitStats();
         if (!stillStopped) {
-            // Machine finished (guest called exit)
             console.log(`[worker] resume loop: machine finished after ${resumeCount} resumes`);
             return;
         }
     }
 }
 
-// Global error handler — surface errors to main thread
 self.addEventListener('error', (e) => {
     console.error('[worker] Uncaught error:', e.message, e.filename, e.lineno);
     self.postMessage({ type: 'error', message: `${e.message} (${e.filename}:${e.lineno})` });
@@ -431,13 +414,11 @@ self.addEventListener('unhandledrejection', (e) => {
     self.postMessage({ type: 'error', message: String(e.reason) });
 });
 
-// Handle messages from main thread
 self.onmessage = async function(e) {
     const msg = e.data;
 
     if (msg.type === 'init') {
         try {
-        // Receive SharedArrayBuffers and configuration
         const controlSab = msg.controlSab;
         const stdoutSab = msg.stdoutSab;
         const netSab = msg.netSab;
@@ -473,26 +454,17 @@ self.onmessage = async function(e) {
             netBytes = new Uint8Array(netSab);
         }
 
-        // Store initial terminal dimensions from control SAB
-        const initCols = Atomics.load(controlView, 6); // offset 24
-        const initRows = Atomics.load(controlView, 7); // offset 28
+        const initCols = Atomics.load(controlView, 6);
+        const initRows = Atomics.load(controlView, 7);
 
-        console.log('[worker] crossOriginIsolated:', self.crossOriginIsolated);
-        console.log('[worker] SharedArrayBuffer available:', typeof SharedArrayBuffer !== 'undefined');
         if (!self.crossOriginIsolated) {
-            throw new Error('Worker not cross-origin isolated — COOP/COEP headers missing. SharedArrayBuffer unavailable.');
+            throw new Error('Worker not cross-origin isolated');
         }
 
         console.log('[worker] Loading Emscripten module...');
-        // Load Emscripten module (ES module import)
         const { default: createFriscy } = await import('./friscy.js');
-        console.log('[worker] createFriscy loaded, instantiating...');
-
-        // Stdin buffer shared between Module callbacks and resume loop
         const stdinBuffer = [];
 
-        // Configure and instantiate Emscripten module
-        console.log('[worker] Calling createFriscy...');
         emModule = await createFriscy({
             noInitialRun: true,
             print: function(text) {
@@ -500,11 +472,8 @@ self.onmessage = async function(e) {
                 writeStdoutRing(encoder.encode(text + '\n'));
             },
             printErr: function(text) {
-                // Debug output (C++ fprintf(stderr)) goes to console only,
-                // NOT to the terminal ring buffer. Guest I/O uses _termWrite.
                 console.error('[friscy-err]', text);
             },
-            // _termWrite routes stdout through the ring buffer to main thread
             _termWrite: function(text) {
                 writeStdoutRing(encoder.encode(text));
             },
@@ -513,13 +482,10 @@ self.onmessage = async function(e) {
             _stdinEOF: false,
             _termRows: initRows || 24,
             _termCols: initCols || 80,
-            // Override stdin to use SAB blocking
             stdin: function() {
-                // If buffer has data, return from it
                 if (stdinBuffer.length > 0) {
                     return stdinBuffer.shift();
                 }
-                // Otherwise block for stdin from main thread
                 const data = requestStdin(1);
                 return data.length > 0 ? data[0] : null;
             },
@@ -529,7 +495,6 @@ self.onmessage = async function(e) {
         });
 
         if (enableJit) {
-            // Load JIT manager (non-critical)
             try {
                 const jitMod = await import('./jit_manager.js');
                 jitManager = jitMod.default;
@@ -557,29 +522,12 @@ self.onmessage = async function(e) {
                     edgeHotThreshold: jitEdgeHotThreshold,
                     tripletHotThreshold: jitTraceTripletHotThreshold,
                 });
-                console.log(
-                    `[worker] JIT manager loaded ` +
-                    `(hotThreshold=${jitManager.hotThreshold ?? 'default'}, ` +
-                    `tiering=${jitManager.tieringEnabled ? 'on' : 'off'}, ` +
-                    `optHot=${jitManager.optimizeThreshold ?? 'default'}, ` +
-                    `budget=${jitManager.compileBudgetPerSecond ?? 'default'}, ` +
-                    `qmax=${jitManager.compileQueueMax ?? 'default'}, ` +
-                    `markov=${jitManager.markovEnabled ? 'on' : 'off'}, ` +
-                    `topK=${jitManager.predictorTopK ?? 'default'}, ` +
-                    `pconf=${jitManager.predictorBaseConfidenceThreshold ?? 'default'}, ` +
-                    `trace=${jitManager.traceEnabled ? 'on' : 'off'}, ` +
-                    `triplet=${jitManager.tripletEnabled ? 'on' : 'off'}, ` +
-                    `edgeHot=${jitManager.traceEdgeHotThreshold ?? 'default'}, ` +
-                    `tripletHot=${jitManager.traceTripletHotThreshold ?? 'default'})`
-                );
             } catch (e) {
                 console.warn('[worker] JIT manager not available:', e.message);
             }
 
-            // Install JIT invalidation hook on Module
-            installInvalidationHook(emModule);
+            if (typeof installInvalidationHook === 'function') installInvalidationHook(emModule);
 
-            // Initialize JIT manager with the Wasm memory
             const wasmMemory = emModule.wasmMemory || (emModule.asm && emModule.asm.memory);
             if (wasmMemory) {
                 jitManager.init(wasmMemory);
@@ -590,17 +538,13 @@ self.onmessage = async function(e) {
                         console.warn('[worker] JIT compiler wait failed:', e.message);
                     }
                 } else {
-                    // Load JIT compiler (async, non-blocking)
                     jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
                         console.warn('[worker] JIT compiler not available:', e.message);
                     });
                 }
             }
-        } else {
-            console.log('[worker] JIT disabled via configuration');
         }
 
-        // Install network callbacks that route through SAB RPC
         if (netSab) {
             emModule.onSocketCreated = function(fd, domain, type) {
                 networkRPC(NET_OP_SOCKET_CREATE, fd, domain, type, null);
@@ -652,7 +596,6 @@ self.onmessage = async function(e) {
             };
         }
 
-        console.log('[worker] Module ready, sending ready message');
         self.postMessage({ type: 'ready' });
         } catch (e) {
             console.error('[worker] Init failed:', e.message, e.stack);
@@ -661,33 +604,22 @@ self.onmessage = async function(e) {
     }
 
     if (msg.type === 'run') {
-        // Start emulator execution
         const args = msg.args || [];
-
         try {
             if (msg.rootfsData) {
-                // Write rootfs tar to Emscripten VFS
                 emModule.FS.writeFile('/rootfs.tar', new Uint8Array(msg.rootfsData));
             }
 
             if (msg.checkpointData) {
-                // Write checkpoint to Emscripten VFS for --load-checkpoint
                 emModule.FS.writeFile('/checkpoint.ckpt', new Uint8Array(msg.checkpointData));
-                // Prepend --load-checkpoint to args (before other args)
                 args.unshift('--load-checkpoint', '/checkpoint.ckpt');
                 console.log('[worker] Checkpoint loaded (' + msg.checkpointData.byteLength + ' bytes)');
             }
 
-            // Run with arguments (JSPI makes callMain return a Promise)
             await emModule.callMain(args);
-            console.log('[worker] callMain returned, checking stopped:', emModule._friscy_stopped ? emModule._friscy_stopped() : 'no fn');
-
-            // Enter resume loop if machine stopped for stdin or host fetch
             if (emModule._friscy_stopped && emModule._friscy_stopped()) {
                 await runResumeLoop();
             }
-
-            // Machine finished — signal exit
             maybePostJitStats(true);
             signalExit(0);
         } catch (e) {
@@ -701,10 +633,31 @@ self.onmessage = async function(e) {
     }
 
     if (msg.type === 'resize') {
-        // Update terminal dimensions
         if (emModule) {
             emModule._termRows = msg.rows || 24;
             emModule._termCols = msg.cols || 80;
+        }
+    }
+
+    if (msg.type === 'write_file') {
+        if (emModule && emModule.FS) {
+            try {
+                emModule.FS.writeFile(msg.path, new Uint8Array(msg.data));
+                console.log(`[worker] Wrote ${msg.data.byteLength} bytes to ${msg.path}`);
+            } catch (e) {
+                console.error(`[worker] Failed to write file ${msg.path}:`, e.message);
+            }
+        }
+    }
+
+    if (msg.type === 'load_overlay') {
+        if (emModule && emModule.FS && msg.data) {
+            try {
+                emModule.FS.writeFile('/tmp/overlay.tar', new Uint8Array(msg.data));
+                console.log(`[worker] Loaded overlay tar (${msg.data.byteLength} bytes)`);
+            } catch (e) {
+                console.error('[worker] Failed to load overlay:', e.message);
+            }
         }
     }
 };

@@ -54,3 +54,4 @@ friscy-bundle/*.tar
 # OS
 .DS_Store
 Thumbs.db
+public/friscy-bundle/*.tar

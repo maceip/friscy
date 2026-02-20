@@ -488,6 +488,11 @@ inline SyscallContext* get_ctx(Machine& m) {
     return m.template get_userdata<SyscallContext>();
 }
 
+// Helper to check if fd is managed by VectorHeart/JSPI
+inline bool is_vh_fd(int fd) {
+    return fd >= 500 && fd < 1000;
+}
+
 // Helper to get VFS from machine
 inline vfs::VirtualFS& get_fs(Machine& m) {
     return *get_ctx(m)->fs;
@@ -1486,6 +1491,16 @@ static void sys_openat(Machine& m) {
         fs.open(path, 0100 /* O_CREAT */);  // creates empty file via VFS open path
     }
 
+    // Intercept /mnt/host access for local folder sharing
+    if (path.startsWith("/mnt/host/")) {
+        // Redirect to VectorHeart hypercall 600
+        std::string vh_path = path;
+        if (flags & O_DIRECTORY) vh_path += "/";
+        long vh_fd = js_opfs_io(0, (void*)vh_path.c_str(), flags, 600, 0);
+        m.set_result(vh_fd);
+        return;
+    }
+
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
     // Track /dev/tty and /dev/pts/* opens as tty fds for ioctl
     if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
@@ -1504,6 +1519,14 @@ static void sys_close(Machine& m) {
     // Clean up epoll/eventfd state
     g_epoll_instances.erase(fd);
     g_eventfd_counters.erase(fd);
+
+    if (is_vh_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        m.set_result(js_opfs_io(fd, nullptr, 0, 603, 0));
+        return;
+#endif
+    }
+
     get_fs(m).close(fd);
     m.set_result(0);
 }
@@ -1661,6 +1684,15 @@ static void sys_read(Machine& m) {
 #endif
     }
 
+    // VectorHeart JSPI-managed FDs
+    if (is_vh_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        auto* buf_ptr = m.memory.memarray<uint8_t>(buf_addr, count);
+        m.set_result(js_opfs_io(fd, buf_ptr, count, 602, 0));
+        return;
+#endif
+    }
+
     std::vector<uint8_t> buf(count);
     ssize_t n = fs.read(fd, buf.data(), count);
     if (n > 0) {
@@ -1794,6 +1826,15 @@ static void sys_write(Machine& m) {
 #endif
     }
 
+    // VectorHeart JSPI-managed FDs
+    if (is_vh_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        auto* buf_ptr = m.memory.memarray<uint8_t>(buf_addr, count);
+        m.set_result(js_opfs_io(fd, buf_ptr, count, 601, 0));
+        return;
+#endif
+    }
+
     m.set_result(err::BADF);
 }
 
@@ -1900,12 +1941,22 @@ static void sys_writev(Machine& m) {
 }
 
 static void sys_lseek(Machine& m) {
+    int fd = m.template sysarg<int>(0);
+    int64_t offset = m.template sysarg<int64_t>(1);
+    int whence = m.template sysarg<int>(2);
+
+    if (is_vh_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        // js_opfs_io 604 handles positional reads, but for pure lseek 
+        // we might need a dedicated op or manage offset in JS.
+        // For now, return the offset to avoid breaking callers.
+        m.set_result(js_opfs_io(fd, nullptr, 0, 605, (long)offset)); // Op 605 = lseek
+        return;
+#endif
+    }
+
     auto& fs = get_fs(m);
-    m.set_result(fs.lseek(
-        m.template sysarg<int>(0),
-        m.template sysarg<int64_t>(1),
-        m.template sysarg<int>(2)
-    ));
+    m.set_result(fs.lseek(fd, offset, whence));
 }
 
 static void sys_getdents64(Machine& m) {
@@ -1913,6 +1964,14 @@ static void sys_getdents64(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
+
+    if (is_vh_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        auto* buf = m.memory.memarray<uint8_t>(buf_addr, count);
+        m.set_result(js_opfs_io(fd, buf, count, 607, 0));
+        return;
+#endif
+    }
 
     std::vector<uint8_t> buf(count);
     ssize_t n = fs.getdents64(fd, buf.data(), count);
@@ -1976,6 +2035,16 @@ static void sys_fstat(Machine& m) {
     auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
     auto statbuf_addr = m.sysarg(1);
+
+    if (is_vh_fd(fd)) {
+#ifdef __EMSCRIPTEN__
+        // Redirect to VH op 606 (fstat)
+        // We pass statbuf_addr as the buffer
+        auto* buf = m.memory.memarray<uint8_t>(statbuf_addr, sizeof(linux_stat64));
+        m.set_result(js_opfs_io(fd, buf, sizeof(linux_stat64), 606, 0));
+        return;
+#endif
+    }
 
     // stdin/stdout/stderr are character devices
     if (fd == 0 || fd == 1 || fd == 2) {
@@ -4105,11 +4174,12 @@ static void sys_kill(Machine& m) {
 static void sys_tkill(Machine& m) {
     int sig = m.template sysarg<int>(1);
     if (sig == 6) { // SIGABRT
-        // Dump ring buffer of recent syscalls
+        // Dump machine state on crash
         static bool dumped = false;
         if (!dumped) {
             dumped = true;
-            fprintf(stderr, "[ABORT] Syscall ring unavailable in current libriscv build\n");
+            fprintf(stderr, "[ABORT] tkill(SIGABRT) received. Node.js or guest app is aborting.\n");
+            fprintf(stderr, "[ABORT] Note: Syscall ring buffer is not enabled in this libriscv build.\n");
         }
         fprintf(stderr, "[ABORT] tkill(SIGABRT)! PC=0x%lx RA=0x%lx SP=0x%lx\n",
                 (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2));

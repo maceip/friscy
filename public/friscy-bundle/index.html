@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>friscy</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <style>
+    @font-face { font-family: 'Maple Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('https://cdn.jsdelivr.net/fontsource/fonts/maple-mono@latest/latin-400-normal.woff2') format('woff2'); }
+    @font-face { font-family: 'Maple Mono'; font-style: normal; font-weight: 700; font-display: swap; src: url('https://cdn.jsdelivr.net/fontsource/fonts/maple-mono@latest/latin-700-normal.woff2') format('woff2'); }
+    </style>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #050810;
+            color: #e6e1cf;
+            font-family: 'Maple Mono', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            padding: 0.75rem 1rem;
+            background: linear-gradient(180deg, #0d1117 0%, #0a0e14 100%);
+            border-bottom: 1px solid rgba(89,194,255,0.15);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: relative;
+        }
+        header::after {
+            content: '';
+            position: absolute;
+            bottom: -1px;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255,143,64,0.4) 20%, rgba(89,194,255,0.3) 50%, rgba(210,166,255,0.4) 80%, transparent);
+        }
+        h1 { font-size: 1.2rem; font-weight: 500; }
+        .status { font-size: 0.85rem; color: #888; margin-top: 0.25rem; }
+        .net-status {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            margin-left: 0.5rem;
+        }
+        .net-status.connected { background: #1a4d2e; color: #a6e3a1; }
+        .net-status.disconnected { background: #4d1a1a; color: #f38ba8; }
+        .net-status.connecting { background: #4d3d1a; color: #f9e2af; }
+        #search-bar {
+            display: none; position: fixed; top: 8px; right: 16px; z-index: 50;
+            background: #0d1117; border: 1px solid rgba(89,194,255,0.2); border-radius: 6px;
+            padding: 4px 8px; align-items: center; gap: 6px;
+            font-family: '"Maple Mono", monospace'; font-size: 13px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        }
+        #search-bar.visible { display: flex; }
+        #search-bar input {
+            background: #0a0e14; color: #e6e1cf; border: 1px solid #1c2433;
+            border-radius: 4px; padding: 4px 8px; font-size: 13px;
+            font-family: inherit; outline: none; width: 240px;
+        }
+        #search-bar input:focus { border-color: #59c2ff; }
+        #search-bar button {
+            background: none; border: none; color: #3e4b59; cursor: pointer;
+            font-size: 14px; padding: 2px 6px; border-radius: 3px;
+        }
+        #search-bar button:hover { background: #1c2433; color: #e6e1cf; }
+        #jit-warmup-hud {
+            position: fixed;
+            right: 12px;
+            bottom: 12px;
+            min-width: 196px;
+            padding: 0.55rem 0.65rem;
+            border: 1px solid rgba(255, 143, 64, 0.25);
+            background: rgba(10, 14, 20, 0.92);
+            color: #e6e1cf;
+            border-radius: 8px;
+            font-family: 'Maple Mono', 'Menlo', 'Monaco', monospace;
+            font-size: 0.68rem;
+            line-height: 1.45;
+            z-index: 30;
+            display: none;
+            backdrop-filter: blur(5px);
+            pointer-events: none;
+        }
+        #jit-warmup-hud.visible { display: block; }
+        #jit-warmup-hud .hud-title {
+            color: #ff8f40;
+            margin-bottom: 0.22rem;
+            letter-spacing: 0.02em;
+        }
+        #jit-warmup-hud .hud-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+        #jit-warmup-hud .hud-row .key { color: #8b949e; }
+        #jit-warmup-hud .hud-row .val { color: #e6edf3; font-variant-numeric: tabular-nums; }
+        #terminal-container {
+            flex: 1;
+            padding: 0.75rem;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+            resize: vertical;
+        }
+        #terminal {
+            flex: 1;
+            border-radius: 4px;
+            overflow: hidden;
+            display: flex;
+            position: relative;
+            border: 1px solid rgba(89,194,255,0.12);
+            box-shadow:
+                0 0 0 1px rgba(255,143,64,0.06),
+                0 0 30px rgba(89,194,255,0.04),
+                inset 0 0 60px rgba(0,0,0,0.3);
+        }
+        /* Futuristic corner brackets */
+        #terminal::before, #terminal::after {
+            content: '';
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        #terminal::before {
+            top: -1px; left: -1px;
+            border-top: 2px solid rgba(255,143,64,0.5);
+            border-left: 2px solid rgba(255,143,64,0.5);
+        }
+        #terminal::after {
+            bottom: -1px; right: -1px;
+            border-bottom: 2px solid rgba(89,194,255,0.4);
+            border-right: 2px solid rgba(89,194,255,0.4);
+        }
+        /* Subtle scanline overlay */
+        #terminal-container::after {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0,0,0,0.03) 2px,
+                rgba(0,0,0,0.03) 4px
+            );
+            pointer-events: none;
+            z-index: 5;
+        }
+        .xterm .xterm-viewport {
+            overflow-y: hidden !important;
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+        }
+        .xterm .xterm-viewport::-webkit-scrollbar {
+            width: 0 !important;
+            height: 0 !important;
+            display: none !important;
+        }
+        #terminal::-webkit-scrollbar,
+        #terminal-wrapper::-webkit-scrollbar {
+            display: none !important;
+        }
+        #terminal, #terminal-wrapper, .xterm-screen {
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+        }
+        .xterm-screen::-webkit-scrollbar {
+            display: none !important;
+        }
+        /* Progress overlay */
+        #progress-overlay {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            gap: 1.5rem;
+            background: #0d1117;
+            border-radius: 8px;
+        }
+        #progress-overlay.hidden { display: none; }
+        .progress-title {
+            font-size: 1.4rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+        }
+        .progress-stage {
+            font-size: 0.9rem;
+            color: #8b949e;
+        }
+        .progress-wave {
+            width: min(400px, 80%);
+            height: 24px;
+        }
+        .progress-detail {
+            font-size: 0.8rem;
+            color: #484f58;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* Import panel */
+        #import-panel {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            background: #0d1117;
+            border-radius: 8px;
+            gap: 0;
+            padding: 2rem;
+        }
+        #import-panel.visible { display: flex; }
+        .import-title {
+            font-size: 1.1rem;
+            color: #e6edf3;
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+        .import-subtitle {
+            font-size: 0.8rem;
+            color: #6e7681;
+            margin-bottom: 12px;
+        }
+        .import-chip {
+            display: inline-block;
+            background: transparent;
+            color: #f9a8d4;
+            padding: 4px 12px;
+            border-radius: 999px;
+            border: 1px solid #f9a8d4;
+            font-size: 0.8rem;
+            font-family: 'Maple Mono', 'Menlo', 'Monaco', monospace;
+            cursor: pointer;
+            transition: opacity 0.15s, border-color 0.15s;
+            margin-bottom: 4px;
+            transform: translateX(-45px);
+        }
+        .import-chip:hover { border-color: #fbcfe8; color: #fbcfe8; }
+        .import-chip.hidden { opacity: 0; pointer-events: none; }
+        .import-input-wrapper {
+            position: relative;
+            width: min(720px, 90%);
+            display: flex;
+            align-items: stretch;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 999px;
+            transition: border-color 0.15s;
+        }
+        .import-input-wrapper:focus-within { border-color: #58a6ff; }
+        .import-input {
+            flex: 1;
+            padding: 6px 20px;
+            background: transparent;
+            border: none;
+            color: #e6edf3;
+            font-size: 0.95rem;
+            font-family: 'Maple Mono', 'Menlo', 'Monaco', monospace;
+            outline: none;
+            min-width: 0;
+        }
+        .import-input::placeholder { color: #484f58; }
+        .import-go-btn {
+            padding: 0 8px 0 4px;
+            background: #238636;
+            color: #fff;
+            border: none;
+            border-left: 1px solid #30363d;
+            border-radius: 0 999px 999px 0;
+            font-size: 0.85rem;
+            font-family: inherit;
+            cursor: pointer;
+            transition: background 0.15s;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .import-go-btn:hover { background: #2ea043; }
+        .import-go-btn:disabled { background: #21262d; color: #484f58; cursor: default; }
+        .import-autocomplete {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            max-height: 240px;
+            overflow-y: auto;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            z-index: 50;
+            display: none;
+        }
+        .import-autocomplete.open { display: block; }
+        .import-ac-item {
+            padding: 8px 20px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-family: 'Maple Mono', 'Menlo', 'Monaco', monospace;
+            color: #c9d1d9;
+            border-bottom: 1px solid #21262d;
+        }
+        .import-ac-item:first-child { border-radius: 12px 12px 0 0; }
+        .import-ac-item:last-child { border-bottom: none; border-radius: 0 0 12px 12px; }
+        .import-ac-item:only-child { border-radius: 12px; }
+        .import-ac-item:hover, .import-ac-item.selected {
+            background: #1f6feb22;
+            color: #58a6ff;
+        }
+        .import-ac-item .match { color: #58a6ff; font-weight: 600; }
+        .import-status {
+            font-size: 0.8rem;
+            color: #8b949e;
+            min-height: 1.2em;
+        }
+        .import-progress-canvas {
+            width: min(460px, 90%);
+            height: 18px;
+            display: none;
+        }
+        .import-progress-canvas.visible { display: block;
+        }
+
+        .header-link {
+            color: inherit;
+            text-decoration: none;
+        }
+        .header-link:hover { text-decoration: underline; }
+        .header-logo {
+            height: 24px;
+            opacity: 0.7;
+            margin-left: 1rem;
+        }
+        .header-logo:hover { opacity: 1; }
+        /* Mobile breakpoints */
+        @media (max-width: 768px) {
+            header { padding: 0.5rem 0.75rem; }
+            h1 { font-size: 1rem; }
+            .status { font-size: 0.75rem; }
+            .header-logo { height: 18px; margin-left: 0.5rem; }
+            .tab-bar { padding: 0 0.5rem; gap: 1px; overflow-x: auto; scrollbar-width: none; }
+            .tab-bar::-webkit-scrollbar { display: none; }
+            .tab { padding: 5px 8px; font-size: 0.7rem; gap: 4px; white-space: nowrap; }
+            .tab-icon { width: 13px; height: 13px; }
+            .tab-strip-border { margin: 0 0.5rem; }
+            #terminal-container { padding: 0.5rem; }
+            #dual-terminal-container.active { flex-direction: column; }
+            .dual-pane.primary, .dual-pane.companion { flex: 1; }
+            #reset-btn { width: 24px; height: 24px; font-size: 0.9rem; line-height: 22px; }
+            .import-input-wrapper { width: 95%; }
+            .import-title { font-size: 0.95rem; }
+            .import-input { font-size: 0.85rem; padding: 8px 10px; }
+            #jit-warmup-hud {
+                right: 8px;
+                bottom: 8px;
+                min-width: 176px;
+                font-size: 0.64rem;
+            }
+        }
+        @media (max-width: 480px) {
+            header { padding: 0.4rem 0.5rem; }
+            h1 { font-size: 0.9rem; }
+            .status { font-size: 0.7rem; margin-top: 0.15rem; }
+            .net-status { font-size: 0.65rem; padding: 0.15rem 0.35rem; }
+            .tab { padding: 4px 6px; font-size: 0.65rem; }
+            .tab-icon { width: 12px; height: 12px; }
+            #terminal-container { padding: 0.25rem; }
+            #jit-warmup-hud { min-width: 165px; font-size: 0.61rem; }
+        }
+        /* IME-aware: when virtual keyboard is visible, shrink terminal */
+        @media (max-height: 450px) {
+            header { padding: 0.25rem 0.5rem; }
+            h1 { font-size: 0.85rem; }
+            .status { display: none; }
+            .tab-bar { padding: 0 0.25rem; }
+            .tab { padding: 3px 5px; font-size: 0.6rem; }
+            #terminal-container { padding: 0.25rem; }
+        }
+        .tab-bar {
+            display: flex;
+            padding: 0 1rem;
+            padding-top: 0.4rem;
+            gap: 2px;
+            align-items: flex-end;
+        }
+        .tab {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            background: #0a0e14;
+            color: #6e7681;
+            border: 1px solid #21262d;
+            border-bottom: none;
+            border-radius: 8px 8px 0 0;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-family: inherit;
+            position: relative;
+            bottom: -1px;
+            transition: background 0.2s, color 0.2s;
+        }
+        .tab:hover { background: #161b22; color: #c9d1d9; }
+        .tab.active {
+            background: #0d1117;
+            color: #e6edf3;
+            border-color: #30363d;
+            z-index: 1;
+        }
+        .tab-icon {
+            width: 16px;
+            height: 16px;
+            flex-shrink: 0;
+        }
+        .tab-strip-border {
+            height: 0;
+            border-bottom: 1px solid #30363d;
+            margin: 0 1rem;
+        }
+        #terminal-wrapper {
+            position: relative;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #dual-terminal-container {
+            display: none; flex: 1; gap: 0.5rem; min-height: 0;
+        }
+        #dual-terminal-container.active { display: flex; }
+        .dual-pane { display: flex; flex-direction: column; overflow: hidden; border-radius: 8px; min-height: 0; }
+        .dual-pane.primary { flex: 2; }
+        .dual-pane.companion { flex: 1; }
+        .pane-label {
+            font-size: 0.7rem; color: #6e7681; padding: 4px 8px;
+            background: #161b22; border-bottom: 1px solid #21262d;
+            text-transform: uppercase; letter-spacing: 0.05em;
+            flex-shrink: 0;
+        }
+        .dual-term { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+        #reset-btn {
+            display: none;
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            z-index: 100;
+            background: rgba(15, 52, 96, 0.75);
+            color: #8b949e;
+            border: 1px solid rgba(48, 54, 61, 0.5);
+            border-radius: 4px;
+            width: 28px;
+            height: 28px;
+            cursor: pointer;
+            font-size: 1.1rem;
+            line-height: 26px;
+            text-align: center;
+            padding: 0;
+            backdrop-filter: blur(4px);
+            transition: background 0.15s, color 0.15s;
+        }
+        #reset-btn:hover { background: rgba(15, 52, 96, 0.95); color: #eee; }
+
+        /* Image Side Panel */
+        .image-side-panel {
+            position: absolute;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: 300px; /* Adjust as needed */
+            background: #0d1117;
+            border-left: 1px solid rgba(89,194,255,0.15);
+            transform: translateX(100%);
+            transition: transform 0.3s ease-out;
+            z-index: 20;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .image-side-panel.open {
+            transform: translateX(0);
+        }
+
+        .image-side-panel-header {
+            padding: 0.5rem 1rem;
+            background: #16213e;
+            border-bottom: 1px solid rgba(89,194,255,0.15);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: #e6e1cf;
+            font-weight: bold;
+        }
+
+        .image-side-panel-header button {
+            background: none;
+            border: none;
+            color: #e6e1cf;
+            font-size: 1.2rem;
+            cursor: pointer;
+        }
+
+        .image-side-panel-content {
+            flex-grow: 1;
+            padding: 1rem;
+            overflow-y: auto;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .image-side-panel-content img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+
+        /* Styling for links in WebLinksAddon */
+        .xterm a {
+            text-decoration: none;
+        }
+        .xterm a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1><a href="https://github.com/maceip/friscy" class="header-link">friscy</a></h1>
+            <div class="status" id="status">fast risc-v runtime for the browser &amp; wasm<span id="net-status" class="net-status disconnected">net: off</span></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.5rem;">
+            <button id="theme-toggle-btn" title="Toggle Theme" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:1.2rem;padding:0.25rem;">&#x263C;</button>
+            <img src="./webmcp-icon.svg" alt="WebMCP" class="header-logo" title="WebMCP enabled">
+            <img src="./riscv-logo.jpg" alt="RISC-V" class="header-logo">
+        </div>
+    </header>
+    <div id="search-bar">
+        <input id="search-input" type="text" placeholder="Search terminal..." spellcheck="false" autocomplete="off">
+        <button id="search-prev" title="Previous (Shift+Enter)">&#x25B2;</button>
+        <button id="search-next" title="Next (Enter)">&#x25BC;</button>
+        <button id="search-close" title="Close (Escape)">&#x2715;</button>
+    </div>
+    <div class="tab-bar">
+        <button class="tab active" id="tab-alpine" data-example="alpine" title="Alpine Linux shell">
+            <img src="./alpine-icon.svg" alt="" class="tab-icon">Alpine
+        </button>
+        <button class="tab" id="tab-nodejs" data-example="nodejs" title="Interactive Node.js REPL">
+            <img src="./nodejs-icon.svg" alt="" class="tab-icon">Node.js
+        </button>
+        <button class="tab" id="tab-server" data-example="server" title="HTTP echo server on port 8080">
+            <img src="./go-icon.svg" alt="" class="tab-icon">Go Server
+        </button>
+        <button class="tab" id="tab-claude" data-example="claude" title="Ephemeral Claude Code Container">
+            <img src="./claude-sparkle.svg" alt="" class="tab-icon">Claude
+        </button>
+    </div>
+    <div class="tab-strip-border"></div>
+    <div id="terminal-container">
+        <div id="progress-overlay">
+            <div class="progress-title">friscy</div>
+            <div class="progress-stage" id="progress-stage">Preparing...</div>
+            <canvas id="progress-canvas" class="progress-wave" width="800" height="48"></canvas>
+            <div class="progress-detail" id="progress-detail">&nbsp;</div>
+        </div>
+        <div id="import-panel">
+            <div class="import-title">Import a Docker image</div>
+            <div class="import-subtitle">Pull any public image from Docker Hub and run it in friscy</div>
+            <div class="import-chip" id="import-chip">ubuntu:latest</div>
+            <form id="import-form" toolname="import_docker_image" tooldescription="Pull a Docker image from Docker Hub and run it in a RISC-V emulator in the browser">
+            <div class="import-input-wrapper">
+                <input type="text" class="import-input" id="import-input" name="image" placeholder="nginx:alpine" autocomplete="off" spellcheck="false" toolparamdescription="Docker image reference, e.g. ubuntu:latest or python:3.12">
+                <button type="submit" class="import-go-btn" id="import-go-btn">Pull &amp; Run</button>
+                <div class="import-autocomplete" id="import-ac"></div>
+            </div>
+            </form>
+            <canvas class="import-progress-canvas" id="import-progress-canvas" width="460" height="18"></canvas>
+            <div class="import-status" id="import-status">&nbsp;</div>
+        </div>
+        <div id="terminal-wrapper">
+            <div id="terminal" style="display:none;"></div>
+            <div id="dual-terminal-container">
+                <div class="dual-pane primary">
+                    <div class="pane-label">Go Echo Server · port 8080</div>
+                    <div id="terminal-server" class="dual-term"></div>
+                </div>
+                <div class="dual-pane companion">
+                    <div class="pane-label">Alpine Shell · wget client</div>
+                    <div id="terminal-companion" class="dual-term"></div>
+                </div>
+            </div>
+            <div id="image-side-panel" class="image-side-panel">
+                <div class="image-side-panel-header">
+                    <span>Dropped Image</span>
+                    <button id="image-side-panel-close">&times;</button>
+                </div>
+                <div class="image-side-panel-content">
+                    <img id="dropped-image-preview" src="" alt="Dropped Image Preview" />
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Service worker: caching + COOP/COEP for cross-origin isolation -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('./service-worker.js').then(reg => {
+                console.log('Service Worker registered:', reg);
+                // Reload when not yet isolated (first visit)
+                if (!crossOriginIsolated && reg.active) {
+                    location.reload();
+                    return;
+                }
+                // Reload when a NEW service worker activates (cache update)
+                reg.addEventListener('updatefound', () => {
+                    const sw = reg.installing;
+                    sw.addEventListener('statechange', () => {
+                        if (sw.state === 'activated') {
+                            console.log('New service worker activated, reloading...');
+                            location.reload();
+                        }
+                    });
+                });
+            }).catch(e => console.error('Service Worker registration failed:', e));
+        }
+    </script>
+
+    <script src="dist/bundle.js"></script>
+</body>
+</html>

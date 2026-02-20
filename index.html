@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/friscy-bundle/claude-sparkle.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>friscy</title>
+    <!-- Build v1.0.1 - Handover/Squiggly -->
+    <!-- Primary Meta Tags -->
+    <meta name="title" content="friscy — Fast RISC-V Runtime for Browser & WASM" />
+    <meta name="description" content="Run Linux containers and agentic workloads directly in your browser using high-performance RISC-V emulation and JIT compilation." />
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://friscy.dev/" />
+    <meta property="og:title" content="friscy — Fast RISC-V Runtime for Browser & WASM" />
+    <meta property="og:description" content="Run Linux containers and agentic workloads directly in your browser using high-performance RISC-V emulation and JIT compilation." />
+    <meta property="og:image" content="/friscy-bundle/riscv-logo.jpg" />
+
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:url" content="https://friscy.dev/" />
+    <meta property="twitter:title" content="friscy — Fast RISC-V Runtime for Browser & WASM" />
+    <meta property="twitter:description" content="Run Linux containers and agentic workloads directly in your browser using high-performance RISC-V emulation and JIT compilation." />
+    <meta property="twitter:image" content="/friscy-bundle/riscv-logo.jpg" />
+    
+    <!-- PWA & WebMCP -->
+    <link rel="manifest" href="/.well-known/manifest.json" />
+    <link rel="agent-tool" href="/?tool=import_docker_image" title="Import Docker Image" />
+    <link rel="agent-tool" href="/?tool=spawn_dual_terminal" title="Spawn Dual Terminal" />
+    
+    <!-- Preload Critical Assets -->
+    <style>
+      /* Critical CSS for Skeleton */
+      body { background: #050810; margin: 0; color: #e6e1cf; font-family: monospace; overflow: hidden; }
+      #skeleton-header { height: 48px; background: linear-gradient(to bottom, #111827, #000); border-bottom: 1px solid rgba(89,194,255,0.15); display: flex; align-items: center; padding: 0 16px; justify-content: space-between; }
+      #skeleton-footer { height: 24px; background: #000; border-top: 1px solid rgba(89,194,255,0.15); position: fixed; bottom: 0; width: 100%; }
+      .skeleton-logo { font-weight: 900; color: #59c2ff; font-style: italic; font-size: 1.25rem; letter-spacing: -0.05em; }
+      .skeleton-loader { display: flex; flex-direction: column; align-items: center; justify-content: center; height: calc(100vh - 72px); color: #4b5563; gap: 16px; }
+      .spinner { width: 32px; height: 32px; border: 2px solid #1f2937; border-top-color: #59c2ff; border-radius: 50%; animation: spin 1s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      console.log('[index.html] body script running - VER: 2');
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

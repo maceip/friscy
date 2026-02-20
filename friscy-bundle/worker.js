@@ -670,6 +670,14 @@ self.onmessage = async function(e) {
                 emModule.FS.writeFile('/rootfs.tar', new Uint8Array(msg.rootfsData));
             }
 
+            if (msg.checkpointData) {
+                // Write checkpoint to Emscripten VFS for --load-checkpoint
+                emModule.FS.writeFile('/checkpoint.ckpt', new Uint8Array(msg.checkpointData));
+                // Prepend --load-checkpoint to args (before other args)
+                args.unshift('--load-checkpoint', '/checkpoint.ckpt');
+                console.log('[worker] Checkpoint loaded (' + msg.checkpointData.byteLength + ' bytes)');
+            }
+
             // Run with arguments (JSPI makes callMain return a Promise)
             await emModule.callMain(args);
             console.log('[worker] callMain returned, checking stopped:', emModule._friscy_stopped ? emModule._friscy_stopped() : 'no fn');

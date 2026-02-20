@@ -28,6 +28,14 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // Used by JS resume loop to distinguish stdin-wait from program exit.
 inline bool g_waiting_for_stdin = false;
 
+// Flag: when true, native mode stops on first stdin read instead of blocking.
+// Used by --export-checkpoint to capture state at the stdin-wait point.
+inline bool g_checkpoint_on_stdin = false;
+// Counter: number of consecutive idle epoll_pwait calls (no events returned).
+// When this exceeds a threshold, the system is idle and we can checkpoint.
+inline int g_idle_epoll_count = 0;
+static constexpr int IDLE_EPOLL_THRESHOLD = 3;  // stop after 3 consecutive idle polls
+
 // Host fetch hypercall (syscall 500): guest does ecall with a7=500,
 // machine stops, Worker performs fetch, writes response, resumes.
 inline bool g_waiting_for_host_fetch = false;
@@ -402,6 +410,7 @@ namespace nr {
     constexpr int close_range   = 436;
     constexpr int rseq          = 293;
     constexpr int io_uring_setup = 425;
+    constexpr int clone3        = 435;
     constexpr int faccessat2    = 439;
 }
 
@@ -827,6 +836,166 @@ static void sys_clone(Machine& m) {
     g_fork.child_reaped = false;
 
     // Return 0 = "you are the child"
+    m.set_result(0);
+}
+
+// clone3 — newer clone syscall that takes a struct clone_args pointer.
+// glibc 2.34+ uses this for pthread_create instead of clone().
+// struct clone_args layout (from linux/sched.h):
+//   offset  0: u64 flags
+//   offset  8: u64 pidfd
+//   offset 16: u64 child_tid  (CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID)
+//   offset 24: u64 parent_tid (CLONE_PARENT_SETTID)
+//   offset 32: u64 exit_signal
+//   offset 40: u64 stack      (bottom of stack)
+//   offset 48: u64 stack_size
+//   offset 56: u64 tls        (CLONE_SETTLS)
+// We parse the struct and delegate to the same thread/fork logic as sys_clone.
+static void sys_clone3(Machine& m) {
+    auto cl_args_addr = m.sysarg(0);
+    auto cl_args_size = m.sysarg(1);
+    (void)cl_args_size;
+
+    // Read clone_args fields from guest memory
+    uint64_t flags       = m.memory.template read<uint64_t>(cl_args_addr + 0);
+    uint64_t child_tid   = m.memory.template read<uint64_t>(cl_args_addr + 16);
+    uint64_t parent_tid  = m.memory.template read<uint64_t>(cl_args_addr + 24);
+    uint64_t exit_signal = m.memory.template read<uint64_t>(cl_args_addr + 32);
+    uint64_t stack       = m.memory.template read<uint64_t>(cl_args_addr + 40);
+    uint64_t stack_size  = m.memory.template read<uint64_t>(cl_args_addr + 48);
+    uint64_t tls         = m.memory.template read<uint64_t>(cl_args_addr + 56);
+
+    // Combine exit_signal into flags (clone3 separates them, clone packs them)
+    (void)exit_signal;
+
+    constexpr uint64_t F_CLONE_VM              = 0x00000100;
+    constexpr uint64_t F_CLONE_THREAD          = 0x00010000;
+    constexpr uint64_t F_CLONE_VFORK           = 0x00004000;
+    constexpr uint64_t F_CLONE_PARENT_SETTID   = 0x00100000;
+    constexpr uint64_t F_CLONE_CHILD_CLEARTID  = 0x00200000;
+    constexpr uint64_t F_CLONE_SETTLS          = 0x00080000;
+
+    if ((flags & F_CLONE_THREAD) || ((flags & F_CLONE_VM) && !(flags & F_CLONE_VFORK))) {
+        // Thread creation — same logic as sys_clone thread path
+        int tid = g_next_pid++;
+        // clone3 stack = bottom of stack region, stack_size = size
+        // Child SP = stack + stack_size (top of stack, grows down)
+        uint64_t child_sp = stack + stack_size;
+
+        if (flags & F_CLONE_PARENT_SETTID) {
+            if (parent_tid != 0) {
+                m.memory.template write<int32_t>(parent_tid, tid);
+            }
+        }
+
+        if (g_sched.count == 0) {
+            g_sched.init(g_next_pid - 2);
+        }
+
+        int child_idx = g_sched.add_thread(tid);
+        if (child_idx < 0) {
+            fprintf(stderr, "[clone3] thread slots full, faking tid=%d\n", tid);
+            m.set_result(tid);
+            return;
+        }
+
+        int parent_idx = g_sched.current;
+        save_thread(m, g_sched.threads[parent_idx]);
+        g_sched.threads[parent_idx].regs[10] = (uint64_t)tid;
+
+        m.cpu.reg(riscv::REG_SP) = child_sp;
+        m.set_result(0);
+
+        if (flags & F_CLONE_SETTLS) {
+            m.cpu.reg(4) = tls;  // tp register = x4
+        }
+
+        if (flags & F_CLONE_CHILD_CLEARTID) {
+            g_sched.threads[child_idx].clear_child_tid = child_tid;
+        }
+
+        g_sched.current = child_idx;
+        g_sched.threads[child_idx].pc = m.cpu.pc();
+
+        static int clone3_thread_count = 0;
+        if (++clone3_thread_count <= 10)
+            fprintf(stderr, "[clone3] thread #%d cooperative, tid=%d stack=0x%lx+0x%lx\n",
+                    clone3_thread_count, tid, (long)stack, (long)stack_size);
+        return;
+    }
+
+    // Fork path — delegate to same vfork emulation
+    if (g_fork.in_child) {
+        m.set_result(-11);  // -EAGAIN
+        return;
+    }
+
+    fprintf(stderr, "[clone3] fork flags=0x%lx stack=0x%lx+0x%lx\n",
+            (long)flags, (long)stack, (long)stack_size);
+
+    // Save parent registers BEFORE changing SP
+    for (int i = 0; i < 32; i++) {
+        g_fork.regs[i] = m.cpu.reg(i);
+    }
+    g_fork.pc = m.cpu.pc();
+    g_fork.child_pid = g_next_pid++;
+    g_fork.exit_status = 0;
+
+    // Save parent memory regions BEFORE changing SP (stack save needs parent SP)
+    {
+        uint64_t save_start = g_exec_ctx.exec_rw_start;
+        uint64_t save_end = (g_exec_ctx.heap_start > g_exec_ctx.exec_rw_end)
+                          ? g_exec_ctx.heap_start : g_exec_ctx.exec_rw_end;
+        if (save_start > 0 && save_end > save_start) {
+            riscv::PageAttributes attr;
+            attr.read = true; attr.write = true; attr.exec = true;
+            m.memory.set_page_attr(save_start, save_end - save_start, attr);
+            auto& r = g_fork.exec_data;
+            r.addr = save_start;
+            r.size = save_end - save_start;
+            r.data.resize(r.size);
+            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        }
+    }
+    if (g_exec_ctx.interp_rw_start > 0 && g_exec_ctx.interp_rw_end > g_exec_ctx.interp_rw_start) {
+        auto& r = g_fork.interp_data;
+        r.addr = g_exec_ctx.interp_rw_start;
+        r.size = g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+    }
+    {
+        uint64_t sp = m.cpu.reg(riscv::REG_SP);
+        uint64_t stack_top = g_exec_ctx.original_stack_top;
+        auto& r = g_fork.stack_data;
+        r.addr = sp;
+        r.size = stack_top - sp;
+        r.data.resize(r.size);
+        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+    }
+    if (g_exec_ctx.heap_start > 0 && g_exec_ctx.heap_size > 0) {
+        uint64_t mmap_region_start = g_exec_ctx.heap_start + g_exec_ctx.heap_size;
+        uint64_t mmap_frontier = m.memory.mmap_allocate(0);
+        if (mmap_frontier > mmap_region_start) {
+            auto& r = g_fork.mmap_data;
+            r.addr = mmap_region_start;
+            r.size = mmap_frontier - mmap_region_start;
+            r.data.resize(r.size);
+            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        }
+    }
+    g_fork.parent_open_fds = get_fs(m).get_open_fds();
+    static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
+    std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
+
+    g_fork.in_child = true;
+    g_fork.child_reaped = false;
+
+    // Set child stack AFTER saving parent state
+    if (stack != 0 && stack_size != 0) {
+        m.cpu.reg(riscv::REG_SP) = stack + stack_size;
+    }
+
     m.set_result(0);
 }
 
@@ -1443,7 +1612,13 @@ static void sys_read(Machine& m) {
         }
 #else
         // Native mode: read from host stdin (pipe or terminal)
-        {
+        if (g_checkpoint_on_stdin) {
+            // Checkpoint mode: stop machine at stdin wait point
+            // (don't block on read — we want to capture state here)
+            g_waiting_for_stdin = true;
+            m.cpu.increment_pc(-4);  // Rewind past ecall
+            m.stop();
+        } else {
             std::vector<uint8_t> buf(count);
             ssize_t n = ::read(STDIN_FILENO, buf.data(), count);
             if (n > 0) {
@@ -3237,6 +3412,7 @@ static void sys_epoll_pwait(Machine& m) {
 #endif
 
     if (ready > 0) {
+        g_idle_epoll_count = 0;  // Reset idle counter on activity
         m.set_result(ready);
     } else if (timeout == 0) {
         // Non-blocking poll, nothing ready
@@ -3321,6 +3497,13 @@ static void sys_epoll_pwait(Machine& m) {
             m.stop();
             return;
 #else
+            if (g_checkpoint_on_stdin) {
+                // Checkpoint mode: stop at idle point
+                g_waiting_for_stdin = true;
+                m.cpu.increment_pc(-4);
+                m.stop();
+                return;
+            }
             // Native: sleep 10ms, return -EINTR
             usleep(10000);
             m.set_result(-4);  // -EINTR
@@ -3350,6 +3533,17 @@ static void sys_epoll_pwait(Machine& m) {
         m.set_result(0);
         m.stop();
 #else
+        if (g_checkpoint_on_stdin) {
+            // Checkpoint mode: count consecutive idle epoll waits.
+            // After several idle polls, the system is truly idle (waiting for user input).
+            g_idle_epoll_count++;
+            if (g_idle_epoll_count >= IDLE_EPOLL_THRESHOLD) {
+                g_waiting_for_stdin = true;
+                m.cpu.increment_pc(-4);
+                m.stop();
+                return;
+            }
+        }
         {
             if (timeout > 0) {
                 int sleep_ms = std::min(timeout, 10);
@@ -4230,6 +4424,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::clock_gettime, sys_clock_gettime);
     machine.install_syscall_handler(nr::getrandom, sys_getrandom);
     machine.install_syscall_handler(nr::clone, sys_clone);
+    machine.install_syscall_handler(nr::clone3, sys_clone3);
     machine.install_syscall_handler(nr::execve, sys_execve);
     machine.install_syscall_handler(nr::wait4, sys_wait4);
     // brk: override to handle post-execve memory layout changes

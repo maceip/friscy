@@ -240,7 +240,7 @@
         // Called when user provides API key — starts the actual emulator
         function startEmulator(userApiKey) {
             if (!bootContext) return;
-            const { example, rootfs, netRPCHost } = bootContext;
+            const { example, rootfs, checkpointData, netRPCHost } = bootContext;
 
             // Build args — replace PLACEHOLDER API key with real one
             const envVars = (example.env || []).map(e =>
@@ -249,10 +249,10 @@
             const envArgs = envVars.flatMap(e => ['--env', e]);
             const args = [...envArgs, '--rootfs', '/rootfs.tar', ...(example.entrypoint || ['/bin/sh'])];
 
-            launchWorkerRun(args, rootfs);
+            launchWorkerRun(args, rootfs, checkpointData);
         }
 
-        function launchWorkerRun(args, rootfs) {
+        function launchWorkerRun(args, rootfs, checkpoint) {
             // Cache rootfs for potential shell restart
             cachedRootfs = rootfs.slice(0);
 
@@ -260,11 +260,19 @@
             pendingShellRestart = false;
             console.log('[friscy] launchWorkerRun args:', JSON.stringify(args));
             const rootfsArray = new Uint8Array(rootfs);
-            worker.postMessage({
+            const msg = {
                 type: 'run',
                 args,
                 rootfsData: rootfsArray.buffer,
-            }, [rootfsArray.buffer]);
+            };
+            const transfers = [rootfsArray.buffer];
+            if (checkpoint) {
+                const ckptArray = new Uint8Array(checkpoint);
+                msg.checkpointData = ckptArray.buffer;
+                transfers.push(ckptArray.buffer);
+                console.log('[friscy] Checkpoint attached:', checkpoint.byteLength, 'bytes');
+            }
+            worker.postMessage(msg, transfers);
 
             // Start polling (clear previous interval if any)
             if (pollInterval) clearInterval(pollInterval);
@@ -890,15 +898,27 @@
                 return;
             }
 
-            // Fetch rootfs
+            // Fetch rootfs + checkpoint in parallel
             term.writeln('\x1b[2m[friscy] Downloading rootfs...\x1b[0m');
-            const rootfsResp = await fetch(example.rootfs);
+            const fetchPromises = [fetch(example.rootfs)];
+            if (example.checkpoint) {
+                term.writeln('\x1b[2m[friscy] Downloading checkpoint...\x1b[0m');
+                fetchPromises.push(fetch(example.checkpoint));
+            }
+            const responses = await Promise.all(fetchPromises);
+            const rootfsResp = responses[0];
             if (!rootfsResp.ok) {
                 term.writeln('\x1b[31mError: failed to download rootfs\x1b[0m');
                 return;
             }
             const rootfs = await rootfsResp.arrayBuffer();
             term.writeln('\x1b[2m[friscy] Rootfs loaded (' + (rootfs.byteLength / 1048576).toFixed(1) + ' MB)\x1b[0m');
+
+            let checkpointData = null;
+            if (responses[1] && responses[1].ok) {
+                checkpointData = await responses[1].arrayBuffer();
+                term.writeln('\x1b[2m[friscy] Checkpoint loaded (' + (checkpointData.byteLength / 1048576).toFixed(1) + ' MB)\x1b[0m');
+            }
 
             // Allocate SABs
             controlSab = new SharedArrayBuffer(4096);
@@ -953,7 +973,7 @@
             }
 
             // Store boot context for startEmulator()
-            bootContext = { example, rootfs, netRPCHost };
+            bootContext = { example, rootfs, checkpointData, netRPCHost };
             console.log('[friscy] Boot complete. rootfs size:', rootfs.byteLength, 'detached:', rootfs.detached || false);
 
             // Show API key prompt — emulator starts when user provides key

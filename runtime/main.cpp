@@ -18,6 +18,7 @@
 #include "network.hpp"
 #include "vh_harness.hpp"
 #include "elf_loader.hpp"
+#include "checkpoint.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -554,6 +555,8 @@ int main(int argc, char** argv) {
     std::string rootfs_path;
     std::string entry_path;
     std::string export_tar_path;
+    std::string export_checkpoint_path;
+    std::string load_checkpoint_path;
     std::vector<std::string> guest_args;
     std::vector<std::string> extra_env;
     bool container_mode = false;
@@ -580,6 +583,18 @@ int main(int argc, char** argv) {
                 return 1;
             }
             export_tar_path = argv[++i];
+        } else if (strcmp(argv[i], "--export-checkpoint") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --export-checkpoint requires <path>\n";
+                return 1;
+            }
+            export_checkpoint_path = argv[++i];
+        } else if (strcmp(argv[i], "--load-checkpoint") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --load-checkpoint requires <path>\n";
+                return 1;
+            }
+            load_checkpoint_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -1079,6 +1094,34 @@ int main(int argc, char** argv) {
             m.set_result(-38);  // ENOSYS
         };
 
+        // --- Checkpoint load: restore full machine state, skip straight to resume ---
+        if (!load_checkpoint_path.empty()) {
+            fprintf(stderr, "[friscy] Loading checkpoint from: %s\n", load_checkpoint_path.c_str());
+            checkpoint::load_checkpoint_file(machine, load_checkpoint_path);
+            fprintf(stderr, "[friscy] Checkpoint loaded, machine ready at stdin wait.\n");
+#ifdef __EMSCRIPTEN__
+            g_machine = &machine;
+            // Return to JS — friscy_resume() will drive further execution.
+            return 0;
+#else
+            // Native: fall through to the simulate loop.
+            // g_waiting_for_stdin is already set by load_checkpoint.
+            // The next simulate() call will re-enter from where we left off.
+            // But first we need to clear it so simulate can run, then the
+            // guest will re-issue the read syscall and set it again.
+            syscalls::g_waiting_for_stdin = false;
+            std::cout << "[friscy] Resuming from checkpoint...\n";
+            std::cout << "----------------------------------------\n";
+            // Skip the initial simulate — go straight to the loop
+            goto simulate_loop;
+#endif
+        }
+
+        // Enable checkpoint-on-stdin mode if exporting a checkpoint
+        if (!export_checkpoint_path.empty()) {
+            syscalls::g_checkpoint_on_stdin = true;
+        }
+
         std::cout << "[friscy] Starting execution...\n";
         std::cout << "----------------------------------------\n";
 
@@ -1090,6 +1133,7 @@ int main(int argc, char** argv) {
         // 2. Stdin wait (g_waiting_for_stdin — JS calls friscy_resume)
         // 3. execve (loads new binary, stops to break out of dispatch safely)
         // 4. Page fault (MachineException — retry after fixing permissions)
+        simulate_loop:
         for (int retries = 0; retries < 8; retries++) {
             try {
 #ifdef __EMSCRIPTEN__
@@ -1115,6 +1159,15 @@ int main(int argc, char** argv) {
                 }
 #else
                 machine.simulate(MAX_INSTRUCTIONS);
+                // Checkpoint export: save state when machine first waits for stdin
+                if (syscalls::g_waiting_for_stdin && !export_checkpoint_path.empty()) {
+                    fprintf(stderr, "[friscy] Saving checkpoint at stdin wait point...\n");
+                    auto [instr, _] = machine.get_counters();
+                    fprintf(stderr, "[friscy] Instructions executed: %lu\n", (unsigned long)instr);
+                    checkpoint::save_checkpoint_file(machine, export_checkpoint_path);
+                    fprintf(stderr, "[friscy] Checkpoint saved, exiting.\n");
+                    return 0;
+                }
                 // After execve, machine.stop() causes simulate to return
                 // with m_max_counter=0. instruction_limit_reached() returns
                 // false (it requires m_max_counter!=0). Use our own flag.

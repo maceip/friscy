@@ -928,11 +928,13 @@
 
             // Network bridge (same auto-detection as index.html)
             const DEFAULT_PROXY = 'https://78.141.219.102:4433/connect';
+            const DEFAULT_PROXY_CERT_HASH = '5B7pqn+Adpph4cKEidlzVG58dhaY1nZ8Dp4M0f4Wic4=';
             const proxyUrl = params.has('noproxy') ? null
                 : params.get('proxy')
                   || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
                       ? `https://${location.hostname}:4433/connect` : DEFAULT_PROXY);
-            const proxyCertHash = params.get('proxycert') || null;
+            const proxyCertHash = params.get('proxycert')
+                || (proxyUrl ? DEFAULT_PROXY_CERT_HASH : null);
             const coloredWorkers = params.get('colored') === '1';
             let netBridge = null, netRPCHost = null;
             if (proxyUrl) {

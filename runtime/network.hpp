@@ -294,7 +294,7 @@ inline void sys_bind(Machine& m) {
 
         int result = EM_ASM_INT({
             if (typeof Module.onSocketBind === 'function') {
-                const addr = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                const addr = new Uint8Array(Module.HEAPU8.buffer, Number($1), Number($2));
                 return Module.onSocketBind($0, addr);
             }
             return 0;
@@ -627,7 +627,7 @@ inline void sys_connect(Machine& m) {
     // Send connect request to JS bridge
     int result = EM_ASM_INT({
         if (typeof Module.onSocketConnect === 'function') {
-            const addr = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+            const addr = new Uint8Array(Module.HEAPU8.buffer, Number($1), Number($2));
             return Module.onSocketConnect($0, addr);
         }
         return -38;  // ENOSYS
@@ -688,7 +688,7 @@ inline void sys_sendto(Machine& m) {
 #ifdef __EMSCRIPTEN__
     int result = EM_ASM_INT({
         if (typeof Module.onSocketSend === 'function') {
-            const data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+            const data = new Uint8Array(Module.HEAPU8.buffer, Number($1), Number($2));
             return Module.onSocketSend($0, data);
         }
         return -38;
@@ -744,11 +744,12 @@ inline void sys_recvfrom(Machine& m) {
         if (typeof Module.readSocketData !== 'function') return 0;
         var result = Module.readSocketData($0, $1);
         if (!result || result.length === 0) return 0;
+        var off = Number($2);
         for (var i = 0; i < result.length; i++) {
-            Module.HEAPU8[$2 + i] = result[i];
+            Module.HEAPU8[off + i] = result[i];
         }
         return result.length;
-    }, sockfd, (int)len, (int)(uintptr_t)view.data());
+    }, sockfd, (int)len, view.data());
 
     if (bytes_read > 0) {
         m.set_result(bytes_read);

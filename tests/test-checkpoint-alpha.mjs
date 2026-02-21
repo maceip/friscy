@@ -83,7 +83,7 @@ try {
 console.log(JSON.stringify({ pass: true, loadMs, resumeCount, resumeMs: Date.now() - t1, stopped: mod._friscy_stopped(), output: output.slice(0, 5) }));
 `;
 
-    const tmpScript = '/tmp/alpha-test1.mjs';
+    const tmpScript = resolve(PROJECT, 'tests', '.alpha-test1.mjs');
     writeFileSync(tmpScript, script);
 
     return new Promise((resolve) => {
@@ -133,7 +133,7 @@ async function testBrowserCheckpoint() {
         if (!resp.ok) throw new Error('Server not responding');
     } catch {
         log('Starting local server...');
-        serverProc = spawn('node', ['serve.js'], { cwd: BUNDLE, stdio: 'ignore', detached: true });
+        serverProc = spawn('node', ['serve.js', '9090'], { cwd: BUNDLE, stdio: 'ignore', detached: true });
         serverProc.unref();
         await new Promise(r => setTimeout(r, 2000));
     }

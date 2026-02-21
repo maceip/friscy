@@ -229,14 +229,17 @@ inline std::vector<uint8_t> save_checkpoint(Machine& machine) {
 // ============================================================================
 // save_checkpoint to file (convenience wrapper)
 // ============================================================================
-inline void save_checkpoint_file(Machine& machine, const std::string& path) {
-    auto data = save_checkpoint(machine);
+inline void save_checkpoint_file(const std::vector<uint8_t>& data, const std::string& path) {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) throw std::runtime_error("checkpoint: cannot open " + path + " for writing");
     size_t written = fwrite(data.data(), 1, data.size(), f);
     fclose(f);
     if (written != data.size()) throw std::runtime_error("checkpoint: write failed");
     fprintf(stderr, "[checkpoint] Written %zu bytes to %s\n", data.size(), path.c_str());
+}
+
+inline void save_checkpoint_file(Machine& machine, const std::string& path) {
+    save_checkpoint_file(save_checkpoint(machine), path);
 }
 
 // ============================================================================

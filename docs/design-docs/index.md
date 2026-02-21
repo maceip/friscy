@@ -8,6 +8,7 @@ Architecture Decision Records, newest first.
 | 002 | RISC-V as target ISA | Accepted | 2025-01 |
 | 003 | libriscv as interpreter core | Accepted | 2025-01 |
 | 004 | Emscripten over hand-rolled Wasm | Accepted | 2025-01 |
+| 005 | Checkpoint as linear memory transplant | Accepted | 2026-02 |
 
 ## How to add a new ADR
 

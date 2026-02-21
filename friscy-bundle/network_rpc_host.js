@@ -16,10 +16,15 @@ export class NetworkRPCHost {
         this.proxyUrl = options.proxyUrl || null;
         this.certHash = options.certHash || null;
         this.queueMax = Number.isInteger(options.queueMax) && options.queueMax > 0 ? options.queueMax : 128;
+        this.faultAfterRpcCount = Number.isInteger(options.faultAfterRpcCount) && options.faultAfterRpcCount >= 0
+            ? options.faultAfterRpcCount
+            : null;
         this.laneWorker = null;
         this.laneReady = false;
+        this.injectedFault = false;
         this.pending = new Map();
         this.nextReqId = 1;
+        this.totalRequests = 0;
         this.metrics = {
             queueDepth: 0,
             queueDepthPeak: 0,
@@ -29,6 +34,7 @@ export class NetworkRPCHost {
             laneActive: false,
             fallbackCount: 0,
             backpressureDrops: 0,
+            laneFaults: 0,
         };
     }
 
@@ -46,6 +52,7 @@ export class NetworkRPCHost {
             const arg1 = Atomics.load(this.netView, 3);
             const arg2 = Atomics.load(this.netView, 4);
             const dataLen = Atomics.load(this.netView, 6);
+            this.totalRequests++;
 
             let result = -38; // ENOSYS
             let respData = null;
@@ -53,6 +60,21 @@ export class NetworkRPCHost {
 
             try {
                 const payload = dataLen > 0 ? this.netBytes.slice(NET_HEADER, NET_HEADER + dataLen) : null;
+                if (
+                    this.laneReady &&
+                    !this.injectedFault &&
+                    this.faultAfterRpcCount !== null &&
+                    this.totalRequests > this.faultAfterRpcCount
+                ) {
+                    this.injectedFault = true;
+                    this.metrics.laneFaults++;
+                    if (this.laneWorker) {
+                        this.laneWorker.terminate();
+                        this.laneWorker = null;
+                    }
+                    this.laneReady = false;
+                    this.metrics.laneActive = false;
+                }
                 if (this.laneReady) {
                     if (this.pending.size >= this.queueMax) {
                         this.metrics.backpressureDrops++;

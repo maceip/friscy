@@ -15,6 +15,8 @@
 #include <unordered_map>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+// VectorHeart JSPI import — implemented in library_vectorheart.js
+extern "C" long js_opfs_io(int fd, void* buf, size_t len, int op, long off);
 #else
 #include <sys/socket.h>
 #include <poll.h>
@@ -157,6 +159,11 @@ struct TermiosState {
 inline TermiosState g_termios;
 // Track which fds are tty fds (0/1/2 are always tty; /dev/tty opens add more)
 inline std::set<int> g_tty_fds = {0, 1, 2};
+// fcntl per-fd state
+// - F_GETFD / F_SETFD -> g_fd_cloexec_flags (FD_CLOEXEC bit)
+// - F_GETFL / F_SETFL -> g_fd_status_flags (O_* status flags)
+inline std::unordered_map<int, int> g_fd_cloexec_flags;
+inline std::unordered_map<int, int> g_fd_status_flags;
 
 // Cooperative thread scheduler for CLONE_THREAD.
 // When clone creates a thread, we save the parent's state and let the child
@@ -456,6 +463,7 @@ constexpr int O_CREAT = 0100;
 constexpr int O_EXCL = 0200;
 constexpr int O_TRUNC = 01000;
 constexpr int O_APPEND = 02000;
+constexpr int O_NONBLOCK = 04000;
 constexpr int O_DIRECTORY = 0200000;
 constexpr int O_CLOEXEC = 02000000;
 
@@ -1492,7 +1500,8 @@ static void sys_openat(Machine& m) {
     }
 
     // Intercept /mnt/host access for local folder sharing
-    if (path.startsWith("/mnt/host/")) {
+#ifdef __EMSCRIPTEN__
+    if (path.size() >= 10 && path.compare(0, 10, "/mnt/host/") == 0) {
         // Redirect to VectorHeart hypercall 600
         std::string vh_path = path;
         if (flags & O_DIRECTORY) vh_path += "/";
@@ -1500,12 +1509,17 @@ static void sys_openat(Machine& m) {
         m.set_result(vh_fd);
         return;
     }
+#endif
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
     // Track /dev/tty and /dev/pts/* opens as tty fds for ioctl
     if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
                     || path.rfind("/dev/pts/", 0) == 0)) {
         g_tty_fds.insert(fd);
+    }
+    if (fd >= 0) {
+        g_fd_cloexec_flags[fd] = (flags & O_CLOEXEC) ? 1 : 0;
+        g_fd_status_flags[fd] = flags;
     }
     m.set_result(fd);
 }
@@ -1516,6 +1530,8 @@ static void sys_close(Machine& m) {
         fprintf(stderr, "[TRACE] close(fd=%d) pc=0x%lx\n", fd, (long)m.cpu.pc());
     // Remove from tty tracking (but never remove 0/1/2)
     if (fd > 2) g_tty_fds.erase(fd);
+    g_fd_cloexec_flags.erase(fd);
+    g_fd_status_flags.erase(fd);
     // Clean up epoll/eventfd state
     g_epoll_instances.erase(fd);
     g_eventfd_counters.erase(fd);
@@ -1589,9 +1605,10 @@ static void sys_read(Machine& m) {
     }
 
     // If fd has been redirected (e.g. dup2'd to a pipe), try VFS first.
-    // In Emscripten mode, if the VFS pipe is empty (n <= 0), fall through
-    // to the Module._stdinBuffer mechanism — libuv does pipe2+dup2 on fd 0
-    // but nothing writes to that pipe; real stdin comes via SAB.
+    // If that source is empty, fall back to the host stdin source:
+    // - Emscripten: Module._stdinBuffer
+    // - Native: real STDIN_FILENO
+    // This avoids getting stuck on an empty internal pipe after restore.
     if (fd == 0 && fs.is_open(fd)) {
         std::vector<uint8_t> buf(count);
         ssize_t n = fs.read(fd, buf.data(), count);
@@ -1600,11 +1617,7 @@ static void sys_read(Machine& m) {
             m.set_result(n);
             return;
         }
-#ifndef __EMSCRIPTEN__
-        m.set_result(n);
-        return;
-#endif
-        // Emscripten: fall through to Module._stdinBuffer below
+        // Fall through to stdin source below.
     }
 
     if (fd == 0) {
@@ -1614,9 +1627,10 @@ static void sys_read(Machine& m) {
         auto view = m.memory.memview(buf_addr, count);
         int bytes_read = EM_ASM_INT({
             if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
-                var toRead = Math.min($1, Module._stdinBuffer.length);
+                var off = Number($0);
+                var toRead = Math.min(Number($1), Module._stdinBuffer.length);
                 for (var i = 0; i < toRead; i++) {
-                    Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
+                    Module.HEAPU8[off + i] = Module._stdinBuffer.shift();
                 }
                 return toRead;
             }
@@ -1662,11 +1676,12 @@ static void sys_read(Machine& m) {
             if (typeof Module.readSocketData !== 'function') return 0;
             var result = Module.readSocketData($0, $1);
             if (!result || result.length === 0) return 0;
+            var off = Number($2);
             for (var i = 0; i < result.length; i++) {
-                Module.HEAPU8[$2 + i] = result[i];
+                Module.HEAPU8[off + i] = result[i];
             }
             return result.length;
-        }, fd, (int)count, (int)(uintptr_t)view.data());
+        }, fd, (int)count, view.data());
         fprintf(stderr, "[read-socket] fd=%d len=%zu bytes_read=%d\n", fd, count, bytes_read);
         m.set_result(bytes_read > 0 ? bytes_read : -11 /*EAGAIN*/);
         return;
@@ -1807,7 +1822,7 @@ static void sys_write(Machine& m) {
         m.memory.memcpy_out(buf.data(), buf_addr, count);
         int result = EM_ASM_INT({
             if (typeof Module.onSocketSend === 'function') {
-                var data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                var data = new Uint8Array(Module.HEAPU8.buffer, Number($1), Number($2));
                 return Module.onSocketSend($0, data);
             }
             return -38;
@@ -1898,7 +1913,7 @@ static void sys_writev(Machine& m) {
                 m.memory.memcpy_out(buf.data(), base, len);
                 int result = EM_ASM_INT({
                     if (typeof Module.onSocketSend === 'function') {
-                        var data = new Uint8Array(Module.HEAPU8.buffer, $1, $2);
+                        var data = new Uint8Array(Module.HEAPU8.buffer, Number($1), Number($2));
                         return Module.onSocketSend($0, data);
                     }
                     return -38;
@@ -2787,6 +2802,13 @@ static void sys_fcntl(Machine& m) {
     constexpr int F_GETFL = 3;
     constexpr int F_SETFL = 4;
     constexpr int F_DUPFD_CLOEXEC = 1030;
+    constexpr int FD_CLOEXEC = 1;
+
+    auto get_default_status = [](int f) {
+        if (f == 0) return O_RDONLY;
+        if (f == 1 || f == 2) return O_WRONLY;
+        return O_RDWR;
+    };
 
     switch (cmd) {
         case F_DUPFD:
@@ -2795,6 +2817,8 @@ static void sys_fcntl(Machine& m) {
             if (g_epoll_instances.count(fd)) {
                 int newfd = g_next_epoll_fd++;
                 g_epoll_instances[newfd] = g_epoll_instances[fd];
+                g_fd_cloexec_flags[newfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : g_fd_cloexec_flags[fd];
+                g_fd_status_flags[newfd] = g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd);
                 fprintf(stderr, "[fcntl] F_DUPFD epoll fd=%d -> newfd=%d\n", fd, newfd);
                 m.set_result(newfd);
                 return;
@@ -2803,6 +2827,10 @@ static void sys_fcntl(Machine& m) {
             if (g_eventfd_counters.count(fd)) {
                 int newfd = fs.dup(fd);
                 if (newfd >= 0) g_eventfd_counters[newfd] = g_eventfd_counters[fd];
+                if (newfd >= 0) {
+                    g_fd_cloexec_flags[newfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : g_fd_cloexec_flags[fd];
+                    g_fd_status_flags[newfd] = g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd);
+                }
                 m.set_result(newfd);
                 return;
             }
@@ -2810,26 +2838,36 @@ static void sys_fcntl(Machine& m) {
             // Propagate tty status to new fd
             if (newfd >= 0 && g_tty_fds.count(fd))
                 g_tty_fds.insert(newfd);
+            if (newfd >= 0) {
+                g_fd_cloexec_flags[newfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : g_fd_cloexec_flags[fd];
+                g_fd_status_flags[newfd] = g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd);
+            }
             m.set_result(newfd);
             return;
         }
         case F_GETFD:
-            m.set_result(0);
+            m.set_result(g_fd_cloexec_flags.count(fd) ? g_fd_cloexec_flags[fd] : 0);
             return;
         case F_SETFD:
+            g_fd_cloexec_flags[fd] = (m.template sysarg<int>(2) & FD_CLOEXEC) ? FD_CLOEXEC : 0;
             m.set_result(0);
             return;
         case F_GETFL:
-            m.set_result((fd == 1 || fd == 2) ? 1 : 0);
+            m.set_result(g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd));
             return;
         case F_SETFL: {
 #ifndef __EMSCRIPTEN__
             // For socket FDs, forward nonblocking flag to the real socket
             if (net_is_socket_fd(fd) && net_set_nonblock) {
                 int arg = m.template sysarg<int>(2);
-                net_set_nonblock(fd, (arg & 0x800) != 0);
+                net_set_nonblock(fd, (arg & O_NONBLOCK) != 0);
             }
 #endif
+            // Only status flags should change with F_SETFL; preserve access mode bits.
+            int arg = m.template sysarg<int>(2);
+            int old_flags = g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd);
+            int access_mode = old_flags & 0x3;
+            g_fd_status_flags[fd] = access_mode | (arg & ~0x3);
             m.set_result(0);
             return;
         }
@@ -2844,7 +2882,17 @@ static void sys_fcntl(Machine& m) {
 // Without this, musl falls back to looping over all fds up to RLIMIT_NOFILE.
 static void sys_close_range(Machine& m) {
     // Flags: CLOSE_RANGE_CLOEXEC=2 sets FD_CLOEXEC, CLOSE_RANGE_UNSHARE=4
-    // We accept the call as a no-op — our emulated fds don't need cloexec marking.
+    uint32_t first = m.template sysarg<uint32_t>(0);
+    uint32_t last = m.template sysarg<uint32_t>(1);
+    uint32_t flags = m.template sysarg<uint32_t>(2);
+    const uint32_t kCloseRangeCloexecFlag = 2;
+    if (flags & kCloseRangeCloexecFlag) {
+        if (last == UINT32_MAX) last = 65535;
+        for (uint32_t fd = first; fd <= last; fd++) {
+            g_fd_cloexec_flags[(int)fd] = 1;
+            if (fd == UINT32_MAX) break;
+        }
+    }
     m.set_result(0);
 }
 
@@ -2855,6 +2903,11 @@ static void sys_dup(Machine& m) {
     // Propagate tty status to new fd
     if (result >= 0 && g_tty_fds.count(oldfd))
         g_tty_fds.insert(result);
+    if (result >= 0) {
+        g_fd_cloexec_flags[result] = 0;  // dup() clears FD_CLOEXEC on new descriptor
+        g_fd_status_flags[result] = g_fd_status_flags.count(oldfd) ? g_fd_status_flags[oldfd]
+                                                                    : ((oldfd == 0) ? O_RDONLY : ((oldfd == 1 || oldfd == 2) ? O_WRONLY : O_RDWR));
+    }
     m.set_result(result);
 }
 
@@ -2873,6 +2926,9 @@ static void sys_dup3(Machine& m) {
             g_tty_fds.insert(newfd);
         else if (newfd > 2)
             g_tty_fds.erase(newfd);  // dup'd non-tty over a tty fd
+        g_fd_cloexec_flags[newfd] = 0;  // dup2() clears FD_CLOEXEC on target fd
+        g_fd_status_flags[newfd] = g_fd_status_flags.count(oldfd) ? g_fd_status_flags[oldfd]
+                                                                   : ((oldfd == 0) ? O_RDONLY : ((oldfd == 1 || oldfd == 2) ? O_WRONLY : O_RDWR));
     }
     m.set_result(result);
 }
@@ -2880,6 +2936,12 @@ static void sys_dup3(Machine& m) {
 static void sys_pipe2(Machine& m) {
     auto& fs = get_fs(m);
     auto pipefd_addr = m.sysarg(0);
+    int flags = m.template sysarg<int>(1);
+    int allowed_flags = O_CLOEXEC | O_NONBLOCK;
+    if ((flags & ~allowed_flags) != 0) {
+        m.set_result(err::INVAL);
+        return;
+    }
 
     // Create a pipe using two connected in-memory file handles
     // Write end writes to a shared buffer, read end reads from it
@@ -2891,10 +2953,20 @@ static void sys_pipe2(Machine& m) {
     // Allocate two fds - read end and write end
     int read_fd = fs.open_pipe(pipe_entry, 0);
     int write_fd = fs.open_pipe(pipe_entry, 1);
+    if (read_fd < 0 || write_fd < 0) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    int cloexec = (flags & O_CLOEXEC) ? 1 : 0;
+    int nonblock = (flags & O_NONBLOCK) ? O_NONBLOCK : 0;
+    g_fd_cloexec_flags[read_fd] = cloexec;
+    g_fd_cloexec_flags[write_fd] = cloexec;
+    g_fd_status_flags[read_fd] = O_RDONLY | nonblock;
+    g_fd_status_flags[write_fd] = O_WRONLY | nonblock;
 
     int32_t fds[2] = { read_fd, write_fd };
     m.memory.memcpy(pipefd_addr, fds, sizeof(fds));
-    fprintf(stderr, "[pipe2] => read=%d write=%d\n", read_fd, write_fd);
+    fprintf(stderr, "[pipe2] flags=0x%x => read=%d write=%d\n", flags, read_fd, write_fd);
     m.set_result(0);
 }
 
@@ -2910,8 +2982,9 @@ static void sys_readv(Machine& m) {
     }
 
     // If fd 0 has been redirected (e.g. dup2'd to a pipe), try VFS first.
-    // In Emscripten mode, if the VFS pipe is empty, fall through to
-    // Module._stdinBuffer — libuv does pipe2+dup2 but real stdin comes via SAB.
+    // If that source is empty, fall through to stdin source below.
+    // - Emscripten: Module._stdinBuffer
+    // - Native: real STDIN_FILENO
     if (fd == 0 && fs.is_open(fd)) {
         size_t total = 0;
         for (int i = 0; i < iovcnt; i++) {
@@ -2935,11 +3008,7 @@ static void sys_readv(Machine& m) {
             m.set_result(total);
             return;
         }
-#ifndef __EMSCRIPTEN__
-        m.set_result(0);
-        return;
-#endif
-        // Emscripten: fall through to Module._stdinBuffer below
+        // Fall through to stdin source below.
     }
 
     if (fd == 0) {
@@ -2969,9 +3038,10 @@ static void sys_readv(Machine& m) {
                 auto view = m.memory.memview(base, len);
                 int bytes_read = EM_ASM_INT({
                     if (Module._stdinBuffer && Module._stdinBuffer.length > 0) {
-                        var toRead = Math.min($1, Module._stdinBuffer.length);
+                        var off = Number($0);
+                        var toRead = Math.min(Number($1), Module._stdinBuffer.length);
                         for (var i = 0; i < toRead; i++) {
-                            Module.HEAPU8[$0 + i] = Module._stdinBuffer.shift();
+                            Module.HEAPU8[off + i] = Module._stdinBuffer.shift();
                         }
                         return toRead;
                     }
@@ -3289,19 +3359,28 @@ static void sys_ppoll(Machine& m) {
     } else if (zero_timeout) {
         m.set_result(0);
     } else if (needs_stdin) {
-        // No data on stdin — stop and let JS resume when data arrives
+#ifdef __EMSCRIPTEN__
+        // Browser: no stdin data yet, cooperatively yield and retry same ecall.
         g_waiting_for_stdin = true;
         m.cpu.increment_pc(-4);
         m.stop();
+#else
+        // Native: block briefly and report timeout-style no events.
+        // Do not stop/replay the same ecall — that can strand restored checkpoints.
+        struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+        ::poll(&pfd, 1, 10);
+        m.set_result(0);
+#endif
     } else {
-        // Nothing ready and no stdin to wait for.
-        // This happens when the shell polls for signals (SIGCHLD)
-        // after a fork+wait cycle. Without stopping, this creates
-        // a spin loop consuming billions of instructions.
-        // Treat as a stdin-wait so the JS event loop can process.
+#ifdef __EMSCRIPTEN__
+        // Browser: yield to event loop when no FDs are ready.
         g_waiting_for_stdin = true;
         m.cpu.increment_pc(-4);
         m.stop();
+#else
+        // Native: avoid hard stop; return no events and let guest progress.
+        m.set_result(0);
+#endif
     }
 }
 
@@ -4174,6 +4253,18 @@ static void sys_kill(Machine& m) {
 static void sys_tkill(Machine& m) {
     int sig = m.template sysarg<int>(1);
     if (sig == 6) { // SIGABRT
+#ifdef __EMSCRIPTEN__
+        // During browser checkpoint export we need to keep progressing until the
+        // stdin-wait checkpoint point. Some guest abort paths intentionally emit
+        // EBREAK after tkill(SIGABRT); skip that by returning directly to caller.
+        if (g_checkpoint_on_stdin) {
+            uint64_t ra = m.cpu.reg(1);
+            fprintf(stderr, "[ABORT] Intercept SIGABRT in checkpoint mode: jump RA=0x%lx\n", (long)ra);
+            m.cpu.jump(ra);
+            m.set_result(0);
+            return;
+        }
+#endif
         // Dump machine state on crash
         static bool dumped = false;
         if (!dumped) {
@@ -4189,16 +4280,19 @@ static void sys_tkill(Machine& m) {
                 fprintf(stderr, "  x%d=0x%lx", r, (long)m.cpu.reg(r));
         }
         fprintf(stderr, "\n");
-        // Try to read strings from registers that might be message pointers
+        // Try to read strings from registers that might be message pointers.
+        // IMPORTANT: sanitize to printable ASCII before fprintf("%s") so
+        // Emscripten's UTF-8 decoding never aborts on arbitrary guest bytes.
         for (int r : {10, 11, 12, 13, 14, 15}) {
             auto addr = m.cpu.reg(r);
             if (addr > 0x10000 && addr < 0x1FFFFFFF) {
                 try {
                     char buf[256] = {};
                     for (int i = 0; i < 255; i++) {
-                        buf[i] = m.memory.template read<char>(addr + i);
-                        if (buf[i] == 0) break;
-                        if ((unsigned char)buf[i] < 32 && buf[i] != '\n' && buf[i] != '\t') { buf[i] = 0; break; }
+                        unsigned char ch = static_cast<unsigned char>(m.memory.template read<char>(addr + i));
+                        if (ch == 0) break;
+                        // Keep printable ASCII; replace everything else.
+                        buf[i] = (ch >= 32 && ch <= 126) ? static_cast<char>(ch) : '?';
                     }
                     if (buf[0]) fprintf(stderr, "  x%d string: \"%s\"\n", r, buf);
                 } catch (...) {}

@@ -36,6 +36,9 @@ aot/target/
 target/
 aot/Cargo.lock
 
+# Alpha test temp script
+tests/.alpha-test1.mjs
+
 # Test binaries and tarballs (built locally)
 tests/test_http
 tests/test_http_minimal

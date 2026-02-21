@@ -23,6 +23,13 @@ mergeInto(LibraryManager.library, {
     files: new Map(),
     sockets: new Map()
   },
+  $vhDecodeBytes: function(ptr, len) {
+    const p = Number(ptr);
+    const n = Math.max(0, Number(len));
+    const bytes = new Uint8Array(HEAPU8.buffer, p, n);
+    // Tolerant decode: avoids UTF8ToString assertion aborts on non-text bytes.
+    return new TextDecoder().decode(bytes);
+  },
 
   // ========================================================================
   // [600s] FS / OPFS — Async (JSPI-suspended)
@@ -34,6 +41,7 @@ mergeInto(LibraryManager.library, {
   js_opfs_io__deps: ['$vhState'],
   js_opfs_io: async function(fd, ptr, len, op, off) {
     try {
+      fd = Number(fd); ptr = Number(ptr); len = Number(len); op = Number(op); off = Number(off);
       if (op === 600) { // Open
         var fullPath = UTF8ToString(ptr);
         var handle;
@@ -48,7 +56,7 @@ mergeInto(LibraryManager.library, {
                 if (!parts[i]) continue;
                 dir = await dir.getDirectoryHandle(parts[i]);
             }
-            handle = await dir.getFileHandle(parts[parts.length - 1], { create: (len & 0100) !== 0 }); // O_CREAT check
+            handle = await dir.getFileHandle(parts[parts.length - 1], { create: (len & 0o100) !== 0 }); // O_CREAT check
         } else {
             // Standard OPFS Access
             var root = await navigator.storage.getDirectory();
@@ -94,7 +102,7 @@ mergeInto(LibraryManager.library, {
         // st_mode (offset 16): 4 bytes
         // st_size (offset 48): 8 bytes
         var view = new DataView(HEAPU8.buffer, ptr, len);
-        view.setUint32(16, entry.isDir ? 0040755 : 0100644, true);
+        view.setUint32(16, entry.isDir ? 0o40755 : 0o100644, true);
         view.setBigUint64(48, BigInt(size), true);
         return 0;
       }
@@ -152,9 +160,10 @@ mergeInto(LibraryManager.library, {
   // on read, if a complete request was buffered (\r\n\r\n), performs
   // fetch() and returns response body chunks.
   // ========================================================================
-  js_net_proxy__deps: ['$vhState'],
+  js_net_proxy__deps: ['$vhState', '$vhDecodeBytes'],
   js_net_proxy: async function(fd, ip_ptr, port, op, buf_ptr, len) {
     try {
+      fd = Number(fd); ip_ptr = Number(ip_ptr); port = Number(port); op = Number(op); buf_ptr = Number(buf_ptr); len = Number(len);
       if (op === 800) { // Connect
         var synthFd = 500 + (fd % 100);
         vhState.sockets.set(synthFd, {
@@ -170,7 +179,7 @@ mergeInto(LibraryManager.library, {
       if (!s) return -9; // EBADF
 
       if (op === 802) { // Write (buffer request)
-        s.req += UTF8ToString(buf_ptr, len);
+        s.req += vhDecodeBytes(buf_ptr, len);
         if (s.req.includes('\r\n\r\n')) {
           var r = await fetch(s.url);
           s.res = new Uint8Array(await r.arrayBuffer());
@@ -181,7 +190,7 @@ mergeInto(LibraryManager.library, {
       if (op === 803) { // Read (return response body)
         if (!s.res) return 0;
         var chunk = s.res.subarray(s.pos, s.pos + len);
-        new Uint8Array(HEAPU8.buffer, buf_ptr, chunk.length).set(chunk);
+        new Uint8Array(HEAPU8.buffer, buf_ptr, Number(chunk.length)).set(chunk);
         s.pos += chunk.length;
         return chunk.length;
       }
@@ -201,6 +210,8 @@ mergeInto(LibraryManager.library, {
   // ========================================================================
   js_dns_resolve: async function(host_ptr, host_len, ip_buf_ptr, ip_buf_len, port) {
     try {
+      host_ptr = Number(host_ptr); host_len = Number(host_len);
+      ip_buf_ptr = Number(ip_buf_ptr); ip_buf_len = Number(ip_buf_len); port = Number(port);
       var hostname = UTF8ToString(host_ptr, host_len);
 
       // Fast path: well-known hosts
@@ -240,7 +251,9 @@ mergeInto(LibraryManager.library, {
   //
   // Op codes: 705=getrandom, 703=memmove, 708=json_parse
   // ========================================================================
+  js_compute_offload__deps: ['$vhDecodeBytes'],
   js_compute_offload: function(op, p1, l1, p2, l2) {
+    op = Number(op); p1 = Number(p1); l1 = Number(l1); p2 = Number(p2); l2 = Number(l2);
     var mem = HEAPU8.buffer;
 
     if (op === 705) { // getrandom
@@ -261,7 +274,7 @@ mergeInto(LibraryManager.library, {
     if (op === 708) { // JSON Teleportation
       try {
         // 1. Host-side native parse (JIT-accelerated V8, 10-100x faster than jitless guest)
-        var jsonStr = UTF8ToString(p1, l1);
+        var jsonStr = vhDecodeBytes(p1, l1);
         var obj = JSON.parse(jsonStr);
 
         // 2. Minify and re-encode — strips whitespace, normalizes escapes,
@@ -288,7 +301,7 @@ mergeInto(LibraryManager.library, {
 
   // ========================================================================
   // Time — Sync (NOT on JSPI_IMPORTS)
-  // Returns Date.now() as BigInt (-sWASM_BIGINT=1 required)
+  // Returns Date.now() as BigInt for int64_t on C++ side.
   // ========================================================================
   js_gettime_ms: function() {
     return BigInt(Date.now());

@@ -114,6 +114,12 @@ target_link_libraries(friscy PUBLIC riscv)
 # Include directories for our headers
 target_include_directories(friscy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Overlay/VFS mutation roundtrip self-test (native only)
+if(NOT EMSCRIPTEN)
+    add_executable(vfs_overlay_selftest vfs_overlay_selftest.cpp)
+    target_include_directories(vfs_overlay_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 # --- Compile flags ---
 if(FRISCY_PRODUCTION)
     # Maximum performance for production
@@ -186,7 +192,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)

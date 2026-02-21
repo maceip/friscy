@@ -25,6 +25,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cstdlib>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #else
@@ -66,6 +67,9 @@ static void setup_virtual_files();
 // Global machine pointer for JS interop (stdin resume loop)
 #ifdef __EMSCRIPTEN__
 static Machine* g_machine = nullptr;
+#ifdef __EMSCRIPTEN__
+static std::vector<uint8_t> g_last_checkpoint_export;
+#endif
 
 extern "C" {
 // Returns 1 if machine is stopped waiting for stdin, 0 otherwise.
@@ -109,6 +113,7 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             }
             return friscy_stopped();
         } catch (const riscv::MachineException& e) {
+            std::cerr << "[trace] resume-machine-exception-catch\n";
             uint64_t fault_addr = e.data();
             std::cerr << "[resume] MachineException: " << e.what()
                       << " data=0x" << std::hex << fault_addr
@@ -117,8 +122,11 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             // the current function (set PC = RA). Common after fork child cleanup.
             if (std::string(e.what()).find("EBREAK") != std::string::npos) {
                 uint64_t ra = g_machine->cpu.reg(1);
-                std::cerr << "[resume] EBREAK: skipping, RA=0x"
-                          << std::hex << ra << std::dec << "\n";
+                std::cerr << "[resume] EBREAK: branch-entered, PC=0x"
+                          << std::hex << g_machine->cpu.pc()
+                          << " RA=0x" << ra
+                          << " SP=0x" << g_machine->cpu.reg(2)
+                          << std::dec << "\n";
                 g_machine->cpu.jump(ra);
                 continue;
             }
@@ -138,7 +146,7 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             EM_ASM({
                 if (typeof Module._termWrite === 'function') {
                     Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
-                        UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                        UTF8ToString(Number($0)) + ' (data: 0x' + ($1).toString(16) +
                         ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
                 }
             }, e.what(), (uint32_t)e.data(), (uint32_t)g_machine->cpu.pc());
@@ -147,7 +155,7 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             EM_ASM({
                 if (typeof Module._termWrite === 'function') {
                     Module._termWrite('\r\n\x1b[31m[friscy] Error: ' +
-                        UTF8ToString($0) + '\x1b[0m\r\n');
+                        UTF8ToString(Number($0)) + '\x1b[0m\r\n');
                 }
             }, e.what());
             return 0;
@@ -482,6 +490,13 @@ static void setup_virtual_files() {
     g_vfs.add_virtual_file("/usr/share/zoneinfo/UTC", utc_tz);
     g_vfs.add_virtual_file("/usr/share/zoneinfo/Etc/UTC", utc_tz);
 
+    // VectorHeart LD_PRELOAD — enables host fetch (no WebTransport proxy needed)
+    {
+#include "vh_preload.so.inc"
+        std::vector<uint8_t> vh_so(vh_preload_so_bytes, vh_preload_so_bytes + vh_preload_so_bytes_len);
+        g_vfs.add_virtual_file("/usr/lib/vh_preload.so", vh_so);
+    }
+
     // /proc/version_signature — Node.js reads this to detect WSL
     g_vfs.add_virtual_file("/proc/version_signature",
         "Linux version 6.8.0 (friscy@libriscv) (riscv64-linux-gnu-gcc)\n");
@@ -529,6 +544,45 @@ extern "C" uint8_t* friscy_export_tar(uint32_t* out_size) {
     if (out_size) *out_size = static_cast<uint32_t>(tar.size());
     return buf;
 }
+
+// Checkpoint export — returns last checkpoint saved via --export-checkpoint.
+// Caller must Module._free() the returned pointer. Returns nullptr if none.
+extern "C" uint8_t* friscy_export_checkpoint(uint32_t* out_size) {
+    if (g_last_checkpoint_export.empty()) {
+        if (out_size) *out_size = 0;
+        return nullptr;
+    }
+    uint8_t* buf = static_cast<uint8_t*>(malloc(g_last_checkpoint_export.size()));
+    if (!buf) {
+        if (out_size) *out_size = 0;
+        return nullptr;
+    }
+    memcpy(buf, g_last_checkpoint_export.data(), g_last_checkpoint_export.size());
+    if (out_size) *out_size = static_cast<uint32_t>(g_last_checkpoint_export.size());
+    return buf;
+}
+
+// Live checkpoint export — snapshots current machine state immediately.
+// Caller must Module._free() the returned pointer.
+extern "C" uint8_t* friscy_save_live_checkpoint(uint32_t* out_size) {
+    if (!g_machine) {
+        if (out_size) *out_size = 0;
+        return nullptr;
+    }
+    auto data = checkpoint::save_checkpoint(*g_machine);
+    if (data.empty()) {
+        if (out_size) *out_size = 0;
+        return nullptr;
+    }
+    uint8_t* buf = static_cast<uint8_t*>(malloc(data.size()));
+    if (!buf) {
+        if (out_size) *out_size = 0;
+        return nullptr;
+    }
+    memcpy(buf, data.data(), data.size());
+    if (out_size) *out_size = static_cast<uint32_t>(data.size());
+    return buf;
+}
 #endif
 
 // Print usage
@@ -536,7 +590,8 @@ static void usage(const char* argv0) {
     std::cerr << "friscy - Docker container runner via libriscv\n\n";
     std::cerr << "Usage:\n";
     std::cerr << "  " << argv0 << " <riscv64-elf-binary> [args...]\n";
-    std::cerr << "  " << argv0 << " --rootfs <rootfs.tar> <entry-binary> [args...]\n";
+    std::cerr << "  " << argv0 << " --rootfs <rootfs.tar> [host-options...] <entry-binary> [args...]\n";
+    std::cerr << "  " << argv0 << " [host-options...] -- <entry-binary> [args...]\n";
     std::cerr << "\nExamples:\n";
     std::cerr << "  " << argv0 << " ./hello                    # Run standalone binary\n";
     std::cerr << "  " << argv0 << " --rootfs alpine.tar /bin/busybox ls -la\n";
@@ -563,53 +618,59 @@ int main(int argc, char** argv) {
 
     // Parse arguments
     int i = 1;
+    bool parsing_guest_args = false;
     while (i < argc) {
-        if (strcmp(argv[i], "--rootfs") == 0) {
+        if (!parsing_guest_args && strcmp(argv[i], "--") == 0) {
+            parsing_guest_args = true;
+            i++;
+            continue;
+        }
+
+        if (!parsing_guest_args && strcmp(argv[i], "--rootfs") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --rootfs requires <tarfile>\n";
                 return 1;
             }
             container_mode = true;
             rootfs_path = argv[++i];
-        } else if (strcmp(argv[i], "--env") == 0) {
+        } else if (!parsing_guest_args && strcmp(argv[i], "--env") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --env requires KEY=VALUE\n";
                 return 1;
             }
             extra_env.push_back(argv[++i]);
-        } else if (strcmp(argv[i], "--export-tar") == 0) {
+        } else if (!parsing_guest_args && strcmp(argv[i], "--export-tar") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --export-tar requires <path>\n";
                 return 1;
             }
             export_tar_path = argv[++i];
-        } else if (strcmp(argv[i], "--export-checkpoint") == 0) {
+        } else if (!parsing_guest_args && strcmp(argv[i], "--export-checkpoint") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --export-checkpoint requires <path>\n";
                 return 1;
             }
             export_checkpoint_path = argv[++i];
-        } else if (strcmp(argv[i], "--load-checkpoint") == 0) {
+        } else if (!parsing_guest_args && strcmp(argv[i], "--load-checkpoint") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --load-checkpoint requires <path>\n";
                 return 1;
             }
             load_checkpoint_path = argv[++i];
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+        } else if (!parsing_guest_args && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
             usage(argv[0]);
             return 0;
-        } else if (argv[i][0] == '-' && !container_mode) {
-            std::cerr << "Error: Unknown option: " << argv[i] << "\n";
-            return 1;
         } else {
             if (entry_path.empty()) {
+                if (argv[i][0] == '-') {
+                    std::cerr << "Error: Unknown host option: " << argv[i]
+                              << "\nHint: use '--' before guest command/args if needed.\n";
+                    return 1;
+                }
                 entry_path = argv[i];
             }
-            // Collect remaining args for the guest
-            while (i < argc) {
-                guest_args.push_back(argv[i++]);
-            }
-            break;
+            parsing_guest_args = true;
+            guest_args.push_back(argv[i]);
         }
         i++;
     }
@@ -924,8 +985,20 @@ int main(int argc, char** argv) {
         // Install network syscall handlers (socket, connect, etc.)
         net::install_network_syscalls(machine);
 
-        // Install VectorHeart hypercall harness (ecalls 600-803)
-        vh::setup_vh_harness(machine);
+        // Install VectorHeart hypercall harness (ecalls 600-803).
+        // Stage 2 async can be deferred with FRISCY_VH_STAGE2=0|false|off.
+        bool enable_vh_stage2 = true;
+        if (const char* stage2_env = std::getenv("FRISCY_VH_STAGE2")) {
+            if (strcmp(stage2_env, "0") == 0 ||
+                strcmp(stage2_env, "false") == 0 ||
+                strcmp(stage2_env, "off") == 0) {
+                enable_vh_stage2 = false;
+            }
+        }
+        vh::setup_vh_harness(machine, enable_vh_stage2);
+        std::cout << "[friscy] VectorHeart Stage 2 startup: "
+                  << (enable_vh_stage2 ? "enabled" : "deferred")
+                  << "\n";
 
         // Set up network bridge function pointers for syscalls.hpp
         // (avoids header include order issues between network.hpp and syscalls.hpp)
@@ -1038,11 +1111,13 @@ int main(int argc, char** argv) {
                     // Use TextDecoder to handle potential partial UTF-8 sequences between chunks
                     if (!Module._decoder) Module._decoder = new TextDecoder();
                     // Copy to regular ArrayBuffer — TextDecoder rejects SharedArrayBuffer views
-                    var buf = new Uint8Array($1);
-                    buf.set(Module.HEAPU8.subarray($0, $0 + $1));
+                    var ptr = Number($0);
+                    var len = Number($1);
+                    var buf = new Uint8Array(len);
+                    buf.set(Module.HEAPU8.subarray(ptr, ptr + len));
                     Module._termWrite(Module._decoder.decode(buf, {stream: true}));
                 } else {
-                    out(UTF8ToString($0, $1));
+                    out(UTF8ToString(Number($0), Number($1)));
                 }
             }, data, len);
         });
@@ -1094,6 +1169,12 @@ int main(int argc, char** argv) {
             m.set_result(-38);  // ENOSYS
         };
 
+        // Enable checkpoint-on-stdin mode if exporting a checkpoint.
+        // Must be set before checkpoint load path too, so load+export chaining works.
+        if (!export_checkpoint_path.empty()) {
+            syscalls::g_checkpoint_on_stdin = true;
+        }
+
         // --- Checkpoint load: restore full machine state, skip straight to resume ---
         if (!load_checkpoint_path.empty()) {
             fprintf(stderr, "[friscy] Loading checkpoint from: %s\n", load_checkpoint_path.c_str());
@@ -1109,17 +1190,19 @@ int main(int argc, char** argv) {
             // The next simulate() call will re-enter from where we left off.
             // But first we need to clear it so simulate can run, then the
             // guest will re-issue the read syscall and set it again.
+            // Also force resume from main scheduler thread. Restoring into a
+            // non-main waiting worker can spin in epoll/timer loops instead of
+            // consuming stdin on the checkpointed foreground thread.
+            if (syscalls::g_sched.count > 0) {
+                syscalls::g_sched.current = 0;
+                syscalls::g_sched.threads[0].waiting = false;
+            }
             syscalls::g_waiting_for_stdin = false;
             std::cout << "[friscy] Resuming from checkpoint...\n";
             std::cout << "----------------------------------------\n";
             // Skip the initial simulate — go straight to the loop
             goto simulate_loop;
 #endif
-        }
-
-        // Enable checkpoint-on-stdin mode if exporting a checkpoint
-        if (!export_checkpoint_path.empty()) {
-            syscalls::g_checkpoint_on_stdin = true;
         }
 
         std::cout << "[friscy] Starting execution...\n";
@@ -1164,7 +1247,11 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "[friscy] Saving checkpoint at stdin wait point...\n");
                     auto [instr, _] = machine.get_counters();
                     fprintf(stderr, "[friscy] Instructions executed: %lu\n", (unsigned long)instr);
-                    checkpoint::save_checkpoint_file(machine, export_checkpoint_path);
+                    auto data = checkpoint::save_checkpoint(machine);
+#ifdef __EMSCRIPTEN__
+                    g_last_checkpoint_export = data;
+#endif
+                    checkpoint::save_checkpoint_file(data, export_checkpoint_path);
                     fprintf(stderr, "[friscy] Checkpoint saved, exiting.\n");
                     return 0;
                 }
@@ -1300,6 +1387,7 @@ int main(int argc, char** argv) {
                           << "\n";
                 break;
             } catch (const riscv::MachineException& e) {
+                std::cerr << "[trace] inner-machine-exception-catch\n";
                 uint64_t fault_addr = e.data();
                 uint64_t crash_pc = machine.cpu.pc();
                 std::cerr << "[friscy] MachineException: " << e.what()
@@ -1319,8 +1407,11 @@ int main(int argc, char** argv) {
                 // emulation where futex force-unlock may trigger false positives.
                 if (std::string(e.what()).find("EBREAK") != std::string::npos) {
                     uint64_t ra = machine.cpu.reg(1);  // x1 = return address
-                    std::cerr << "[friscy] EBREAK (abort): skipping, returning to RA=0x"
-                              << std::hex << ra << std::dec << "\n";
+                    std::cerr << "[friscy] EBREAK (abort): branch-entered, PC=0x"
+                              << std::hex << machine.cpu.pc()
+                              << " RA=0x" << ra
+                              << " SP=0x" << machine.cpu.reg(2)
+                              << std::dec << "\n";
                     machine.cpu.jump(ra);
                     continue;
                 }
@@ -1339,7 +1430,7 @@ int main(int argc, char** argv) {
                 EM_ASM({
                     if (typeof Module._termWrite === 'function') {
                         Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
-                            UTF8ToString($0) + ' (data: 0x' + ($1).toString(16) +
+                            UTF8ToString(Number($0)) + ' (data: 0x' + ($1).toString(16) +
                             ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
                     }
                 }, e.what(), (uint32_t)e.data(), (uint32_t)machine.cpu.pc());
@@ -1389,6 +1480,7 @@ int main(int argc, char** argv) {
         return static_cast<int>(exit_code);
 
     } catch (const riscv::MachineException& e) {
+        std::cerr << "[trace] outer-machine-exception-catch\n";
         std::cerr << "\n[friscy] Machine exception: " << e.what();
         if (e.data() != 0) {
             std::cerr << " (data: 0x" << std::hex << e.data() << std::dec << ")";

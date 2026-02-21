@@ -31,6 +31,10 @@ typedef unsigned int  socklen_t;
 #define SYS_read      63
 #define SYS_write     64
 #define SYS_pread64   67
+#define SYS_connect   203
+
+#define VH_CAP_SYNC   (1u << 0)
+#define VH_CAP_ASYNC  (1u << 1)
 
 // ============================================================================
 // Raw Linux syscall — for fd 0-2 passthrough (no libc dependency)
@@ -78,6 +82,25 @@ static inline long vh_ecall(int nr, long a0, long a1, long a2, long a3, long a4)
 }
 
 // ============================================================================
+// Stage capability query
+// 610: vh_caps() -> bitmask (VH_CAP_*)
+// Cache result in preload to avoid repeated control ecalls on hot paths.
+// ============================================================================
+static long g_vh_caps_cached = -1;
+
+static inline long vh_caps(void) {
+    if (g_vh_caps_cached >= 0) return g_vh_caps_cached;
+    long caps = vh_ecall(610, 0, 0, 0, 0, 0);
+    if (caps < 0) caps = VH_CAP_SYNC; // safe fallback: assume stage 1 only
+    g_vh_caps_cached = caps;
+    return g_vh_caps_cached;
+}
+
+static inline int vh_async_enabled(void) {
+    return (vh_caps() & VH_CAP_ASYNC) != 0;
+}
+
+// ============================================================================
 // [600s] FS / OPFS
 // ============================================================================
 
@@ -85,35 +108,35 @@ ssize_t write(int fd, const void *buf, size_t count) {
     // JSON channel
     if (fd == 99)
         return (ssize_t)vh_ecall(708, (long)buf, (long)count, 0, 0, 0);
-    // Synthetic socket FD range
-    if (fd >= 500 && fd < 600)
+    // Synthetic socket FD range (stage 2 async only)
+    if (vh_async_enabled() && fd >= 500 && fd < 600)
         return (ssize_t)vh_ecall(802, (long)fd, (long)buf, (long)count, 0, 0);
-    // OPFS file FD
-    if (fd > 2)
+    // OPFS file FD (stage 2 async only)
+    if (vh_async_enabled() && fd > 2)
         return (ssize_t)vh_ecall(601, (long)fd, (long)buf, (long)count, 0, 0);
-    // Passthrough to real Linux syscall for stdio (fd 0-2)
+    // Stage 1 fallback or stdio passthrough
     return raw_syscall3(SYS_write, fd, (long)buf, (long)count);
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
-    // Synthetic socket FD range
-    if (fd >= 500 && fd < 600)
+    // Synthetic socket FD range (stage 2 async only)
+    if (vh_async_enabled() && fd >= 500 && fd < 600)
         return (ssize_t)vh_ecall(803, (long)fd, (long)buf, (long)count, 0, 0);
-    // OPFS file FD
-    if (fd > 2)
+    // OPFS file FD (stage 2 async only)
+    if (vh_async_enabled() && fd > 2)
         return (ssize_t)vh_ecall(602, (long)fd, (long)buf, (long)count, 0, 0);
-    // Passthrough to real Linux syscall for stdio
+    // Stage 1 fallback or stdio passthrough
     return raw_syscall3(SYS_read, fd, (long)buf, (long)count);
 }
 
 ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
-    if (fd > 2)
+    if (vh_async_enabled() && fd > 2)
         return (ssize_t)vh_ecall(604, (long)fd, (long)buf, (long)count, (long)offset, 0);
     return raw_syscall4(SYS_pread64, fd, (long)buf, (long)count, (long)offset);
 }
 
 int close(int fd) {
-    if (fd > 2)
+    if (vh_async_enabled() && fd > 2)
         return (int)vh_ecall(603, (long)fd, 0, 0, 0, 0);
     return (int)raw_syscall3(SYS_close, fd, 0, 0);
 }
@@ -155,12 +178,18 @@ ssize_t getrandom(void *buf, size_t len, unsigned int flags) {
 
 // 800: connect — route to host net proxy
 int connect(int fd, const void *addr, socklen_t len) {
+    if (!vh_async_enabled()) {
+        // Stage 1 fallback: let normal socket syscall path handle it.
+        return (int)raw_syscall3(SYS_connect, fd, (long)addr, (long)len);
+    }
     return (int)vh_ecall(800, (long)fd, (long)addr, (long)len, 0, 0);
 }
 
 // 801: getaddrinfo — resolve via host DNS
 int getaddrinfo(const char *node, const void *service,
                 const void *hints, void **res) {
+    // Keep the explicit VH path for now; in Stage 1 this may return -ENOSYS
+    // and callers should fall back to direct connect/ip usage where possible.
     return (int)vh_ecall(801, (long)node, (long)service, (long)hints, (long)res, 0);
 }
 

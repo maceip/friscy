@@ -1,7 +1,8 @@
 // network_bridge.js - WebTransport network bridge for friscy
 export class NetworkBridge {
-    constructor(proxyUrl) {
+    constructor(proxyUrl, options = {}) {
         this.proxyUrl = proxyUrl;
+        this.certHash = options.certHash || null;
         this.transport = null;
         this.sockets = new Map(); // fd -> stream
         this.nextFd = 1000;
@@ -9,8 +10,25 @@ export class NetworkBridge {
 
     async connect() {
         if (this.transport) return;
+        let transportOptions = undefined;
+        if (this.certHash) {
+            const hashB64 = this.certHash.replace(/\s+/g, '');
+            let decoded;
+            try {
+                decoded = atob(hashB64);
+            } catch {
+                throw new Error('Invalid proxycert hash (expected base64 sha256)');
+            }
+            const bytes = new Uint8Array(decoded.length);
+            for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+            transportOptions = {
+                serverCertificateHashes: [
+                    { algorithm: 'sha-256', value: bytes }
+                ]
+            };
+        }
         // @ts-ignore
-        this.transport = new WebTransport(this.proxyUrl);
+        this.transport = new WebTransport(this.proxyUrl, transportOptions);
         await this.transport.ready;
         console.log('[net] WebTransport connected');
     }

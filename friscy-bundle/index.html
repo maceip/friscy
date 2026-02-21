@@ -608,6 +608,15 @@
         </div>
     </div>
 
+    <button id="reset-btn" title="Reset">&#8635;</button>
+    <div id="jit-warmup-hud">
+        <div class="hud-title">JIT</div>
+        <div class="hud-row"><span class="key">compiled</span><span id="jit-hud-compiled" class="val">0</span></div>
+        <div class="hud-row"><span class="key">queue</span><span id="jit-hud-queue" class="val">0</span></div>
+        <div class="hud-row"><span class="key">miss</span><span id="jit-hud-miss" class="val">0%</span></div>
+        <div class="hud-row"><span class="key">predict</span><span id="jit-hud-predict" class="val">0%</span></div>
+    </div>
+
     <!-- Service worker: caching + COOP/COEP for cross-origin isolation -->
     <script>
         if ('serviceWorker' in navigator) {
@@ -621,7 +630,7 @@
                 // Reload when a NEW service worker activates (cache update)
                 reg.addEventListener('updatefound', () => {
                     const sw = reg.installing;
-                    sw.addEventListener('statechange', () => {
+                    if (sw) sw.addEventListener('statechange', () => {
                         if (sw.state === 'activated') {
                             console.log('New service worker activated, reloading...');
                             location.reload();

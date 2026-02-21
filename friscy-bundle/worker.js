@@ -660,4 +660,96 @@ self.onmessage = async function(e) {
             }
         }
     }
+
+    if (msg.type === 'export-checkpoint') {
+        if (!emModule || !emModule.FS) {
+            self.postMessage({ type: 'checkpoint-export-error', message: 'Module not initialized' });
+            return;
+        }
+        try {
+            const t0 = Date.now();
+            if (msg.rootfsData) {
+                emModule.FS.writeFile('/rootfs.tar', new Uint8Array(msg.rootfsData));
+            }
+            const args = [
+                '--rootfs', '/rootfs.tar',
+                '--env', 'LD_PRELOAD=/usr/lib/vh_preload.so',
+                '--env', 'ANTHROPIC_API_KEY=sk-ant-dummy',
+                '--export-checkpoint', '/export.ckpt',
+                '/usr/bin/node', '--jitless', '--max-old-space-size=256', '/usr/local/bin/claude-repl.js',
+            ];
+            console.log('[worker] Export checkpoint started (LD_PRELOAD, ~20–30 min)...');
+            self.postMessage({ type: 'checkpoint-export-stage', stage: 'boot-started', atMs: Date.now() - t0 });
+            await emModule.callMain(args);
+            const stopped = emModule._friscy_stopped ? !!emModule._friscy_stopped() : false;
+            self.postMessage({
+                type: 'checkpoint-export-stage',
+                stage: 'stdin-wait-reached',
+                atMs: Date.now() - t0,
+                stopped,
+            });
+            let copy;
+            if (emModule._friscy_export_checkpoint) {
+                const sizePtr = emModule._malloc(4);
+                const dataPtr = emModule._friscy_export_checkpoint(sizePtr);
+                const size = Number(emModule.HEAPU32[Number(sizePtr) >> 2]);
+                emModule._free(sizePtr);
+                if (dataPtr && size > 0) {
+                    const ptr = Number(dataPtr);
+                    copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
+                    emModule._free(dataPtr);
+                }
+            }
+            if (!copy) {
+                const data = emModule.FS.readFile('/export.ckpt');
+                copy = new Uint8Array(data.length);
+                copy.set(data);
+            }
+            console.log('[worker] Checkpoint exported:', copy.length, 'bytes');
+            self.postMessage({
+                type: 'checkpoint-exported',
+                data: copy,
+                metrics: {
+                    totalMs: Date.now() - t0,
+                    bytes: copy.length,
+                    stopped,
+                },
+            }, [copy.buffer]);
+        } catch (e) {
+            console.error('[worker] Export failed:', e.message, e.stack);
+            self.postMessage({ type: 'checkpoint-export-error', message: e.message, stack: e.stack });
+        }
+    }
+
+    if (msg.type === 'export-checkpoint-live') {
+        if (!emModule) {
+            self.postMessage({ type: 'checkpoint-export-error', message: 'Module not initialized' });
+            return;
+        }
+        try {
+            const sizePtr = emModule._malloc(4);
+            const liveExport = emModule._friscy_save_live_checkpoint || emModule._friscy_export_checkpoint;
+            if (!liveExport) {
+                emModule._free(sizePtr);
+                throw new Error('No checkpoint export function available');
+            }
+            const dataPtr = liveExport(sizePtr);
+            const size = Number(emModule.HEAPU32[Number(sizePtr) >> 2]);
+            emModule._free(sizePtr);
+            if (!dataPtr || size <= 0) {
+                throw new Error('Live checkpoint export returned empty payload');
+            }
+            const ptr = Number(dataPtr);
+            const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
+            emModule._free(dataPtr);
+            self.postMessage({
+                type: 'checkpoint-exported-live',
+                data: copy,
+                metrics: { bytes: copy.length },
+            }, [copy.buffer]);
+        } catch (e) {
+            console.error('[worker] Live export failed:', e.message, e.stack);
+            self.postMessage({ type: 'checkpoint-export-error', message: e.message, stack: e.stack });
+        }
+    }
 };

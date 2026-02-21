@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const PORT = 8080;
+const PORT = parseInt(process.argv[2] || '8080', 10);
 const MIME_TYPES = {
   '.html': 'text/html',
   '.js': 'text/javascript',
@@ -30,9 +30,11 @@ const server = http.createServer((req, res) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
 
-  let filePath = '.' + req.url;
-  if (filePath === './') {
-    filePath = './index.html';
+  const pathname = (req.url && req.url.split('?')[0]) || '/';
+  let filePath = '.' + pathname;
+  if (filePath === './' || filePath === '.') {
+    const hasExample = req.url && req.url.includes('example=');
+    filePath = hasExample ? './index.html' : './claude-demo.html';
   }
 
   const extname = String(path.extname(filePath)).toLowerCase();

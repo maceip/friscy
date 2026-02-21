@@ -94,6 +94,7 @@ const cmdHistory = {
 
 // ── Drag & Drop image handler ──
 function setupDragDrop(terminalEl, term) {
+    if (!terminalEl) return;
     const imageSidePanel = document.getElementById('image-side-panel');
     const droppedImagePreview = document.getElementById('dropped-image-preview');
     const imageSidePanelClose = document.getElementById('image-side-panel-close');

@@ -236,19 +236,29 @@
         let cachedRootfs = null; // Kept for shell restart
         let pendingShellRestart = false;
         let pollInterval = null;
+        let checkpointAfterResponse = false;
 
         // Called when user provides API key — starts the actual emulator
         function startEmulator(userApiKey) {
             if (!bootContext) return;
-            const { example, rootfs, checkpointData, netRPCHost } = bootContext;
+            const { manifest, example, rootfs, checkpointData, netRPCHost } = bootContext;
 
-            // Build args — replace PLACEHOLDER API key with real one
-            const envVars = (example.env || []).map(e =>
+            // Merge default env (incl. LD_PRELOAD for host fetch) with example env — same as index.html
+            const defaultEnv = manifest?.env || [];
+            const exampleEnv = example.env || [];
+            const envMap = new Map();
+            for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
+            for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
+            const envVars = [...envMap.values()].map(e =>
                 e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + userApiKey : e
             );
             const envArgs = envVars.flatMap(e => ['--env', e]);
             const args = [...envArgs, '--rootfs', '/rootfs.tar', ...(example.entrypoint || ['/bin/sh'])];
 
+            // Fresh boots wait for READY sentinel; checkpoint boots resume at stdin-wait.
+            if (!checkpointData) {
+                phase = 'boot';
+            }
             launchWorkerRun(args, rootfs, checkpointData);
         }
 
@@ -271,6 +281,16 @@
                 msg.checkpointData = ckptArray.buffer;
                 transfers.push(ckptArray.buffer);
                 console.log('[friscy] Checkpoint attached:', checkpoint.byteLength, 'bytes');
+                // Checkpoint restore resumes at stdin-wait and does not emit READY.
+                // Move UI into prompt mode immediately so input is accepted.
+                if (phase === 'boot' || phase === 'apikey') {
+                    phase = 'prompt';
+                    showWelcome();
+                    term.write('\x1b[2m[friscy] Restored from checkpoint.\x1b[0m\r\n');
+                    writeSeparator();
+                    writePrompt();
+                    writeFooter();
+                }
             }
             worker.postMessage(msg, transfers);
 
@@ -287,6 +307,26 @@
             const bytes = new TextEncoder().encode(text);
             for (const b of bytes) stdinQueue.push(b);
             checkStdinRequest();
+        }
+
+        function requestLiveCheckpointExport() {
+            return new Promise((resolve, reject) => {
+                if (!worker) {
+                    reject(new Error('Worker not initialized'));
+                    return;
+                }
+                const onMsg = (e) => {
+                    if (e.data?.type === 'checkpoint-exported-live') {
+                        worker.removeEventListener('message', onMsg);
+                        resolve(e.data);
+                    } else if (e.data?.type === 'checkpoint-export-error') {
+                        worker.removeEventListener('message', onMsg);
+                        reject(new Error(e.data.message || 'Live checkpoint export failed'));
+                    }
+                };
+                worker.addEventListener('message', onMsg);
+                worker.postMessage({ type: 'export-checkpoint-live' });
+            });
         }
 
         function checkStdinRequest() {
@@ -359,9 +399,15 @@
             worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
             await workerReady;
 
-            // Build args for /bin/sh -i (keep env vars from original example)
+            // Build args for /bin/sh -i (merge manifest + example env)
+            const manifest = bootContext?.manifest || {};
             const example = bootContext?.example || {};
-            const envVars = (example.env || []).map(e =>
+            const defaultEnv = manifest.env || [];
+            const exampleEnv = example.env || [];
+            const envMap = new Map();
+            for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
+            for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
+            const envVars = [...envMap.values()].map(e =>
                 e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + apiKey : e
             );
             const envArgs = envVars.flatMap(e => ['--env', e]);
@@ -612,6 +658,24 @@
             writeSeparator();
             writePrompt();
             writeFooter();
+            if (checkpointAfterResponse) {
+                checkpointAfterResponse = false;
+                term.write('\r\n\x1b[2m[friscy] Exporting live checkpoint after claude mcp list...\x1b[0m\r\n');
+                requestLiveCheckpointExport().then(({ data }) => {
+                    const blob = new Blob([data], { type: 'application/octet-stream' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'claude-mcp-post.ckpt';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    URL.revokeObjectURL(url);
+                    term.write('\x1b[2m[friscy] Live checkpoint downloaded (claude-mcp-post.ckpt).\x1b[0m\r\n');
+                }).catch((err) => {
+                    term.write('\x1b[31m[friscy] Live checkpoint export failed: ' + err.message + '\x1b[0m\r\n');
+                });
+            }
         }
 
         // ──── Slash menu ────
@@ -730,7 +794,6 @@
                         }
                         term.write('\x1b[2mConnecting...\x1b[0m\r\n');
                         startEmulator(apiKey);
-                        phase = 'boot'; // Wait for READY sentinel
                         return;
                     } else if (ch === '\x7f' || ch === '\b') {
                         if (apiKeyBuf.length > 0) {
@@ -806,6 +869,7 @@
                         // Send prompt to emulator
                         history.push(trimmed);
                         historyIdx = -1;
+                        checkpointAfterResponse = (trimmed.toLowerCase() === 'claude mcp list');
                         sendStdin(trimmed + '\n');
                         startWorking();
                     }
@@ -973,10 +1037,10 @@
             }
 
             // Store boot context for startEmulator()
-            bootContext = { example, rootfs, checkpointData, netRPCHost };
+            bootContext = { manifest, example, rootfs, checkpointData, netRPCHost };
             console.log('[friscy] Boot complete. rootfs size:', rootfs.byteLength, 'detached:', rootfs.detached || false);
 
-            // Show API key prompt — emulator starts when user provides key
+            // Show API key prompt — emulator starts when user provides key.
             showApiKeyPrompt();
         }
 

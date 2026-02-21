@@ -1017,6 +1017,7 @@
                   || (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
                       ? `https://${location.hostname}:4433/connect` : DEFAULT_PROXY);
             const proxyCertHash = params.get('proxycert') || null;
+            const coloredWorkers = params.get('colored') === '1';
             let netBridge = null, netRPCHost = null;
             if (proxyUrl) {
                 try {
@@ -1032,7 +1033,12 @@
                 updateNetStatus('disconnected');
             }
             if (netBridge) {
-                netRPCHost = new NetworkRPCHost(netSab, netBridge);
+                netRPCHost = new NetworkRPCHost(netSab, netBridge, {
+                    laneEnabled: coloredWorkers,
+                    proxyUrl,
+                    certHash: proxyCertHash,
+                    queueMax: 128,
+                });
                 netRPCHost.start();
             }
 

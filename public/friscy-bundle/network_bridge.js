@@ -94,3 +94,5 @@ export class NetworkBridge {
         return 0;
     }
 }
+
+export { NetworkBridge as FriscyNetworkBridge };

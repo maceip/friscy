@@ -545,12 +545,12 @@
 <body>
     <header>
         <div>
-            <h1 style="display:flex; align-items:center;"><a href="https://github.com/maceip/friscy" class="header-link"><img src="./riscv.svg" alt="RISC-V" style="height:24px; opacity:0.9;"></a></h1>
-            <div class="status" id="status" style="font-size:1.4rem; font-weight:700; color:#ff8f40; margin-left:0.75rem;">friscy<span id="net-status" class="net-status disconnected">net: off</span></div>
+            <h1 style="display:flex; align-items:center;"><a href="https://github.com/maceip/friscy" class="header-link"><img src="./friscylogo.png" alt="friscy" style="height:28px; opacity:0.95;"></a></h1>
+            <div class="status" id="status" style="font-size:1.4rem; font-weight:700; color:#ff8f40; margin-left:0.75rem;"><span id="net-status" class="net-status disconnected">net: off</span></div>
         </div>
         <div style="display:flex;align-items:center;gap:0.5rem;">
-            <img src="./webmcp-icon.svg" alt="WebMCP" class="header-logo" title="WebMCP enabled" style="filter: invert(1); opacity: 0.8; height: 18px;">
-            <img src="./riscv.svg" alt="RISC-V" class="header-logo" style="opacity: 0.8;">
+            <img src="./mcp.svg" alt="MCP" class="header-logo" title="MCP" style="opacity: 0.9; height: 20px;">
+            <img src="./riscv-logo.svg" alt="RISC-V" class="header-logo" style="opacity: 0.9; height: 20px;">
         </div>
     </header>
     <div id="search-bar">
@@ -597,7 +597,9 @@
             <div id="terminal" style="display:none;"></div>
             <div style="position:absolute; bottom:8px; right:8px; z-index:20; display:flex; gap:0.5rem; background:rgba(13,17,23,0.8); backdrop-filter:blur(4px); padding:4px 8px; border-radius:6px; border:1px solid rgba(89,194,255,0.2);">
                 <button id="pause-btn" title="Pause/Resume Execoution" style="background:none; border:none; color:#e6e1cf; cursor:pointer; font-size:1.1rem; padding:0.2rem;">&#x23F8;</button>
-                <button id="snapshot-btn" title="Create Memory Checkpoint" style="background:none; border:none; color:#ff8f40; cursor:pointer; font-size:1.1rem; padding:0.2rem;">&#x1F4F8;</button>
+                <button id="suspend-btn" title="Suspend VM" style="background:none; border:none; color:#ff8f40; cursor:pointer; font-size:1.1rem; padding:0.2rem; display:flex; align-items:center;">
+                    <img id="suspend-icon" src="./SUSPEND.svg" alt="Suspend" style="width:18px;height:18px;">
+                </button>
             </div>
             <div id="dual-terminal-container">
                 <div class="dual-pane primary">

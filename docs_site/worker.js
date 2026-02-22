@@ -297,6 +297,10 @@ async function runResumeLoop() {
     const friscy_set_fetch_response = emModule._friscy_set_fetch_response;
 
     while (friscy_stopped()) {
+        while (self._isSuspended) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+
         if (!controlView || !controlBytes) break;
 
         const currentCmd = Atomics.load(controlView, 0);
@@ -355,6 +359,10 @@ async function runResumeLoop() {
                 const reqBytes = new Uint8Array(emModule.HEAPU8.buffer, reqPtr, reqLen);
                 const reqJSON = new TextDecoder().decode(reqBytes.slice());
                 const req = JSON.parse(reqJSON);
+
+                if (!self.allowNetwork) {
+                    throw new Error("Sandbox policy prohibits external network requests.");
+                }
 
                 console.log(`[worker] host-fetch: ${req.options?.method || 'GET'} ${req.url}`);
 
@@ -485,6 +493,8 @@ self.onmessage = async function(e) {
         const jitTraceTripletHotThreshold = Number.isFinite(msg.jitTraceTripletHotThreshold)
             ? msg.jitTraceTripletHotThreshold
             : null;
+        
+        self.allowNetwork = msg.allowNetwork === true;
 
         controlView = new Int32Array(controlSab);
         controlBytes = new Uint8Array(controlSab);
@@ -824,5 +834,15 @@ self.onmessage = async function(e) {
             console.error('[worker] Live export failed:', e.message, e.stack);
             self.postMessage({ type: 'checkpoint-export-error', message: e.message, stack: e.stack });
         }
+    }
+
+    if (msg.type === 'suspend') {
+        self._isSuspended = true;
+        self.postMessage({ type: 'suspended' });
+    }
+
+    if (msg.type === 'resume') {
+        self._isSuspended = false;
+        self.postMessage({ type: 'resumed' });
     }
 };

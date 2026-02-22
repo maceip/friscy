@@ -4,7 +4,7 @@ import { attach } from '@xterm/addon-attach';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { ImageAddon } from '@xterm/addon-image';
-import { WebglAddon } '@xterm/addon-webgl';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { FriscyNetworkBridge } from './network_bridge.js';
 
 // WebTransport bridge removed — VectorHeart hypercalls handle networking via JSPI
@@ -103,7 +103,7 @@ function setupDragDrop(terminalEl, term) {
     if (imageSidePanelClose) {
         imageSidePanelClose.addEventListener('click', () => {
             imageSidePanel?.classList.remove('open');
-            if (droppedImagePreview) (droppedImagePreview as HTMLImageElement).src = ''; 
+            if (droppedImagePreview) droppedImagePreview.src = '';
         });
     }
 
@@ -1113,12 +1113,26 @@ async function main() {
 
 
 
-    const snapshotBtn = document.getElementById('snapshot-btn');
-    if (snapshotBtn) {
-        snapshotBtn.addEventListener('click', () => {
+    const suspendBtn = document.getElementById('suspend-btn');
+    const suspendIcon = document.getElementById('suspend-icon');
+    let isSuspended = false;
+    
+    if (suspendBtn) {
+        suspendBtn.addEventListener('click', () => {
             if (!machineRunning || !worker) return;
-            if (statusEl) statusEl.textContent = 'Saving memory snapshot...';
-            worker.postMessage({ type: 'export-checkpoint-live' });
+            if (!isSuspended) {
+                worker.postMessage({ type: 'suspend' });
+                isSuspended = true;
+                if (statusEl) statusEl.textContent = 'VM Suspended';
+                suspendBtn.style.opacity = '0.5';
+                if (suspendIcon) suspendIcon.src = './RESUME.svg';
+            } else {
+                worker.postMessage({ type: 'resume' });
+                isSuspended = false;
+                if (statusEl) statusEl.textContent = 'fast risc-v runtime for the browser & wasm' + netStatusHTML;
+                suspendBtn.style.opacity = '1.0';
+                if (suspendIcon) suspendIcon.src = './SUSPEND.svg';
+            }
         });
     }
 
@@ -1178,6 +1192,7 @@ async function main() {
         jitMarkovEnabled: jitCfg.jitMarkovEnabled,
         jitTripletEnabled: jitCfg.jitTripletEnabled,
         jitAwaitCompiler: jitCfg.jitAwaitCompiler,
+        allowNetwork: activeExample === 'server',
     });
 
     await workerReady;
@@ -1204,8 +1219,8 @@ async function main() {
         term.writeln('\\x1b[32mNetwork: WebTransport Proxy via ' + proxyUrl + '\\x1b[0m');
         updateNetStatus('WebTransport Connected');
     } else {
-        // Network: VectorHeart hypercalls handle networking via JSPI (no proxy needed)
-        updateNetStatus('connected JSPI');
+        // Network: restricted by default for non-server examples
+        updateNetStatus('Offline (sandbox restricted)');
     }
 
     // Transition: hide overlay FIRST, then show + open terminals
@@ -1233,7 +1248,10 @@ async function main() {
     term.writeln('');
     term.writeln('\x1b[1;32mfriscy\x1b[0m fast risc-v runtime for the browser & wasm');
     term.writeln(`Image: ${manifest.image} (${rootfsMB} MB)`);
-    term.writeln('\x1b[32mNetwork: VectorHeart (JSPI)\x1b[0m');
+    if (activeExample === 'server') {
+        term.writeln('\x1b[32mNetwork: WebTransport Proxy via ' + proxyUrl + '\x1b[0m');
+    } else {
+        term.writeln('\x1b[31mNetwork: Restricted by sandbox policy\x1b[0m');
     }
     term.writeln('');
 
@@ -1397,7 +1415,7 @@ async function main() {
 }
 
 // --- Tab bar ---
-const activeExample = params.get('example') || 'alpine';
+const activeExample = new URLSearchParams(window.location.search).get('example') || 'alpine';
 
 document.querySelectorAll('.tab').forEach(tab => {
     if ((tab as HTMLElement).dataset.example === activeExample) tab.classList.add('active');

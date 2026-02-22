@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+#![allow(unused_imports)]
 // cfg.rs - Control Flow Graph builder
 //
 // Constructs basic blocks and identifies functions from disassembled instructions.

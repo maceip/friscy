@@ -47,6 +47,7 @@ if [ ! -f "$BUILD_DIR/friscy" ]; then
     mkdir -p "$BUILD_DIR"
     cd "$BUILD_DIR"
     cmake .. -DCMAKE_BUILD_TYPE=Release
+    # shellcheck disable=SC2046
     make -j$(nproc)
 fi
 

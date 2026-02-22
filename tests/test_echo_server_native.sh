@@ -20,6 +20,7 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 cleanup() {
+    # shellcheck disable=SC2015
     [[ -n "${FRISCY_PID:-}" ]] && kill "$FRISCY_PID" 2>/dev/null || true
     wait "$FRISCY_PID" 2>/dev/null || true
 }

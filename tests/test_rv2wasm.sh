@@ -38,6 +38,7 @@ command -v cargo >/dev/null 2>&1 || { echo "Error: cargo (Rust) is required"; ex
 
 # Create test directory
 TEST_TMP=$(mktemp -d)
+# shellcheck disable=SC2064
 trap "rm -rf $TEST_TMP" EXIT
 
 # ---- Build rv2wasm ----
@@ -63,6 +64,7 @@ else
 fi
 
 # Help test
+# shellcheck disable=SC2015
 "$RV2WASM" --help >/dev/null 2>&1 && pass "--help works" || fail "--help failed"
 
 # ---- Skip binary tests if no cross-compiler ----
@@ -94,6 +96,7 @@ int main() {
 }
 CEOF
 
+# shellcheck disable=SC2015
 riscv64-linux-gnu-gcc -static -O2 -o "$TEST_TMP/test_loop" "$TEST_TMP/test_loop.c" 2>/dev/null && {
     pass "Compiled test_loop binary"
 
@@ -137,6 +140,7 @@ int main() {
 }
 CEOF
 
+# shellcheck disable=SC2015
 riscv64-linux-gnu-gcc -static -O2 -o "$TEST_TMP/test_fp" "$TEST_TMP/test_fp.c" 2>/dev/null && {
     pass "Compiled test_fp binary"
 
@@ -186,6 +190,7 @@ int main() {
 }
 CEOF
 
+# shellcheck disable=SC2015
 riscv64-linux-gnu-gcc -static -O2 -o "$TEST_TMP/test_atomic" "$TEST_TMP/test_atomic.c" 2>/dev/null && {
     pass "Compiled test_atomic binary"
 

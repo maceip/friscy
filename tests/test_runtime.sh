@@ -13,6 +13,7 @@
 # ============================================================================
 set -euo pipefail
 
+# shellcheck disable=SC2034
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colors
@@ -53,6 +54,7 @@ echo "Binary: $FRISCY"
 [[ -n "$ROOTFS" ]] && echo "Rootfs: $ROOTFS"
 
 TEST_TMP=$(mktemp -d)
+# shellcheck disable=SC2064
 trap "rm -rf $TEST_TMP" EXIT
 
 # ---- Workstream A: Basic runtime ----
@@ -90,6 +92,7 @@ int main() {
     return 0;
 }
 CEOF
+    # shellcheck disable=SC2015
     riscv64-linux-gnu-gcc -static -O2 -o "$TEST_TMP/hello" "$TEST_TMP/hello.c" 2>/dev/null && {
         OUTPUT=$("$FRISCY" "$TEST_TMP/hello" 2>/dev/null || true)
         if echo "$OUTPUT" | grep -q 'Hello from friscy'; then

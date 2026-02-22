@@ -25,6 +25,7 @@ if ! command -v docker &> /dev/null; then
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
 
+    # shellcheck disable=SC1091
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
     $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
 
@@ -40,6 +41,7 @@ fi
 if ! command -v cargo &> /dev/null; then
     echo "Installing Rust toolchain..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    # shellcheck disable=SC1091
     source "$HOME/.cargo/env"
 fi
 
@@ -55,7 +57,7 @@ if ! command -v go &> /dev/null; then
     # Update PATH for current session and bashrc
     export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
     if ! grep -q "/usr/local/go/bin" "$HOME/.bashrc"; then
-        echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> "$HOME/.bashrc"
+        echo "export PATH=\$PATH:/usr/local/go/bin:\$HOME/go/bin" >> "$HOME/.bashrc"
     fi
 fi
 

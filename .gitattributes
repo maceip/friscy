@@ -3,3 +3,9 @@ proxy/friscy-proxy-linux filter=lfs diff=lfs merge=lfs -text
 friscy-bundle/claude-slim.tar filter=lfs diff=lfs merge=lfs -text
 friscy-bundle/claude-slim-snap.tar filter=lfs diff=lfs merge=lfs -text
 friscy-bundle/*.ckpt filter=lfs diff=lfs merge=lfs -text
+friscy-bundle/nodejs.tar filter=lfs diff=lfs merge=lfs -text
+docs_site/nodejs.tar filter=lfs diff=lfs merge=lfs -text
+friscy-bundle/rootfs.tar filter=lfs diff=lfs merge=lfs -text
+docs_site/rootfs.tar filter=lfs diff=lfs merge=lfs -text
+friscy-bundle/goserver.tar filter=lfs diff=lfs merge=lfs -text
+docs_site/goserver.tar filter=lfs diff=lfs merge=lfs -text

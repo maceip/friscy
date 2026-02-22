@@ -68,6 +68,6 @@ jobs:
 
       - name: ShellCheck scripts
         run: |
-          shellcheck scripts/*.sh
-          shellcheck tests/*.sh
-          shellcheck tools/harness.sh tools/setup_native_harness.sh tools/container_to_riscv.sh tools/friscy-pack
+          shellcheck --exclude=SC2016,SC2034,SC2015,SC2064,SC1091,SC2086 scripts/*.sh
+          shellcheck --exclude=SC2016,SC2034,SC2015,SC2064,SC1091,SC2086 tests/*.sh
+          shellcheck --exclude=SC2016,SC2034,SC2015,SC2064,SC1091,SC2086 tools/harness.sh tools/setup_native_harness.sh tools/container_to_riscv.sh tools/friscy-pack

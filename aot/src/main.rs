@@ -100,7 +100,11 @@ fn main() -> Result<()> {
 
     if args.verbose {
         let total_bytes: usize = code_sections.iter().map(|s| s.data.len()).sum();
-        eprintln!("  Code sections: {} ({} bytes)", code_sections.len(), total_bytes);
+        eprintln!(
+            "  Code sections: {} ({} bytes)",
+            code_sections.len(),
+            total_bytes
+        );
     }
 
     // Disassemble to instructions

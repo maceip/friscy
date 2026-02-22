@@ -256,7 +256,12 @@ pub fn translate(
 
     // Translate each basic block to a function
     for (idx, (addr, block)) in cfg.blocks.iter().enumerate() {
-        let func = translate_block(block, idx, debug, if opt_level >= 2 { &block_addrs } else { &[] })?;
+        let func = translate_block(
+            block,
+            idx,
+            debug,
+            if opt_level >= 2 { &block_addrs } else { &[] },
+        )?;
         block_to_func.insert(*addr, functions.len());
         functions.push(func);
     }
@@ -278,7 +283,12 @@ pub fn translate(
 
 /// Translate a single basic block to a Wasm function.
 /// `ic_targets` contains known block addresses for inline caching of JALR.
-fn translate_block(block: &BasicBlock, _func_idx: usize, debug: bool, ic_targets: &[u64]) -> Result<WasmFunction> {
+fn translate_block(
+    block: &BasicBlock,
+    _func_idx: usize,
+    debug: bool,
+    ic_targets: &[u64],
+) -> Result<WasmFunction> {
     let mut body = Vec::new();
 
     // Function signature: (param $m i32) (result i32)
@@ -909,7 +919,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             body.push(WasmInst::I32WrapI64);
             body.push(WasmInst::I32Add);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Store { offset: 0 });
         }
 
@@ -919,9 +931,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 256 + rs2 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Add);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -932,9 +948,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 256 + rs2 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Sub);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -945,9 +965,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 256 + rs2 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Mul);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -958,9 +982,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 256 + rs2 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Div);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -970,7 +998,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs1_offset = 256 + rs1 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F32Sqrt);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1003,7 +1033,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             body.push(WasmInst::I32WrapI64);
             body.push(WasmInst::I32Add);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Store { offset: 0 });
         }
 
@@ -1013,9 +1045,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Add);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1026,9 +1062,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Sub);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1039,9 +1079,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Mul);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1052,9 +1096,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Div);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1064,7 +1112,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs1_offset = 384 + rs1 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F64Sqrt);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1282,12 +1332,18 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             // rd = rs1 * rs2 + rs3
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Mul);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs3_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F32Add);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1301,12 +1357,18 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             // rd = rs1 * rs2 - rs3
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Mul);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs3_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F32Sub);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1320,13 +1382,19 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             // rd = -(rs1 * rs2) + rs3 = rs3 - rs1*rs2
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Mul);
             body.push(WasmInst::F32Neg);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs3_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F32Add);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1340,13 +1408,19 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             // rd = -(rs1 * rs2) - rs3
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Mul);
             body.push(WasmInst::F32Neg);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs3_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F32Sub);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1360,12 +1434,18 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs3_offset = 384 + rs3 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Mul);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs3_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F64Add);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1378,12 +1458,18 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs3_offset = 384 + rs3 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Mul);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs3_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F64Sub);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1396,13 +1482,19 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs3_offset = 384 + rs3 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Mul);
             body.push(WasmInst::F64Neg);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs3_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F64Add);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1415,13 +1507,19 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs3_offset = 384 + rs3 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Mul);
             body.push(WasmInst::F64Neg);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs3_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs3_offset,
+            });
             body.push(WasmInst::F64Sub);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1448,7 +1546,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::I64Load { offset: rs1_offset });
                 body.push(WasmInst::I32WrapI64);
-                body.push(WasmInst::I32Const { value: (imm & 0x1f) as i32 });
+                body.push(WasmInst::I32Const {
+                    value: (imm & 0x1f) as i32,
+                });
                 body.push(WasmInst::I32Shl);
                 body.push(WasmInst::I64ExtendI32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1461,7 +1561,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::I64Load { offset: rs1_offset });
                 body.push(WasmInst::I32WrapI64);
-                body.push(WasmInst::I32Const { value: (imm & 0x1f) as i32 });
+                body.push(WasmInst::I32Const {
+                    value: (imm & 0x1f) as i32,
+                });
                 body.push(WasmInst::I32ShrU);
                 body.push(WasmInst::I64ExtendI32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1474,7 +1576,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::I64Load { offset: rs1_offset });
                 body.push(WasmInst::I32WrapI64);
-                body.push(WasmInst::I32Const { value: (imm & 0x1f) as i32 });
+                body.push(WasmInst::I32Const {
+                    value: (imm & 0x1f) as i32,
+                });
                 body.push(WasmInst::I32ShrS);
                 body.push(WasmInst::I64ExtendI32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1701,10 +1805,14 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 256 + rs2 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F32Abs);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Copysign);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1716,10 +1824,14 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             // rd = |rs1| with negated sign of rs2
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F32Abs);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Neg);
             body.push(WasmInst::F32Copysign);
             body.push(WasmInst::F32Store { offset: frd_offset });
@@ -1733,12 +1845,18 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             // When rs1==rs2 this is FABS. Use reinterpret for XOR.
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::I32ReinterpretF32);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::I32ReinterpretF32);
-            body.push(WasmInst::I32Const { value: -2147483648_i32 }); // 0x80000000
+            body.push(WasmInst::I32Const {
+                value: -2147483648_i32,
+            }); // 0x80000000
             body.push(WasmInst::I32And);
             body.push(WasmInst::I32Xor);
             body.push(WasmInst::F32ReinterpretI32);
@@ -1752,10 +1870,14 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F64Abs);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Copysign);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1766,10 +1888,14 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F64Abs);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Neg);
             body.push(WasmInst::F64Copysign);
             body.push(WasmInst::F64Store { offset: frd_offset });
@@ -1781,12 +1907,18 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::I64ReinterpretF64);
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::I64ReinterpretF64);
-            body.push(WasmInst::I64Const { value: -9223372036854775808_i64 }); // 0x8000000000000000
+            body.push(WasmInst::I64Const {
+                value: -9223372036854775808_i64,
+            }); // 0x8000000000000000
             body.push(WasmInst::I64And);
             body.push(WasmInst::I64Xor);
             body.push(WasmInst::F64ReinterpretI64);
@@ -1802,9 +1934,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 256 + rs2 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Min);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1815,9 +1951,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 256 + rs2 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs2_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F32Max);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -1828,9 +1968,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Min);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1841,9 +1985,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs2_offset = 384 + rs2 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs2_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs2_offset,
+            });
             body.push(WasmInst::F64Max);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -1857,9 +2005,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs2_offset = 256 + rs2 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs2_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs2_offset,
+                });
                 body.push(WasmInst::F32Eq);
                 body.push(WasmInst::I64ExtendI32U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1872,9 +2024,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs2_offset = 256 + rs2 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs2_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs2_offset,
+                });
                 body.push(WasmInst::F32Lt);
                 body.push(WasmInst::I64ExtendI32U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1887,9 +2043,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs2_offset = 256 + rs2 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs2_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs2_offset,
+                });
                 body.push(WasmInst::F32Le);
                 body.push(WasmInst::I64ExtendI32U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1902,9 +2062,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs2_offset = 384 + rs2 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs2_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs2_offset,
+                });
                 body.push(WasmInst::F64Eq);
                 body.push(WasmInst::I64ExtendI32U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1917,9 +2081,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs2_offset = 384 + rs2 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs2_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs2_offset,
+                });
                 body.push(WasmInst::F64Lt);
                 body.push(WasmInst::I64ExtendI32U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1932,9 +2100,13 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs2_offset = 384 + rs2 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs2_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs2_offset,
+                });
                 body.push(WasmInst::F64Le);
                 body.push(WasmInst::I64ExtendI32U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1950,7 +2122,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 256 + rs1 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I32TruncF32S);
                 body.push(WasmInst::I64ExtendI32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1962,7 +2136,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 256 + rs1 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I32TruncF32U);
                 body.push(WasmInst::I64ExtendI32S); // sign-extend per RISC-V spec
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -1975,7 +2151,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 256 + rs1 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I64TruncF32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
             }
@@ -1986,7 +2164,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 256 + rs1 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I64TruncF32U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
             }
@@ -1997,7 +2177,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 384 + rs1 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I32TruncF64S);
                 body.push(WasmInst::I64ExtendI32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -2009,7 +2191,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 384 + rs1 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I32TruncF64U);
                 body.push(WasmInst::I64ExtendI32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -2021,7 +2205,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 384 + rs1 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I64TruncF64S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
             }
@@ -2032,7 +2218,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 384 + rs1 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I64TruncF64U);
                 body.push(WasmInst::I64Store { offset: rd_offset });
             }
@@ -2125,7 +2313,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs1_offset = 384 + rs1 * 8;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F64Load { offset: frs1_offset });
+            body.push(WasmInst::F64Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F32DemoteF64);
             body.push(WasmInst::F32Store { offset: frd_offset });
         }
@@ -2135,7 +2325,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
             let frs1_offset = 256 + rs1 * 4;
             body.push(WasmInst::LocalGet { idx: 0 });
             body.push(WasmInst::LocalGet { idx: 0 });
-            body.push(WasmInst::F32Load { offset: frs1_offset });
+            body.push(WasmInst::F32Load {
+                offset: frs1_offset,
+            });
             body.push(WasmInst::F64PromoteF32);
             body.push(WasmInst::F64Store { offset: frd_offset });
         }
@@ -2149,7 +2341,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 256 + rs1 * 4;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F32Load { offset: frs1_offset });
+                body.push(WasmInst::F32Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I32ReinterpretF32);
                 body.push(WasmInst::I64ExtendI32S);
                 body.push(WasmInst::I64Store { offset: rd_offset });
@@ -2173,7 +2367,9 @@ fn translate_instruction(inst: &Instruction, body: &mut Vec<WasmInst>) -> Result
                 let frs1_offset = 384 + rs1 * 8;
                 body.push(WasmInst::LocalGet { idx: 0 });
                 body.push(WasmInst::LocalGet { idx: 0 });
-                body.push(WasmInst::F64Load { offset: frs1_offset });
+                body.push(WasmInst::F64Load {
+                    offset: frs1_offset,
+                });
                 body.push(WasmInst::I64ReinterpretF64);
                 body.push(WasmInst::I64Store { offset: rd_offset });
             }
@@ -2313,7 +2509,9 @@ fn add_terminator_return(
             // and the dispatch loop's br_table becomes trivially predictable
             // when the same target PC returns repeatedly.
             let successors: Vec<u64> = if rd != 0 {
-                block.successors.iter()
+                block
+                    .successors
+                    .iter()
                     .filter(|&&s| ic_targets.contains(&s))
                     .copied()
                     .take(2) // max 2 IC guards to limit code bloat (<10%)
@@ -2331,10 +2529,14 @@ fn add_terminator_return(
                     // Using: block { br_if(cond, skip) ; return const ; } end
                     body.push(WasmInst::Block { label: 0 });
                     body.push(WasmInst::LocalGet { idx: 1 });
-                    body.push(WasmInst::I32Const { value: target_pc as i32 });
+                    body.push(WasmInst::I32Const {
+                        value: target_pc as i32,
+                    });
                     body.push(WasmInst::I32Ne); // skip if NOT equal
                     body.push(WasmInst::BrIf { label: 0 }); // break out of block
-                    body.push(WasmInst::I32Const { value: target_pc as i32 });
+                    body.push(WasmInst::I32Const {
+                        value: target_pc as i32,
+                    });
                     body.push(WasmInst::Return);
                     body.push(WasmInst::End);
                 }
@@ -2414,7 +2616,14 @@ fn emit_branch_compare(
 }
 
 /// Emit branch on zero/nonzero
-fn emit_branch_zero(body: &mut Vec<WasmInst>, rs1: u32, imm: i64, pc: u64, fallthrough: u64, on_zero: bool) {
+fn emit_branch_zero(
+    body: &mut Vec<WasmInst>,
+    rs1: u32,
+    imm: i64,
+    pc: u64,
+    fallthrough: u64,
+    on_zero: bool,
+) {
     let target = (pc as i64 + imm) as u64;
 
     body.push(WasmInst::LocalGet { idx: 0 });
@@ -2448,10 +2657,7 @@ fn emit_branch_zero(body: &mut Vec<WasmInst>, rs1: u32, imm: i64, pc: u64, fallt
 /// - Memory pages fixed (not derived from ELF segments)
 /// - No ElfInfo dependency — caller provides base address
 /// - Block functions identical to AOT (same register layout)
-pub fn translate_jit(
-    cfg: &ControlFlowGraph,
-    base_addr: u64,
-) -> Result<WasmModule> {
+pub fn translate_jit(cfg: &ControlFlowGraph, base_addr: u64) -> Result<WasmModule> {
     translate_jit_with_options(cfg, base_addr, true)
 }
 
@@ -2487,17 +2693,15 @@ pub fn translate_jit_with_options(
 
 /// Fast baseline JIT translation:
 /// skips peephole/register-caching optimization for lower compile latency.
-pub fn translate_jit_fast(
-    cfg: &ControlFlowGraph,
-    base_addr: u64,
-) -> Result<WasmModule> {
+pub fn translate_jit_fast(cfg: &ControlFlowGraph, base_addr: u64) -> Result<WasmModule> {
     translate_jit_with_options(cfg, base_addr, false)
 }
 
 /// Basic peephole optimizations
 fn optimize_function(func: &mut WasmFunction) {
     // Always strip debug comments before optimization.
-    func.body.retain(|inst| !matches!(inst, WasmInst::Comment { .. }));
+    func.body
+        .retain(|inst| !matches!(inst, WasmInst::Comment { .. }));
 
     // We currently declare all non-parameter locals as i64 in wasm_builder.rs.
     // Any new temp introduced here must therefore hold i64 values.
@@ -2508,7 +2712,8 @@ fn optimize_function(func: &mut WasmFunction) {
     loop {
         let mut changed = false;
 
-        let (body, forwarded) = forward_i64_store_loads(std::mem::take(&mut func.body), &mut next_local);
+        let (body, forwarded) =
+            forward_i64_store_loads(std::mem::take(&mut func.body), &mut next_local);
         changed |= forwarded > 0;
 
         let (body, tee_folds) = fold_local_set_get(body);
@@ -2551,7 +2756,10 @@ fn forward_i64_store_loads(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<Wa
     let mut temp_local = None;
 
     while i < body.len() {
-        if let WasmInst::I64Store { offset: store_offset } = body[i] {
+        if let WasmInst::I64Store {
+            offset: store_offset,
+        } = body[i]
+        {
             // Pattern A:
             //   i64.store X
             //   local.get 0
@@ -2562,7 +2770,9 @@ fn forward_i64_store_loads(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<Wa
             {
                 let temp = get_or_alloc_i64_temp(&mut temp_local, next_local);
                 out.push(WasmInst::LocalTee { idx: temp });
-                out.push(WasmInst::I64Store { offset: store_offset });
+                out.push(WasmInst::I64Store {
+                    offset: store_offset,
+                });
                 out.push(WasmInst::LocalGet { idx: temp });
                 i += 3;
                 changes += 1;
@@ -2583,7 +2793,9 @@ fn forward_i64_store_loads(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<Wa
             {
                 let temp = get_or_alloc_i64_temp(&mut temp_local, next_local);
                 out.push(WasmInst::LocalTee { idx: temp });
-                out.push(WasmInst::I64Store { offset: store_offset });
+                out.push(WasmInst::I64Store {
+                    offset: store_offset,
+                });
                 out.push(WasmInst::LocalGet { idx: 0 });
                 out.push(WasmInst::LocalGet { idx: temp });
                 i += 4;
@@ -2864,7 +3076,13 @@ fn cache_gpr_i64_values(body: Vec<WasmInst>, next_local: &mut u32) -> (Vec<WasmI
 }
 
 /// Helper for atomic word operations (XOR, AND, OR)
-fn emit_amo_op_w(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, op: WasmInst) {
+fn emit_amo_op_w(
+    body: &mut Vec<WasmInst>,
+    rd: u32,
+    rs1_offset: u32,
+    rs2_offset: u32,
+    op: WasmInst,
+) {
     let rd_offset = rd * 8;
 
     // Load old value to rd
@@ -2894,7 +3112,13 @@ fn emit_amo_op_w(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset:
 }
 
 /// Helper for atomic doubleword operations (XOR, AND, OR)
-fn emit_amo_op_d(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, op: WasmInst) {
+fn emit_amo_op_d(
+    body: &mut Vec<WasmInst>,
+    rd: u32,
+    rs1_offset: u32,
+    rs2_offset: u32,
+    op: WasmInst,
+) {
     let rd_offset = rd * 8;
 
     // Load old value to rd
@@ -2924,7 +3148,13 @@ fn emit_amo_op_d(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset:
 /// Helper for atomic word min/max operations (AMOMIN_W, AMOMAX_W, AMOMINU_W, AMOMAXU_W)
 /// cmp_op should be: I32LtS (min signed), I32LtU (min unsigned),
 ///                   I32GtS (max signed), I32GtU (max unsigned)
-fn emit_amo_minmax_w(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, cmp_op: WasmInst) {
+fn emit_amo_minmax_w(
+    body: &mut Vec<WasmInst>,
+    rd: u32,
+    rs1_offset: u32,
+    rs2_offset: u32,
+    cmp_op: WasmInst,
+) {
     let rd_offset = rd * 8;
 
     // Load old value to rd
@@ -2971,7 +3201,13 @@ fn emit_amo_minmax_w(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_off
 /// Helper for atomic doubleword min/max operations (AMOMIN_D, AMOMAX_D, AMOMINU_D, AMOMAXU_D)
 /// cmp_op should be: I64LtS (min signed), I64LtU (min unsigned),
 ///                   I64GtS (max signed), I64GtU (max unsigned)
-fn emit_amo_minmax_d(body: &mut Vec<WasmInst>, rd: u32, rs1_offset: u32, rs2_offset: u32, cmp_op: WasmInst) {
+fn emit_amo_minmax_d(
+    body: &mut Vec<WasmInst>,
+    rd: u32,
+    rs1_offset: u32,
+    rs2_offset: u32,
+    cmp_op: WasmInst,
+) {
     let rd_offset = rd * 8;
 
     // Load old value to rd
@@ -3118,13 +3354,10 @@ mod tests {
             .iter()
             .any(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40)));
 
-        assert!(func
-            .body
-            .windows(2)
-            .any(|window| matches!(
-                (&window[0], &window[1]),
-                (WasmInst::LocalGet { idx: 0 }, WasmInst::LocalGet { idx: 4 })
-            )));
+        assert!(func.body.windows(2).any(|window| matches!(
+            (&window[0], &window[1]),
+            (WasmInst::LocalGet { idx: 0 }, WasmInst::LocalGet { idx: 4 })
+        )));
     }
 
     #[test]
@@ -3162,13 +3395,10 @@ mod tests {
             .body
             .iter()
             .any(|inst| matches!(inst, WasmInst::LocalTee { idx } if *idx == 2)));
-        assert!(!func
-            .body
-            .windows(2)
-            .any(|window| matches!(
-                (&window[0], &window[1]),
-                (WasmInst::LocalSet { idx: 2 }, WasmInst::LocalGet { idx: 2 })
-            )));
+        assert!(!func.body.windows(2).any(|window| matches!(
+            (&window[0], &window[1]),
+            (WasmInst::LocalSet { idx: 2 }, WasmInst::LocalGet { idx: 2 })
+        )));
     }
 
     #[test]
@@ -3263,7 +3493,10 @@ mod tests {
             .iter()
             .filter(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40))
             .count();
-        assert_eq!(load40_count, 1, "first load should seed cache, second should reuse local");
+        assert_eq!(
+            load40_count, 1,
+            "first load should seed cache, second should reuse local"
+        );
         assert!(func
             .body
             .iter()
@@ -3295,6 +3528,9 @@ mod tests {
             .iter()
             .filter(|inst| matches!(inst, WasmInst::I64Load { offset } if *offset == 40))
             .count();
-        assert!(load40_count >= 1, "overlapping store must invalidate x5 cache");
+        assert!(
+            load40_count >= 1,
+            "overlapping store must invalidate x5 cache"
+        );
     }
 }

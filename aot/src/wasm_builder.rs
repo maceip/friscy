@@ -7,8 +7,8 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use wasm_encoder::{
     CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, ImportSection, Instruction, MemoryType, Module,
-    TableSection, TableType, TypeSection, ValType,
+    Function, FunctionSection, ImportSection, Instruction, MemoryType, Module, TableSection,
+    TableType, TypeSection, ValType,
 };
 
 /// Build the final Wasm binary
@@ -100,8 +100,8 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
 
     // Active element segment at table index 0, offset 0
     elements.active(
-        Some(0),                           // table index
-        &ConstExpr::i32_const(0),          // offset
+        Some(0),                  // table index
+        &ConstExpr::i32_const(0), // offset
         Elements::Functions(&func_indices),
     );
 
@@ -181,7 +181,7 @@ pub fn build_jit(module: &WasmModule) -> Result<Vec<u8>> {
         "env",
         "memory",
         MemoryType {
-            minimum: 256, // negotiated with runtime (16MB min)
+            minimum: 256,         // negotiated with runtime (16MB min)
             maximum: Some(65536), // 4GB max
             memory64: false,
             shared: true,
@@ -257,7 +257,10 @@ pub fn build_jit(module: &WasmModule) -> Result<Vec<u8>> {
 /// Build JIT dispatch:
 /// - loops over compiled blocks using call_indirect
 /// - returns immediately on halt/syscall/dispatch miss
-fn build_jit_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) -> Function {
+fn build_jit_dispatch_function(
+    module: &WasmModule,
+    addr_to_table_idx: &BTreeMap<u64, u32>,
+) -> Function {
     // Locals: param0=$m (i32), param1=$start_pc (i32), local2=$pc (i32)
     let mut func = Function::new(vec![(1, ValType::I32)]);
 
@@ -307,7 +310,10 @@ fn build_jit_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap
 }
 
 /// Build the main dispatch function with O(1) block lookup via call_indirect
-fn build_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64, u32>) -> Function {
+fn build_dispatch_function(
+    module: &WasmModule,
+    addr_to_table_idx: &BTreeMap<u64, u32>,
+) -> Function {
     // Locals: param 0 = $m (i32), param 1 = $start_pc (i32), local 2 = $pc (i32)
     let mut func = Function::new(vec![(1, ValType::I32)]); // 1 local for pc
 
@@ -362,10 +368,7 @@ fn build_dispatch_function(module: &WasmModule, addr_to_table_idx: &BTreeMap<u64
         func.instruction(&Instruction::I32ShrU);
 
         // call_indirect with type 0 (block function signature)
-        func.instruction(&Instruction::CallIndirect {
-            ty: 0,
-            table: 0,
-        });
+        func.instruction(&Instruction::CallIndirect { ty: 0, table: 0 });
 
         func.instruction(&Instruction::LocalSet(2));
     } else {
@@ -467,11 +470,19 @@ fn compute_addr_alignment(addrs: &[(u64, u32)]) -> u64 {
     for &(addr, _) in &addrs[1..] {
         g = gcd_u64(g, addr - base);
     }
-    if g == 0 { 2 } else { g }
+    if g == 0 {
+        2
+    } else {
+        g
+    }
 }
 
 fn gcd_u64(a: u64, b: u64) -> u64 {
-    if b == 0 { a } else { gcd_u64(b, a % b) }
+    if b == 0 {
+        a
+    } else {
+        gcd_u64(b, a % b)
+    }
 }
 
 /// Emit O(1) br_table dispatch with dense index mapping
@@ -631,7 +642,7 @@ fn emit_br_table_dispatch_jit(
     func.instruction(&Instruction::BrTable(targets.into(), 0));
 
     func.instruction(&Instruction::End); // end $default
-    // Default: unknown PC for this compiled region => return miss PC.
+                                         // Default: unknown PC for this compiled region => return miss PC.
     func.instruction(&Instruction::LocalGet(2));
     func.instruction(&Instruction::Return);
 
@@ -909,33 +920,45 @@ fn emit_instruction(func: &mut Function, inst: &WasmInst) -> Result<()> {
         // i32 loads
         WasmInst::I32Load8S { offset } => {
             func.instruction(&Instruction::I32Load8S(wasm_encoder::MemArg {
-                offset: *offset as u64, align: 0, memory_index: 0,
+                offset: *offset as u64,
+                align: 0,
+                memory_index: 0,
             }));
         }
         WasmInst::I32Load8U { offset } => {
             func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
-                offset: *offset as u64, align: 0, memory_index: 0,
+                offset: *offset as u64,
+                align: 0,
+                memory_index: 0,
             }));
         }
         WasmInst::I32Load16S { offset } => {
             func.instruction(&Instruction::I32Load16S(wasm_encoder::MemArg {
-                offset: *offset as u64, align: 1, memory_index: 0,
+                offset: *offset as u64,
+                align: 1,
+                memory_index: 0,
             }));
         }
         WasmInst::I32Load16U { offset } => {
             func.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
-                offset: *offset as u64, align: 1, memory_index: 0,
+                offset: *offset as u64,
+                align: 1,
+                memory_index: 0,
             }));
         }
         // i32 stores
         WasmInst::I32Store8 { offset } => {
             func.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
-                offset: *offset as u64, align: 0, memory_index: 0,
+                offset: *offset as u64,
+                align: 0,
+                memory_index: 0,
             }));
         }
         WasmInst::I32Store16 { offset } => {
             func.instruction(&Instruction::I32Store16(wasm_encoder::MemArg {
-                offset: *offset as u64, align: 1, memory_index: 0,
+                offset: *offset as u64,
+                align: 1,
+                memory_index: 0,
             }));
         }
 
@@ -1357,9 +1380,10 @@ mod tests {
     #[test]
     fn test_build_sparse_blocks_mixed_alignment() {
         // Addresses with mixed 2-byte and 4-byte offsets (simulating C extension mixing)
-        let addrs = vec![0x1000, 0x1002, 0x1006, 0x1008, 0x100e, 0x1010,
-                         0x1014, 0x1018, 0x101a, 0x101e, 0x1020, 0x1024,
-                         0x1028, 0x102a, 0x102e, 0x1030, 0x1034, 0x1038];
+        let addrs = vec![
+            0x1000, 0x1002, 0x1006, 0x1008, 0x100e, 0x1010, 0x1014, 0x1018, 0x101a, 0x101e, 0x1020,
+            0x1024, 0x1028, 0x102a, 0x102e, 0x1030, 0x1034, 0x1038,
+        ];
         let module = make_module(&addrs);
         let bytes = build(&module).unwrap();
         assert_eq!(&bytes[0..4], b"\0asm");

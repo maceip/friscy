@@ -3,7 +3,7 @@
 // Uses goblin for parsing, extracts code sections and metadata.
 
 use anyhow::{Context, Result};
-use goblin::elf::{Elf, program_header};
+use goblin::elf::{program_header, Elf};
 
 /// Information about a loaded ELF
 #[derive(Debug, Clone)]
@@ -120,9 +120,7 @@ pub fn extract_code_sections(data: &[u8], info: &ElfInfo) -> Result<Vec<CodeSect
 
                 if end <= data.len() {
                     // Avoid duplicates
-                    let already_have = sections
-                        .iter()
-                        .any(|s| s.vaddr == section.sh_addr);
+                    let already_have = sections.iter().any(|s| s.vaddr == section.sh_addr);
 
                     if !already_have {
                         sections.push(CodeSection {

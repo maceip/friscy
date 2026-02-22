@@ -1,3 +1,6 @@
+#![allow(clippy::all)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::manual_is_multiple_of)]
 // translate.rs - RISC-V to WebAssembly translation
 //
 // Translates basic blocks to Wasm functions following the architecture

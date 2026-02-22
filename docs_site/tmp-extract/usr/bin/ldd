@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /lib/ld-musl-riscv64.so.1 --list "$@"

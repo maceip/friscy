@@ -53,6 +53,14 @@ tests/echo_server/echo_server
 
 # Large rootfs tarballs (built locally via Docker)
 friscy-bundle/*.tar
+docs_site/*.tar
+!docs_site/rootfs.tar
+!docs_site/goserver.tar
+
+# Large checkpoints
+friscy-bundle/*.ckpt
+docs_site/*.ckpt
+!docs_site/alpine-bash.ckpt
 
 # OS
 .DS_Store

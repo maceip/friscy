@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Export Checkpoint (LD_PRELOAD)</title>
+  <style>
+    body { font-family: system-ui; margin: 2rem; max-width: 600px; }
+    #status { margin: 1rem 0; padding: 1rem; background: #eee; border-radius: 4px; }
+    #status.done { background: #dfd; }
+    #status.error { background: #fdd; }
+    .muted { color: #666; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>Export Checkpoint (with LD_PRELOAD)</h1>
+  <p class="muted">Runs Node + claude-repl with vh_preload (compute offload) until stdin wait, saves checkpoint. Takes ~20–30 minutes.</p>
+  <div id="status">Initializing...</div>
+
+  <script type="module">
+    const status = document.getElementById('status');
+
+    function setStatus(msg, cls = '') {
+      status.textContent = msg;
+      status.className = cls;
+    }
+
+    try {
+      window.__checkpointExportTimeline = [];
+      window.__checkpointExportMetrics = null;
+
+      if (!crossOriginIsolated) {
+        setStatus('Error: Page must be served with COOP/COEP (SharedArrayBuffer)', 'error');
+        throw new Error('Not cross-origin isolated');
+      }
+
+      // Fetch rootfs
+      setStatus('Downloading rootfs...');
+      const rootfsResp = await fetch('./claude-slim-snap.tar');
+      if (!rootfsResp.ok) throw new Error('Failed to fetch rootfs');
+      const rootfs = await rootfsResp.arrayBuffer();
+      setStatus('Rootfs loaded. Starting worker...');
+
+      // SABs
+      const controlSab = new SharedArrayBuffer(4096);
+      const stdoutSab = new SharedArrayBuffer(65536);
+      const controlView = new Int32Array(controlSab);
+      controlView[6] = 80;
+      controlView[7] = 24;
+
+      const worker = new Worker('./worker.js', { type: 'module' });
+      const initDone = new Promise((resolve, reject) => {
+        worker.onmessage = (e) => {
+          if (e.data.type === 'ready') { resolve(); worker.onmessage = null; }
+          else if (e.data.type === 'error') reject(new Error(e.data.message));
+        };
+        worker.onerror = (e) => reject(new Error('Worker: ' + (e.message || 'unknown')));
+        setTimeout(() => reject(new Error('Init timeout')), 60000);
+      });
+      worker.postMessage({ type: 'init', controlSab, stdoutSab });
+      await initDone;
+
+      setStatus('Exporting checkpoint (this takes ~20–30 minutes)...');
+
+      const exportDone = new Promise((resolve, reject) => {
+        worker.onmessage = (e) => {
+          if (e.data.type === 'checkpoint-export-stage') {
+            window.__checkpointExportTimeline.push({
+              stage: e.data.stage,
+              atMs: e.data.atMs,
+              stopped: e.data.stopped,
+            });
+          } else if (e.data.type === 'checkpoint-exported') {
+            window.__checkpointExportMetrics = e.data.metrics || null;
+            resolve(e.data.data);
+          } else if (e.data.type === 'checkpoint-export-error') {
+            const err = new Error(e.data.message);
+            if (e.data.stack) err.workerStack = e.data.stack;
+            window.__checkpointExportStack = e.data.stack;
+            reject(err);
+          }
+        };
+      });
+
+      worker.postMessage({ type: 'export-checkpoint', rootfsData: rootfs }, [rootfs]);
+
+      const data = await exportDone;
+      const blob = new Blob([data], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'claude-repl.ckpt';
+      a.click();
+      URL.revokeObjectURL(url);
+
+      setStatus('Done! Checkpoint downloaded as claude-repl.ckpt', 'done');
+      window.__checkpointExportDone = true;
+    } catch (e) {
+      setStatus('Error: ' + e.message, 'error');
+      window.__checkpointExportError = e.message;
+      window.__checkpointExportStack = e.workerStack || e.stack;
+      console.error(e);
+    }
+  </script>
+</body>
+</html>

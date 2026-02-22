@@ -1,0 +1,25 @@
+FROM --platform=linux/riscv64 alpine:latest
+
+# Install requested packages: bash, git, wget, tmux, nano, screen, plus ncurses for 256 colors
+RUN apk add --no-cache bash git wget tmux nano screen ncurses vim curl
+
+# Create an impressive 256 color MOTD using ANSI escape codes
+RUN cat <<'EOF' > /etc/motd
+[38;5;196m   __[38;5;202m  _[38;5;208m  _[38;5;214m   [38;5;220m  [38;5;226m  [0m
+[38;5;196m  / _[38;5;202m | |[38;5;208m(_)[38;5;214m___[38;5;220m__[38;5;226m _   _[0m
+[38;5;196m | |_[38;5;202m| |[38;5;208m| |[38;5;214m __[38;5;220m/ _[38;5;226m| | | |[0m
+[38;5;196m |  _[38;5;202m| |[38;5;208m| |[38;5;214m__ [38;5;220m\ (_[38;5;226m| |_| |[0m
+[38;5;196m |_| [38;5;202m|_|[38;5;208m|_|[38;5;214m___[38;5;220m/__[38;5;226m|\__, |[0m
+[38;5;196m     [38;5;202m   [38;5;208m   [38;5;214m   [38;5;220m  [38;5;226m |___/[0m
+
+[38;5;82mWelcome to the friscy Alpine environment![0m
+[38;5;39mPackages installed: bash, git, wget, tmux, nano, screen[0m
+EOF
+
+# Ensure the MOTD is displayed when bash starts for interactive shells
+RUN echo "cat /etc/motd" >> /root/.bashrc
+
+# Set the default shell to bash
+ENV SHELL=/bin/bash
+WORKDIR /root
+CMD ["/bin/bash"]

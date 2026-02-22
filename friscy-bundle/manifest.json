@@ -1,7 +1,7 @@
 {
   "version": 1,
   "image": "friscy-alpine",
-  "entrypoint": ["/bin/sh"],
+  "entrypoint": ["/bin/bash"],
   "rootfs": "./rootfs.tar",
   "workdir": "/root",
   "env": [

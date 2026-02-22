@@ -1,0 +1,15 @@
+alpine-baselayout
+alpine-keys
+alpine-release
+apk-tools
+bash
+busybox
+curl
+git
+musl-utils
+nano
+ncurses
+screen
+tmux
+vim
+wget

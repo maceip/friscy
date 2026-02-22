@@ -131,6 +131,7 @@ run_mode "edge_triplet" "${MODE_QUERY[edge_triplet]}"
 git_commit="$(cd "$PROJECT_DIR" && git rev-parse HEAD)"
 timestamp_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
+# shellcheck disable=SC2016
 node -e '
 const fs = require("fs");
 
@@ -260,6 +261,7 @@ fs.writeFileSync(outFile, JSON.stringify(result, null, 2));
   "${MODE_DATA_FILE[no_predictor]}" "${MODE_DATA_FILE[edge]}" "${MODE_DATA_FILE[edge_triplet]}"
 
 echo "[bench-claude] Summary:"
+# shellcheck disable=SC2016
 node -e '
 const fs = require("fs");
 const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));

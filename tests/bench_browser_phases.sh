@@ -101,6 +101,7 @@ bash "$PROJECT_DIR/tests/bench_browser_node42.sh" \
 
 echo
 echo "[bench-phases] Phase comparison (Phase 2 vs Phase 1):"
+# shellcheck disable=SC2016
 node -e '
 const fs = require("fs");
 const p1 = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));

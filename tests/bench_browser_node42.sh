@@ -246,6 +246,7 @@ fs.writeFileSync(outFile, JSON.stringify(result, null, 2));
 
 echo
 echo "[bench] Summary:"
+# shellcheck disable=SC2016
 node -e '
 const fs = require("fs");
 const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));

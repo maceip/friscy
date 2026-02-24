@@ -64,6 +64,13 @@ const CMD_RESIZE = 6;
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const CMD_NETWORK_RPC_DONE = 7;
 const CMD_EXPORT_VFS = 8;
+const CMD_EXPORT_CHECKPOINT = 9;
+const CMD_ACTIVATE_VH_STAGE2 = 10;
+
+const STOP_REASON_NONE = 0;
+const STOP_REASON_STDIN = 1 << 0;
+const STOP_REASON_HOST_FETCH = 1 << 1;
+const STOP_REASON_TIMESLICE = 1 << 2;
 
 // Network RPC operation codes (stored in payload[0])
 const NET_OP_SOCKET_CREATE = 1;
@@ -110,10 +117,28 @@ let stdoutBytes = null;
 let netView = null;
 let netBytes = null;
 let emModule = null;
+let timesliceResumeEnabled = true;
+
+function redactUrlForLog(url) {
+    try {
+        const u = new URL(String(url || ''));
+        if (u.searchParams.has('key')) {
+            u.searchParams.set('key', '[REDACTED]');
+        }
+        return u.toString();
+    } catch (_e) {
+        return String(url || '');
+    }
+}
+let jitPrewarmEnabled = true;
+let liveExportPending = false;
+let liveExportTimeoutId = null;
 
 let netWorker = null;
 let netRpcId = 1;
 const pendingRpcs = new Map();
+let netLaneReady = false;
+let netLaneInitError = null;
 
 const encoder = new TextEncoder();
 
@@ -179,10 +204,9 @@ function requestStdin(maxLen) {
  * Send a network RPC to the main thread and block until response.
  */
 function networkRPC(op, fd, arg1, arg2, data) {
+    if (!netView || !netBytes) return { result: -38, data: null };
     if (!netWorker) {
         // Fallback or JSPI environment - if not WebTransport proxy
-        if (!netView || !netBytes) return { result: -38, data: null };
-
         Atomics.store(netView, 1, op);
         Atomics.store(netView, 2, fd);
         Atomics.store(netView, 3, arg1);
@@ -220,6 +244,11 @@ function networkRPC(op, fd, arg1, arg2, data) {
     }
 
     // Modern isolated network lane via net_lane_worker
+    if (!netLaneReady) {
+        // Fail fast while lane is still initializing or failed. This avoids
+        // indefinite waits that make the guest look hung.
+        return { result: -107, data: null }; // ENOTCONN
+    }
     const id = netRpcId++;
     netWorker.postMessage({
         type: 'rpc', id, op, fd, arg1, arg2, 
@@ -280,13 +309,91 @@ function maybePostJitStats(force = false) {
     }
 }
 
+function getStopReason(friscy_stop_reason, friscy_stopped) {
+    if (typeof friscy_stop_reason === 'function') {
+        const mask = friscy_stop_reason() | 0;
+        return Number.isFinite(mask) ? mask : STOP_REASON_NONE;
+    }
+    // Backwards compatibility with older runtimes.
+    return (typeof friscy_stopped === 'function' && friscy_stopped())
+        ? STOP_REASON_STDIN
+        : STOP_REASON_NONE;
+}
+
+function clearLiveExportPending() {
+    liveExportPending = false;
+    if (liveExportTimeoutId) {
+        clearTimeout(liveExportTimeoutId);
+        liveExportTimeoutId = null;
+    }
+}
+
+function requestLiveExportFromResumeLoop() {
+    if (!controlView) throw new Error('Control SAB unavailable');
+    if (liveExportPending) throw new Error('Live checkpoint export already in progress');
+    liveExportPending = true;
+    liveExportTimeoutId = setTimeout(() => {
+        if (!liveExportPending) return;
+        clearLiveExportPending();
+        self.postMessage({ type: 'checkpoint-export-error', message: 'Live checkpoint export timed out' });
+    }, 300000);
+    Atomics.store(controlView, 0, CMD_EXPORT_CHECKPOINT);
+    Atomics.notify(controlView, 0);
+}
+
 /**
  * Run the resume loop.
  */
 async function runResumeLoop() {
     console.log('[worker] entering resume loop');
     let resumeCount = 0;
+    const loopStartMs = Date.now();
+    const telemetry = {
+        stopStdin: 0,
+        stopHostFetch: 0,
+        stopTimeslice: 0,
+        timesliceResumeAttempts: 0,
+        jitDispatches: 0,
+        jitFallbacks: 0,
+        jitDirectRuns: 0,
+        jitRegionMisses: 0,
+        jitSyscalls: 0,
+        jitHalts: 0,
+    };
+    let telemetryFlushed = false;
+    const flushTelemetry = (outcome) => {
+        if (telemetryFlushed) return;
+        telemetryFlushed = true;
+        const elapsedMs = Date.now() - loopStartMs;
+        let jitSummary = null;
+        try {
+            if (jitManager && typeof jitManager.getStats === 'function') {
+                const s = jitManager.getStats();
+                jitSummary = {
+                    compiledRegionCount: s?.compiledRegionCount ?? null,
+                    compileFailures: s?.compileFailures ?? null,
+                    queueDepth: s?.queueDepth ?? null,
+                    prewarmAttempts: s?.prewarmAttempts ?? null,
+                    prewarmSuccesses: s?.prewarmSuccesses ?? null,
+                    prewarmFailures: s?.prewarmFailures ?? null,
+                    compilerPrewarmed: s?.compilerPrewarmed ?? null,
+                    firstCompileLatencyMs: s?.firstCompileLatencyMs ?? null,
+                };
+            }
+        } catch (_e) {
+            // ignore stats fetch errors
+        }
+        console.log(`[worker] resume telemetry ${JSON.stringify({
+            outcome,
+            elapsedMs,
+            resumeCount,
+            timesliceResumeEnabled,
+            ...telemetry,
+            jitSummary,
+        })}`);
+    };
     const friscy_stopped = emModule._friscy_stopped;
+    const friscy_stop_reason = emModule._friscy_stop_reason;
     const friscy_resume = emModule._friscy_resume;
     const friscy_get_pc = emModule._friscy_get_pc;
     const friscy_set_pc = emModule._friscy_set_pc;
@@ -296,7 +403,21 @@ async function runResumeLoop() {
     const friscy_get_fetch_request_len = emModule._friscy_get_fetch_request_len;
     const friscy_set_fetch_response = emModule._friscy_set_fetch_response;
 
-    while (friscy_stopped()) {
+    while (true) {
+        const rawStopReason = getStopReason(friscy_stop_reason, friscy_stopped);
+        if (rawStopReason & STOP_REASON_STDIN) telemetry.stopStdin++;
+        if (rawStopReason & STOP_REASON_HOST_FETCH) telemetry.stopHostFetch++;
+        if (rawStopReason & STOP_REASON_TIMESLICE) telemetry.stopTimeslice++;
+        const stopReason = timesliceResumeEnabled
+            ? rawStopReason
+            : (rawStopReason & ~STOP_REASON_TIMESLICE);
+
+        if (stopReason === STOP_REASON_NONE) {
+            flushTelemetry('finished');
+            console.log(`[worker] resume loop: machine finished after ${resumeCount} resumes`);
+            return;
+        }
+
         while (self._isSuspended) {
             await new Promise(r => setTimeout(r, 100));
         }
@@ -313,8 +434,9 @@ async function runResumeLoop() {
                     const size = emModule.HEAPU32[sizePtr >> 2];
                     emModule._free(sizePtr);
                     if (dataPtr && size > 0) {
-                        const tarData = emModule.HEAPU8.slice(dataPtr, dataPtr + size).buffer;
-                        emModule._free(dataPtr);
+                        const ptr = dataPtr >>> 0;
+                        const tarData = emModule.HEAPU8.slice(ptr, ptr + size).buffer;
+                        emModule._free(ptr);
                         self.postMessage({ type: 'vfs_export', tarData }, [tarData]);
                     }
                 } catch (e) {
@@ -323,22 +445,56 @@ async function runResumeLoop() {
             }
         }
 
-        const cmd = Atomics.load(controlView, 0);
-        if (cmd === CMD_STDIN_READY) {
-            const len = Atomics.load(controlView, 2);
-            if (len > 0) {
-                for (let i = 0; i < len; i++) {
-                    emModule._stdinBuffer.push(controlBytes[64 + i]);
-                }
-            }
+        if (currentCmd === CMD_EXPORT_CHECKPOINT) {
             Atomics.store(controlView, 0, CMD_IDLE);
-        } else {
-            Atomics.store(controlView, 2, 4096);
-            Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
-            Atomics.notify(controlView, 0);
-            Atomics.wait(controlView, 0, CMD_STDIN_REQUEST, 100);
-            const newCmd = Atomics.load(controlView, 0);
-            if (newCmd === CMD_STDIN_READY) {
+            try {
+                const liveExport = emModule._friscy_save_live_checkpoint || emModule._friscy_export_checkpoint;
+                if (!liveExport) {
+                    throw new Error('No checkpoint export function available');
+                }
+                const sizePtr = emModule._malloc(4);
+                const dataPtr = liveExport(sizePtr);
+                const size = Number(emModule.HEAPU32[Number(sizePtr) >> 2]);
+                emModule._free(sizePtr);
+                if (!dataPtr || size <= 0) {
+                    throw new Error('Live checkpoint export returned empty payload');
+                }
+                const ptr = dataPtr >>> 0;
+                const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
+                emModule._free(ptr);
+                clearLiveExportPending();
+                self.postMessage({
+                    type: 'checkpoint-exported-live',
+                    data: copy,
+                    metrics: { bytes: copy.length },
+                }, [copy.buffer]);
+            } catch (e) {
+                clearLiveExportPending();
+                console.error('[worker] Live export failed (resume loop):', e.message, e.stack);
+                self.postMessage({ type: 'checkpoint-export-error', message: e.message, stack: e.stack });
+            }
+        }
+
+        if (currentCmd === CMD_ACTIVATE_VH_STAGE2) {
+            Atomics.store(controlView, 0, CMD_IDLE);
+            try {
+                if (typeof emModule._friscy_activate_vh_stage2 !== 'function') {
+                    throw new Error('friscy_activate_vh_stage2 export missing');
+                }
+                const rc = emModule._friscy_activate_vh_stage2();
+                if (rc !== 0) {
+                    throw new Error(`friscy_activate_vh_stage2 failed rc=${rc}`);
+                }
+                self.postMessage({ type: 'vh-stage2-activated' });
+            } catch (e) {
+                console.error('[worker] VH stage2 activation failed:', e.message, e.stack);
+                self.postMessage({ type: 'vh-stage2-error', message: e.message, stack: e.stack });
+            }
+        }
+
+        if (stopReason & STOP_REASON_STDIN) {
+            const cmd = Atomics.load(controlView, 0);
+            if (cmd === CMD_STDIN_READY) {
                 const len = Atomics.load(controlView, 2);
                 if (len > 0) {
                     for (let i = 0; i < len; i++) {
@@ -347,16 +503,42 @@ async function runResumeLoop() {
                 }
                 Atomics.store(controlView, 0, CMD_IDLE);
             } else {
-                Atomics.store(controlView, 0, CMD_IDLE);
+                Atomics.store(controlView, 2, 4096);
+                Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
+                Atomics.notify(controlView, 0);
+                // Keep waiting for actual stdin data instead of timing out to EOF.
+                // Clearing CMD_STDIN_REQUEST too early makes interactive shells exit.
+                while (Atomics.load(controlView, 0) === CMD_STDIN_REQUEST) {
+                    Atomics.wait(controlView, 0, CMD_STDIN_REQUEST, 100);
+                }
+                const newCmd = Atomics.load(controlView, 0);
+                if (newCmd === CMD_STDIN_READY) {
+                    const len = Atomics.load(controlView, 2);
+                    if (len > 0) {
+                        for (let i = 0; i < len; i++) {
+                            emModule._stdinBuffer.push(controlBytes[64 + i]);
+                        }
+                    }
+                    Atomics.store(controlView, 0, CMD_IDLE);
+                } else if (
+                    newCmd === CMD_EXPORT_VFS ||
+                    newCmd === CMD_EXPORT_CHECKPOINT ||
+                    newCmd === CMD_ACTIVATE_VH_STAGE2
+                ) {
+                    // A control command preempted stdin wait; handle it at loop top.
+                    continue;
+                }
             }
         }
         maybePostJitStats();
 
-        if (friscy_host_fetch_pending && friscy_host_fetch_pending()) {
+        if ((stopReason & STOP_REASON_HOST_FETCH) && friscy_host_fetch_pending && friscy_host_fetch_pending()) {
             try {
                 const reqPtr = friscy_get_fetch_request();
                 const reqLen = friscy_get_fetch_request_len();
-                const reqBytes = new Uint8Array(emModule.HEAPU8.buffer, reqPtr, reqLen);
+                const reqPtrU = reqPtr >>> 0;
+                const reqLenU = reqLen >>> 0;
+                const reqBytes = new Uint8Array(emModule.HEAPU8.buffer, reqPtrU, reqLenU);
                 const reqJSON = new TextDecoder().decode(reqBytes.slice());
                 const req = JSON.parse(reqJSON);
 
@@ -364,28 +546,50 @@ async function runResumeLoop() {
                     throw new Error("Sandbox policy prohibits external network requests.");
                 }
 
-                console.log(`[worker] host-fetch: ${req.options?.method || 'GET'} ${req.url}`);
+                console.log(`[worker] host-fetch: ${req.options?.method || 'GET'} ${redactUrlForLog(req.url)}`);
 
+                let respJSON = '';
                 const fetchOpts = {};
                 if (req.options) {
                     if (req.options.method) fetchOpts.method = req.options.method;
                     if (req.options.headers) fetchOpts.headers = req.options.headers;
-                    if (req.options.body) fetchOpts.body = req.options.body;
+                    if (Object.prototype.hasOwnProperty.call(req.options, 'body')) {
+                        fetchOpts.body = req.options.body;
+                    }
                 }
-                const resp = await fetch(req.url, fetchOpts);
-                const body = await resp.text();
 
-                const respHeaders = {};
-                resp.headers.forEach((v, k) => { respHeaders[k] = v; });
-                const respJSON = JSON.stringify({
-                    status: resp.status,
-                    statusText: resp.statusText,
-                    headers: respHeaders,
-                    body: body,
-                });
+                let useProxy = false;
+                if (self.hostFetchProxy && req.url) {
+                    try {
+                        const target = new URL(req.url);
+                        useProxy = target.origin !== self.location.origin;
+                    } catch (_e) {
+                        useProxy = false;
+                    }
+                }
+
+                if (useProxy) {
+                    const proxyResp = await fetch(self.hostFetchProxy, {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json' },
+                        body: JSON.stringify({ url: req.url, options: fetchOpts }),
+                    });
+                    respJSON = await proxyResp.text();
+                } else {
+                    const resp = await fetch(req.url, fetchOpts);
+                    const body = await resp.text();
+                    const respHeaders = {};
+                    resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+                    respJSON = JSON.stringify({
+                        status: resp.status,
+                        statusText: resp.statusText,
+                        headers: respHeaders,
+                        body: body,
+                    });
+                }
 
                 const respBytes = encoder.encode(respJSON);
-                const ptr = emModule._malloc(respBytes.length);
+                const ptr = emModule._malloc(respBytes.length) >>> 0;
                 emModule.HEAPU8.set(respBytes, ptr);
                 friscy_set_fetch_response(ptr, respBytes.length);
                 emModule._free(ptr);
@@ -398,7 +602,7 @@ async function runResumeLoop() {
                     body: '',
                 });
                 const errBytes = encoder.encode(errResp);
-                const ptr = emModule._malloc(errBytes.length);
+                const ptr = emModule._malloc(errBytes.length) >>> 0;
                 emModule.HEAPU8.set(errBytes, ptr);
                 friscy_set_fetch_response(ptr, errBytes.length);
                 emModule._free(ptr);
@@ -412,27 +616,36 @@ async function runResumeLoop() {
             let chainCount = 0;
 
             while (chainCount < MAX_CHAIN) {
+                telemetry.jitDispatches++;
                 const jitResult = jitManager.execute(pc, statePtr);
                 if (!jitResult) {
+                    telemetry.jitFallbacks++;
                     jitManager.recordExecution(pc);
                     friscy_set_pc(pc);
                     break;
                 }
 
-                if (jitResult.isHalt) return;
+                if (jitResult.isHalt) {
+                    telemetry.jitHalts++;
+                    flushTelemetry('jit_halt');
+                    return;
+                }
 
                 if (jitResult.isSyscall) {
+                    telemetry.jitSyscalls++;
                     friscy_set_pc(jitResult.nextPC >>> 0);
                     break;
                 }
 
                 if (jitResult.regionMiss) {
+                    telemetry.jitRegionMisses++;
                     jitManager.recordTraceTransition(pc, jitResult.nextPC >>> 0);
                     pc = jitResult.nextPC >>> 0;
                     chainCount++;
                     continue;
                 }
 
+                telemetry.jitDirectRuns++;
                 friscy_set_pc(jitResult.nextPC >>> 0);
                 break;
             }
@@ -446,13 +659,17 @@ async function runResumeLoop() {
         if (resumeCount <= 5 || resumeCount % 100 === 0) {
             console.log(`[worker] resume #${resumeCount}`);
         }
+        if (rawStopReason & STOP_REASON_TIMESLICE) telemetry.timesliceResumeAttempts++;
         const stillStopped = await friscy_resume();
         maybePostJitStats();
         if (!stillStopped) {
+            flushTelemetry('finished_after_resume');
             console.log(`[worker] resume loop: machine finished after ${resumeCount} resumes`);
             return;
         }
     }
+
+    flushTelemetry('control_sab_missing');
 }
 
 self.addEventListener('error', (e) => {
@@ -488,13 +705,19 @@ self.onmessage = async function(e) {
         const jitMarkovEnabled = msg.jitMarkovEnabled !== false;
         const jitTripletEnabled = msg.jitTripletEnabled !== false;
         const jitAwaitCompiler = msg.jitAwaitCompiler === true;
+        jitPrewarmEnabled = msg.jitPrewarmEnabled !== false;
         const jitTraceEnabled = msg.jitTraceEnabled !== false;
         const jitEdgeHotThreshold = Number.isFinite(msg.jitEdgeHotThreshold) ? msg.jitEdgeHotThreshold : null;
         const jitTraceTripletHotThreshold = Number.isFinite(msg.jitTraceTripletHotThreshold)
             ? msg.jitTraceTripletHotThreshold
             : null;
         
+        timesliceResumeEnabled = msg.timesliceResumeEnabled !== false;
+
         self.allowNetwork = msg.allowNetwork === true;
+        self.hostFetchProxy = (typeof msg.hostFetchProxy === 'string' && msg.hostFetchProxy)
+            ? msg.hostFetchProxy
+            : '';
 
         controlView = new Int32Array(controlSab);
         controlBytes = new Uint8Array(controlSab);
@@ -524,7 +747,7 @@ self.onmessage = async function(e) {
                 writeStdoutRing(encoder.encode(text + '\n'));
             },
             printErr: function(text) {
-                console.error('[friscy-err]', text);
+                console.log('[friscy-err]', text);
             },
             _termWrite: function(text) {
                 writeStdoutRing(encoder.encode(text));
@@ -583,14 +806,21 @@ self.onmessage = async function(e) {
             const wasmMemory = emModule.wasmMemory || (emModule.asm && emModule.asm.memory);
             if (wasmMemory) {
                 jitManager.init(wasmMemory);
+                const warmCompiler = async () => {
+                    await jitManager.loadCompiler('rv2wasm_jit_bg.wasm');
+                    if (!jitPrewarmEnabled || !jitManager.jitCompiler || typeof jitManager.prewarmCompiler !== 'function') {
+                        return;
+                    }
+                    await jitManager.prewarmCompiler();
+                };
                 if (jitAwaitCompiler) {
                     try {
-                        await jitManager.loadCompiler('rv2wasm_jit_bg.wasm');
+                        await warmCompiler();
                     } catch (e) {
                         console.warn('[worker] JIT compiler wait failed:', e.message);
                     }
                 } else {
-                    jitManager.loadCompiler('rv2wasm_jit_bg.wasm').catch(e => {
+                    warmCompiler().catch(e => {
                         console.warn('[worker] JIT compiler not available:', e.message);
                     });
                 }
@@ -657,10 +887,38 @@ self.onmessage = async function(e) {
 
     if (msg.type === 'net_proxy') {
         console.log('[worker] Initializing WebTransport proxy lane to:', msg.proxyUrl);
+        netLaneReady = false;
+        netLaneInitError = null;
         netWorker = new Worker('./net_lane_worker.js', { type: 'module' });
+        setTimeout(() => {
+            if (!netLaneReady && !netLaneInitError) {
+                netLaneInitError = 'net lane did not report ready within 12s';
+                console.error('[worker] net lane timeout');
+                self.postMessage({ type: 'net_error', message: netLaneInitError });
+            }
+        }, 12000);
+        netWorker.onerror = (e) => {
+            netLaneReady = false;
+            netLaneInitError = e?.message || 'net lane worker crashed';
+            console.error('[worker] net lane worker error:', netLaneInitError);
+            self.postMessage({ type: 'net_error', message: netLaneInitError });
+        };
         
         netWorker.onmessage = (e) => {
             const laneMsg = e.data;
+            if (laneMsg.type === 'ready') {
+                netLaneReady = true;
+                console.log('[worker] net lane ready');
+                self.postMessage({ type: 'net_ready' });
+                return;
+            }
+            if (laneMsg.type === 'error') {
+                netLaneReady = false;
+                netLaneInitError = laneMsg.message || 'net lane init failed';
+                console.error('[worker] net lane init error:', netLaneInitError);
+                self.postMessage({ type: 'net_error', message: netLaneInitError });
+                return;
+            }
             if (laneMsg.type === 'rpc_result') {
                 if (!netView) return;
                 Atomics.store(netView, 5, laneMsg.result);
@@ -701,6 +959,16 @@ self.onmessage = async function(e) {
 
             await emModule.callMain(args);
             if (emModule._friscy_stopped && emModule._friscy_stopped()) {
+                if (jitPrewarmEnabled && jitManager.jitCompiler && typeof jitManager.prewarmRegionAt === 'function') {
+                    try {
+                        const pc = (typeof emModule._friscy_get_pc === 'function') ? (emModule._friscy_get_pc() >>> 0) : 0;
+                        const ok = await jitManager.prewarmRegionAt(pc);
+                        if (ok) console.log(`[worker] JIT region prewarmed at 0x${pc.toString(16)}`);
+                        else console.log(`[worker] JIT region prewarm skipped at 0x${pc.toString(16)}`);
+                    } catch (e) {
+                        console.warn('[worker] JIT region prewarm failed:', e.message);
+                    }
+                }
                 await runResumeLoop();
             }
             maybePostJitStats(true);
@@ -712,6 +980,54 @@ self.onmessage = async function(e) {
             writeStdoutRing(encoder.encode(`\r\n[worker] Error: ${errMsg}${errStack}\r\n`));
             maybePostJitStats(true);
             signalExit(1);
+        }
+    }
+
+    if (msg.type === 'stdin-push') {
+        if (!emModule || !emModule._stdinBuffer) return;
+        if (!msg.data) return;
+
+        const bytes = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
+        if (!bytes.length) return;
+
+        for (let i = 0; i < bytes.length; i++) {
+            emModule._stdinBuffer.push(bytes[i]);
+        }
+
+        if (controlView && controlBytes) {
+            const cmd = Atomics.load(controlView, 0);
+            const stopMask = getStopReason(emModule._friscy_stop_reason, emModule._friscy_stopped);
+            const blockedOnStdin = (stopMask & STOP_REASON_STDIN) !== 0;
+            if (cmd === CMD_STDIN_REQUEST || (cmd === CMD_IDLE && blockedOnStdin)) {
+                // Feed one byte through the blocking path to avoid signaling EOF.
+                const first = emModule._stdinBuffer.shift();
+                if (first !== undefined) {
+                    controlBytes[64] = first;
+                    Atomics.store(controlView, 2, 1);
+                    Atomics.store(controlView, 0, CMD_STDIN_READY);
+                    Atomics.notify(controlView, 0);
+                }
+            }
+        }
+    }
+
+    if (msg.type === 'activate-vh-stage2') {
+        if (!emModule) {
+            self.postMessage({ type: 'vh-stage2-error', message: 'Module not initialized' });
+            return;
+        }
+        try {
+            if (typeof emModule._friscy_activate_vh_stage2 !== 'function') {
+                throw new Error('friscy_activate_vh_stage2 export missing');
+            }
+            const rc = emModule._friscy_activate_vh_stage2();
+            if (rc !== 0) {
+                throw new Error(`friscy_activate_vh_stage2 failed rc=${rc}`);
+            }
+            self.postMessage({ type: 'vh-stage2-activated' });
+        } catch (e) {
+            console.error('[worker] VH stage2 activation failed:', e.message, e.stack);
+            self.postMessage({ type: 'vh-stage2-error', message: e.message, stack: e.stack });
         }
     }
 
@@ -778,9 +1094,9 @@ self.onmessage = async function(e) {
                 const size = Number(emModule.HEAPU32[Number(sizePtr) >> 2]);
                 emModule._free(sizePtr);
                 if (dataPtr && size > 0) {
-                    const ptr = Number(dataPtr);
+                    const ptr = dataPtr >>> 0;
                     copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
-                    emModule._free(dataPtr);
+                    emModule._free(ptr);
                 }
             }
             if (!copy) {
@@ -810,6 +1126,11 @@ self.onmessage = async function(e) {
             return;
         }
         try {
+            if (controlView) {
+                requestLiveExportFromResumeLoop();
+                return;
+            }
+
             const sizePtr = emModule._malloc(4);
             const liveExport = emModule._friscy_save_live_checkpoint || emModule._friscy_export_checkpoint;
             if (!liveExport) {
@@ -822,9 +1143,9 @@ self.onmessage = async function(e) {
             if (!dataPtr || size <= 0) {
                 throw new Error('Live checkpoint export returned empty payload');
             }
-            const ptr = Number(dataPtr);
+            const ptr = dataPtr >>> 0;
             const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
-            emModule._free(dataPtr);
+            emModule._free(ptr);
             self.postMessage({
                 type: 'checkpoint-exported-live',
                 data: copy,

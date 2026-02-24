@@ -402,3 +402,28 @@
   - commit: `7c60a0c`
   - remote: `origin/fix-ui-layout`
 - Ladder status: base boot + first checkpoint export (`gemini-version-post.ckpt`) is stable; second checkpoint upload still intermittently hangs and is current focus.
+
+## 2026-02-24 15:40 UTC - Gemini + Codex ladder recovery (browser)
+- Rebuilt and re-exported rootfs assets:
+  - `docs_site/gemini-r2.tar` from `tools/Dockerfile.gemini`
+  - `docs_site/codex.tar` from `tools/Dockerfile.codex`
+- Fixed ladder blocker by restoring request path to preload-patched `https.request`:
+  - `runtime/gemini-repl.js`
+  - `runtime/codex-repl.js`
+- Fixed ladder harness instability:
+  - kept terminal-driven command injection (`term.paste`) for phase transitions,
+  - replaced heavy `.xterm-rows` polling with lightweight `_friscy.rawOutputBuf` polling in:
+    - `tools/node_gemini_checkpoint_chain.mjs`
+    - `tools/node_codex_checkpoint_chain.mjs`
+- Live browser ladder result (green) for Gemini:
+  - command path: `gemini -p "write me a haiku"` then limerick
+  - checkpoints: `gemini-version-post.ckpt` -> `gemini-haiku.ckpt` -> `gemini-limerick.ckpt`
+  - timings (ms): bootBase 11936, bootPostVersion 1894, haiku 4051, bootPostHaiku 1910, limerick 3803
+- Live browser ladder result (green) for Codex:
+  - command path: `codex e 'write me a haiku'` then limerick
+  - checkpoints: `codex-version-post.ckpt` -> `codex-haiku.ckpt` -> `codex-limerick.ckpt`
+  - timings (ms): bootBase 10398, bootPostVersion 1144, haiku 5272, bootPostHaiku 1144, limerick 4790
+- Verified host-fetch hypercall lane is active in worker logs for both APIs.
+- Added host-fetch URL redaction in worker logs to prevent API key leakage:
+  - `docs_site/worker.js`
+  - `friscy-bundle/worker.js`

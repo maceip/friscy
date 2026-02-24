@@ -9,7 +9,7 @@ runtime/build-native/
 runtime/build-tailcall/
 node_modules/
 target/
-
+.env
 # Emscripten SDK (if installed locally)
 tools/emsdk/
 runtime/emsdk/
@@ -60,12 +60,20 @@ docs_site/*.tar
 !docs_site/rootfs.tar
 !docs_site/goserver.tar
 !docs_site/nodejs.tar
+!docs_site/gemini-r2.tar
+!docs_site/codex.tar
 
 # Large checkpoints
 friscy-bundle/*.ckpt
 docs_site/*.ckpt
 !friscy-bundle/alpine-bash.ckpt
 !docs_site/alpine-bash.ckpt
+!docs_site/gemini-version-post.ckpt
+!docs_site/gemini-haiku.ckpt
+!docs_site/gemini-limerick.ckpt
+!docs_site/codex-version-post.ckpt
+!docs_site/codex-haiku.ckpt
+!docs_site/codex-limerick.ckpt
 
 # OS
 .DS_Store
@@ -74,4 +82,3 @@ public/friscy-bundle/*.tar
 
 # Workspace / Nested
 AEON/
-

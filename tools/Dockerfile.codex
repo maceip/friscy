@@ -1,28 +1,25 @@
-# Dockerfile.codex - Build riscv64 Alpine rootfs with OpenAI Codex CLI
-#
-# Codex CLI is Rust — no riscv64 npm binary published.
-# Build from source on riscv64.
+# Dockerfile.codex - Lean riscv64 rootfs for browser Codex checkpoint ladders.
 #
 # Usage:
 #   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.codex -t friscy-codex . --load
 
 FROM --platform=linux/riscv64 alpine:edge
 
-# Install build dependencies
-RUN apk add --no-cache cargo rust git nodejs npm bash curl openssl-dev
+# Keep image deterministic and small for repeated checkpoint runs.
+RUN apk add --no-cache nodejs nodejs-dev npm bash curl ca-certificates gcc musl-dev
 
-# Clone Codex source
-RUN git clone --depth 1 https://github.com/openai/codex.git /tmp/codex
+# Deterministic command-loop runner used by browser ladders.
+COPY runtime/codex-repl.js /usr/local/bin/codex-repl.js
+RUN chmod +x /usr/local/bin/codex-repl.js
 
-# Build the Rust binary
-WORKDIR /tmp/codex/codex-rs
-RUN cargo build --release 2>&1 | tail -20 && \
-    cp target/release/codex /usr/local/bin/codex && \
-    strip /usr/local/bin/codex
-
-# Clean up build artifacts
-RUN rm -rf /tmp/codex /root/.cargo/registry /root/.cargo/git && \
-    apk del cargo rust git openssl-dev
+# Build hostfetch syscall addon for guest Node preload (/etc/https-hostfetch-preload.js).
+COPY tools/node_hostfetch_napi.c /tmp/node_hostfetch_napi.c
+RUN mkdir -p /usr/local/lib && \
+    gcc -shared -fPIC -O2 -o /usr/local/lib/hostfetch.node \
+      /tmp/node_hostfetch_napi.c \
+      -I/usr/include/node && \
+    rm -f /tmp/node_hostfetch_napi.c && \
+    apk del gcc musl-dev nodejs-dev
 
 WORKDIR /root
 CMD ["/bin/sh"]

@@ -17,7 +17,7 @@ function hasNamedKeyInDotenv(name) {
 }
 
 function readApiKeyFromDotenv() {
-  const keys = ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'ANTHROPIC_API_KEY'];
+  const keys = ['OPENAI_API_KEY'];
   try {
     const raw = readFileSync(resolve('.env'), 'utf8');
     for (const line of raw.split(/\r?\n/)) {
@@ -37,11 +37,11 @@ function readApiKeyFromDotenv() {
   return '';
 }
 
-let apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.ANTHROPIC_API_KEY || readApiKeyFromDotenv();
-let reportPath = resolve('docs', 'generated', 'node_gemini_checkpoint_chain_report.json');
+let apiKey = process.env.OPENAI_API_KEY || readApiKeyFromDotenv();
+let reportPath = resolve('docs', 'generated', 'node_codex_checkpoint_chain_report.json');
 const outDir = resolve('docs_site');
-const hasGeminiNamedKey = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || hasNamedKeyInDotenv('GEMINI_API_KEY') || hasNamedKeyInDotenv('GOOGLE_API_KEY'));
-let offlineOnly = process.env.GEMINI_OFFLINE_ONLY === '1' || !hasGeminiNamedKey;
+const hasOpenAIKey = Boolean(process.env.OPENAI_API_KEY || hasNamedKeyInDotenv('OPENAI_API_KEY'));
+let offlineOnly = process.env.CODEX_OFFLINE_ONLY === '1' || !hasOpenAIKey;
 
 const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i++) {
@@ -55,7 +55,7 @@ if (!apiKey) {
   if (offlineOnly) {
     apiKey = 'offline-dummy-key';
   } else {
-    console.error('[chain] Missing GEMINI_API_KEY/GOOGLE_API_KEY / --api-key');
+    console.error('[chain] Missing OPENAI_API_KEY / --api-key');
     process.exit(1);
   }
 }
@@ -180,9 +180,9 @@ function assertCommandSucceeded(result, label) {
   }
 }
 
-function assertNoGeminiAuthError(result, label) {
+function assertNoCodexAuthError(result, label) {
   const text = (result.delta || '').replace(/\s+/g, ' ');
-  if (/Please set an Auth method/i.test(text) || /GEMINI_API_KEY/i.test(text)) {
+  if (/OPENAI_API_KEY/i.test(text) || /invalid api key/i.test(text) || /Incorrect API key/i.test(text)) {
     throw new Error(`${label} failed auth: ${text.slice(0, 300)}`);
   }
 }
@@ -241,8 +241,8 @@ async function exportCheckpoint(page, filename) {
 async function bootPage(page, ckpt = null) {
   const cb = Date.now();
   const query = ckpt
-    ? `?example=gemini&nosw=1&noautockpt=1&ckpt=${encodeURIComponent('./' + ckpt)}&cb=${cb}`
-    : `?example=gemini&nosw=1&noautockpt=1&cb=${cb}`;
+    ? `?example=codex&nosw=1&noautockpt=1&ckpt=${encodeURIComponent('./' + ckpt)}&cb=${cb}`
+    : `?example=codex&nosw=1&noautockpt=1&cb=${cb}`;
   const t0 = Date.now();
   let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -296,29 +296,29 @@ async function main() {
 
   try {
     console.log('[chain] boot base');
-    report.steps.push('boot: base gemini');
+    report.steps.push('boot: base codex');
     report.timings.bootBaseMs = await bootPage(page, null);
 
-    const probeCmd = '__GEMINI_PROBE__';
-    console.log('[chain] run: gemini install probe');
-    report.steps.push('cmd: gemini install probe');
+    const probeCmd = '__CODEX_PROBE__';
+    console.log('[chain] run: codex install probe');
+    report.steps.push('cmd: codex install probe');
     const probe = await runCommand(page, probeCmd, 300000);
     report.timings.installProbeMs = probe.elapsedMs;
     report.installProbePreview = (probe.delta || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-    if (!probe.ok) throw new Error('gemini install probe did not complete');
-    assertCommandSucceeded(probe, 'gemini install probe');
+    if (!probe.ok) throw new Error('codex install probe did not complete');
+    assertCommandSucceeded(probe, 'codex install probe');
 
     console.log('[chain] checkpoint: post-probe');
     report.steps.push('checkpoint: post-probe');
-    const c1 = await exportCheckpoint(page, 'gemini-version-post.ckpt');
+    const c1 = await exportCheckpoint(page, 'codex-version-post.ckpt');
     report.checkpoints.postVersion = c1.path;
     report.timings.checkpointPostVersionMs = c1.ms;
 
     console.log('[chain] boot: post-version');
     report.steps.push('boot: post-version');
-    report.timings.bootPostVersionMs = await bootPage(page, 'gemini-version-post.ckpt');
+    report.timings.bootPostVersionMs = await bootPage(page, 'codex-version-post.ckpt');
 
-    const haikuCmd = offlineOnly ? 'gemini --help' : 'gemini -p "write me a haiku"';
+    const haikuCmd = offlineOnly ? 'codex --help' : "codex e 'write me a haiku'";
     console.log(`[chain] run: ${offlineOnly ? 'help' : 'haiku'}`);
     report.steps.push(`cmd: ${offlineOnly ? 'help' : 'haiku'}`);
     const haiku = await runCommand(page, haikuCmd, 1200000);
@@ -326,19 +326,19 @@ async function main() {
     report.haikuPreview = (haiku.delta || '').replace(/\s+/g, ' ').trim().slice(0, 300);
     if (!haiku.ok) throw new Error('haiku command did not complete');
     assertCommandSucceeded(haiku, offlineOnly ? 'help' : 'haiku');
-    if (!offlineOnly) assertNoGeminiAuthError(haiku, 'haiku');
+    if (!offlineOnly) assertNoCodexAuthError(haiku, 'haiku');
 
     console.log('[chain] checkpoint: post-haiku');
     report.steps.push('checkpoint: post-haiku');
-    const c2 = await exportCheckpoint(page, 'gemini-haiku.ckpt');
+    const c2 = await exportCheckpoint(page, 'codex-haiku.ckpt');
     report.checkpoints.postHaiku = c2.path;
     report.timings.checkpointPostHaikuMs = c2.ms;
 
     console.log('[chain] boot: post-haiku');
     report.steps.push('boot: post-haiku');
-    report.timings.bootPostHaikuMs = await bootPage(page, 'gemini-haiku.ckpt');
+    report.timings.bootPostHaikuMs = await bootPage(page, 'codex-haiku.ckpt');
 
-    const limCmd = offlineOnly ? 'gemini --help' : 'gemini -p "write me a limerick"';
+    const limCmd = offlineOnly ? 'codex --help' : "codex e 'write me a limerick'";
     console.log(`[chain] run: ${offlineOnly ? 'help' : 'limerick'}`);
     report.steps.push(`cmd: ${offlineOnly ? 'help' : 'limerick'}`);
     const lim = await runCommand(page, limCmd, 1200000);
@@ -346,11 +346,11 @@ async function main() {
     report.limerickPreview = (lim.delta || '').replace(/\s+/g, ' ').trim().slice(0, 300);
     if (!lim.ok) throw new Error('limerick command did not complete');
     assertCommandSucceeded(lim, offlineOnly ? 'help' : 'limerick');
-    if (!offlineOnly) assertNoGeminiAuthError(lim, 'limerick');
+    if (!offlineOnly) assertNoCodexAuthError(lim, 'limerick');
 
     console.log('[chain] checkpoint: post-limerick');
     report.steps.push('checkpoint: post-limerick');
-    const c3 = await exportCheckpoint(page, 'gemini-limerick.ckpt');
+    const c3 = await exportCheckpoint(page, 'codex-limerick.ckpt');
     report.checkpoints.postLimerick = c3.path;
     report.timings.checkpointPostLimerickMs = c3.ms;
 

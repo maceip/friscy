@@ -63,14 +63,6 @@ function runGeminiPrompt(prompt) {
       contents: [{ parts: [{ text: prompt || 'Write me a haiku' }] }],
       generationConfig: { maxOutputTokens: 384 },
     });
-
-    let settled = false;
-    const done = (text) => {
-      if (settled) return;
-      settled = true;
-      resolve(text || '');
-    };
-
     const req = https.request({
       hostname: 'generativelanguage.googleapis.com',
       port: 443,
@@ -80,40 +72,43 @@ function runGeminiPrompt(prompt) {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(body),
       },
-    }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += String(chunk); });
-      res.on('end', () => {
+    }, (resp) => {
+      let raw = '';
+      resp.on('data', (c) => { raw += c; });
+      resp.on('end', () => {
         try {
-          const j = JSON.parse(data);
+          const j = JSON.parse(raw);
           if (j && j.error && typeof j.error.message === 'string') {
-            done('Error: ' + j.error.message + '\n');
+            resolve('Error: ' + j.error.message + '\n');
             return;
           }
           if (Array.isArray(j.candidates)) {
             const parts = [];
             for (const cand of j.candidates) {
-              const segs = cand?.content?.parts;
+              const segs = cand && cand.content && cand.content.parts;
               if (!Array.isArray(segs)) continue;
               for (const part of segs) {
-                if (typeof part?.text === 'string' && part.text) parts.push(part.text);
+                if (part && typeof part.text === 'string' && part.text) parts.push(part.text);
               }
             }
             if (parts.length > 0) {
-              done(parts.join('\n').trimEnd() + '\n');
+              resolve(parts.join('\n').trimEnd() + '\n');
               return;
             }
           }
         } catch (_e) {}
-        done((data || `HTTP ${res.statusCode || 0}`) + '\n');
+        resolve((raw || `HTTP ${resp.statusCode || 0}`) + '\n');
       });
     });
 
-    req.on('error', (e) => done(`Error: ${e && e.message ? e.message : String(e)}\n`));
-    req.setTimeout(120000, () => {
-      try { req.destroy(new Error('timeout')); } catch (_e) {}
-      done('Error: request timeout\n');
+    req.on('error', (e) => {
+      resolve(`Error: ${e && e.message ? e.message : String(e)}\n`);
     });
+
+    req.setTimeout(120000, () => {
+      req.destroy(new Error('request timeout'));
+    });
+
     req.write(body);
     req.end();
   });

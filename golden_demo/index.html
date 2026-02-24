@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <base href="/golden_demo/">
+  <title>friscy golden demo</title>
+  <style>
+    body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: #0b1020; color: #e6edf3; }
+    header { display: flex; gap: 8px; padding: 10px; align-items: center; border-bottom: 1px solid #24354f; }
+    button.tab { background: #162238; color: #c9d1d9; border: 1px solid #2f4a70; padding: 6px 10px; cursor: pointer; border-radius: 6px; }
+    button.tab.active { background: #24416b; color: #fff; }
+    #status { margin-left: auto; color: #8b949e; font-size: 12px; }
+    #boot { padding: 8px 10px; border-bottom: 1px solid #24354f; color: #b7c2d1; font-size: 12px; }
+    #term { white-space: pre-wrap; padding: 12px; min-height: 58vh; max-height: 70vh; overflow: auto; background: #050a14; border-top: 1px solid #0f1c31; border-bottom: 1px solid #0f1c31; }
+    #inputbar { display: flex; gap: 8px; padding: 10px; }
+    #cmd { flex: 1; background: #0e1729; color: #e6edf3; border: 1px solid #2b3f61; border-radius: 6px; padding: 8px 10px; }
+    #send { background: #1f6feb; color: #fff; border: 1px solid #1f6feb; border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <button class="tab" data-example="alpine">Alpine</button>
+    <button class="tab" data-example="nodejs">Node.js</button>
+    <button class="tab" data-example="server">Go server</button>
+    <button class="tab" data-example="claude">Claude</button>
+    <button class="tab" data-example="gemini">Gemini</button>
+    <span id="status">idle</span>
+  </header>
+  <div id="boot">boot: not started</div>
+  <pre id="term"></pre>
+  <div id="inputbar">
+    <input id="cmd" placeholder="type command and press Enter" />
+    <button id="send">Send</button>
+  </div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -8,6 +8,12 @@ FROM --platform=linux/riscv64 alpine:edge
 # Install Node.js, npm, build tools (tree-sitter needs C++ compiler)
 RUN apk add --no-cache nodejs npm curl bash python3 make g++
 
+# Add the proven command-loop runner used by browser checkpoint ladders.
+COPY runtime/claude-repl.js /usr/local/bin/claude-repl.js
+RUN chmod +x /usr/local/bin/claude-repl.js
+COPY runtime/gemini-repl.js /usr/local/bin/gemini-repl.js
+RUN chmod +x /usr/local/bin/gemini-repl.js
+
 # Install Gemini CLI globally via npm
 RUN npm install -g @google/gemini-cli
 

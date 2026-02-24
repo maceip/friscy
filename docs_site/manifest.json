@@ -1,7 +1,10 @@
 {
   "version": 1,
   "image": "friscy-alpine",
-  "entrypoint": ["/bin/bash"],
+  "entrypoint": [
+    "/bin/sh",
+    "-i"
+  ],
   "rootfs": "./rootfs.tar",
   "checkpoint": "./alpine-bash.ckpt",
   "workdir": "/root",
@@ -10,88 +13,212 @@
     "HOME=/root",
     "TERM=xterm-256color",
     "COLORTERM=truecolor",
-    "COLORFGBG=15;0",
-    "LD_PRELOAD=/usr/lib/vh_preload.so"
+    "COLORFGBG=15;0"
   ],
   "aot": [],
   "examples": {
     "nodejs": {
       "rootfs": "./nodejs.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "-i"],
+      "checkpoint": "./node-blocking-v3.ckpt",
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "-e",
+        "const fs=require('fs'),vm=require('vm'),util=require('util');const ctx=vm.createContext({require,console,process,Buffer,globalThis});let line='';process.stdout.write('> ');const b=Buffer.alloc(1);while(true){const n=fs.readSync(0,b,0,1,null);if(n<=0)break;const ch=b.toString('utf8',0,1);if(ch==='\\\\r')continue;if(ch!=='\\\\n'){line+=ch;continue;}const src=line;line='';const t=src.trim();if(t===''){process.stdout.write('> ');continue;}if(t==='.exit'||t==='exit'){break;}try{const out=vm.runInContext(src,ctx);if(out!==undefined)process.stdout.write(util.inspect(out)+'\\\\n');}catch(e){process.stdout.write(String((e&&e.stack)||e)+'\\\\n');}process.stdout.write('> ');}"
+      ],
       "image": "friscy-nodejs"
     },
     "server": {
-      "rootfs": "./goserver.tar",
-      "entrypoint": ["/bin/echo_server"],
+      "rootfs": "./rootfs.tar",
+      "entrypoint": [
+        "/bin/echo_server"
+      ],
       "image": "friscy-goserver"
     },
     "dns-test": {
       "rootfs": "./claude-slim.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "/usr/local/bin/dns-test.js"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "/usr/local/bin/dns-test.js"
+      ],
       "image": "friscy-claude",
-      "dns": ["108.61.10.10"]
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "claude": {
       "rootfs": "./claude-slim-snap.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--snapshot-blob", "/tmp/snapshot-fast.blob", "--", "Write a haiku about RISC-V emulation running in WebAssembly"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--snapshot-blob",
+        "/tmp/snapshot-fast.blob",
+        "--",
+        "Write a haiku about RISC-V emulation running in WebAssembly"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "claude-nosnapshot": {
       "rootfs": "./claude-slim.tar",
-      "entrypoint": ["/usr/local/bin/claude-fast.js", "Write a haiku about RISC-V emulation running in WebAssembly"],
+      "entrypoint": [
+        "/usr/local/bin/claude-fast.js",
+        "Write a haiku about RISC-V emulation running in WebAssembly"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "claude-cli": {
       "rootfs": "./claude-slim.tar",
-      "entrypoint": ["/usr/local/bin/claude", "-p", "Write a haiku about RISC-V emulation running in WebAssembly"],
+      "entrypoint": [
+        "/usr/local/bin/claude",
+        "-p",
+        "Write a haiku about RISC-V emulation running in WebAssembly"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "claude-api": {
       "rootfs": "./claude-slim.tar",
-      "entrypoint": ["/usr/bin/node", "-e", "const h=require('https');const d=JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:200,messages:[{role:'user',content:'Write a haiku about RISC-V emulation running in WebAssembly'}]});const q=h.request({hostname:'api.anthropic.com',port:443,path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':process.env.ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(d)}},s=>{let b='';s.on('data',c=>b+=c);s.on('end',()=>{try{const j=JSON.parse(b);console.log(j.content?j.content[0].text:b.substring(0,500))}catch(x){console.log(b.substring(0,200))}process.exit(0)})});q.on('error',x=>{console.log('Error:',x.message);process.exit(1)});q.write(d);q.end();setTimeout(()=>{console.log('Timeout');process.exit(1)},60000)"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "-e",
+        "const h=require('https');const d=JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:200,messages:[{role:'user',content:'Write a haiku about RISC-V emulation running in WebAssembly'}]});const q=h.request({hostname:'api.anthropic.com',port:443,path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':process.env.ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(d)}},s=>{let b='';s.on('data',c=>b+=c);s.on('end',()=>{try{const j=JSON.parse(b);console.log(j.content?j.content[0].text:b.substring(0,500))}catch(x){console.log(b.substring(0,200))}process.exit(0)})});q.on('error',x=>{console.log('Error:',x.message);process.exit(1)});q.write(d);q.end();setTimeout(()=>{console.log('Timeout');process.exit(1)},60000)"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "vh-test": {
       "rootfs": "./nodejs.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "/usr/local/bin/test_vh_shims.js"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/bin/test_vh_shims.js"
+      ],
       "image": "friscy-nodejs"
     },
     "claude-demo": {
       "rootfs": "./claude-slim-snap.tar",
-      "checkpoint": "./claude-repl.ckpt",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "/usr/local/bin/claude-repl.js"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/bin/claude-repl.js"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=PLACEHOLDER"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=PLACEHOLDER"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "claude-plain": {
       "rootfs": "./claude-slim-snap.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "/usr/local/lib/node_modules/@anthropic-ai/claude-code/claude-cjs.cjs", "-p", "Write me a haiku about RISC-V emulation"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/lib/node_modules/@anthropic-ai/claude-code/claude-cjs.cjs",
+        "-p",
+        "Write me a haiku about RISC-V emulation"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "claude-snap": {
       "rootfs": "./claude-slim-snap.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "--snapshot-blob", "/tmp/claude-cli.blob", "--", "-p", "Write me a haiku about RISC-V emulation"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "--snapshot-blob",
+        "/tmp/claude-cli.blob",
+        "--",
+        "-p",
+        "Write me a haiku about RISC-V emulation"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     },
     "claude-deep": {
       "rootfs": "./claude-slim-snap.tar",
-      "entrypoint": ["/usr/bin/node", "--jitless", "--max-old-space-size=256", "--snapshot-blob", "/tmp/claude-deep.blob", "--", "-p", "Write me a haiku about RISC-V emulation"],
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "--snapshot-blob",
+        "/tmp/claude-deep.blob",
+        "--",
+        "-p",
+        "Write me a haiku about RISC-V emulation"
+      ],
       "image": "friscy-claude",
-      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
-      "dns": ["108.61.10.10"]
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
+    },
+    "gemini": {
+      "rootfs": "./gemini-r2.tar",
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/bin/gemini-repl.js"
+      ],
+      "image": "friscy-gemini",
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "GEMINI_API_KEY=PLACEHOLDER",
+        "GOOGLE_API_KEY=PLACEHOLDER"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
     }
   }
 }

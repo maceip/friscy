@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/root",
+    "TERM=dumb"
+  ],
+  "examples": {
+    "alpine": {
+      "image": "friscy-alpine",
+      "rootfs": "/docs_site/rootfs.tar",
+      "entrypoint": [
+        "/bin/sh",
+        "-i"
+      ],
+      "allowNetwork": true
+    },
+    "nodejs": {
+      "image": "friscy-nodejs",
+      "rootfs": "/docs_site/nodejs.tar",
+      "checkpoint": "/docs_site/node-blocking-v3.ckpt",
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "-e",
+        "const fs=require('fs'),vm=require('vm'),util=require('util');const ctx=vm.createContext({require,console,process,Buffer,globalThis});let line='';process.stdout.write('> ');const b=Buffer.alloc(1);while(true){const n=fs.readSync(0,b,0,1,null);if(n<=0)break;const ch=b.toString('utf8',0,1);if(ch==='\\r')continue;if(ch!=='\\n'){line+=ch;continue;}const src=line;line='';const t=src.trim();if(t===''){process.stdout.write('> ');continue;}if(t==='.exit'||t==='exit'){break;}try{const out=vm.runInContext(src,ctx);if(out!==undefined)process.stdout.write(util.inspect(out)+'\\n');}catch(e){process.stdout.write(String((e&&e.stack)||e)+'\\n');}process.stdout.write('> ');}"
+      ],
+      "allowNetwork": true
+    },
+    "server": {
+      "image": "friscy-goserver",
+      "rootfs": "/docs_site/goserver.tar",
+      "entrypoint": [
+        "/bin/sh",
+        "-lc",
+        "/bin/echo_server & echo SERVER_READY; cat"
+      ],
+      "allowNetwork": true
+    },
+    "claude": {
+      "image": "friscy-claude",
+      "rootfs": "/docs_site/claude-slim.tar",
+      "checkpoint": "/docs_site/claude-repl.ckpt",
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/bin/claude-repl.js"
+      ],
+      "env": [
+        "ANTHROPIC_API_KEY=PLACEHOLDER"
+      ],
+      "allowNetwork": true
+    },
+    "gemini": {
+      "image": "friscy-gemini",
+      "rootfs": "/docs_site/gemini-r2.tar",
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/bin/gemini-repl.js"
+      ],
+      "env": [
+        "GEMINI_API_KEY=PLACEHOLDER",
+        "GOOGLE_API_KEY=PLACEHOLDER"
+      ],
+      "allowNetwork": true
+    }
+  }
+}

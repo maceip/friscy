@@ -91,7 +91,7 @@ struct ForkState {
     // Memory snapshots: saved at clone, restored when child exits.
     // With FLAT_RW_ARENA, all arena memory is contiguous so we can
     // save large ranges without worrying about unmapped pages.
-    //   1. Data+BRK: exec_rw_start to heap_start (data/BSS + brk region)
+    //   1. Data+BRK: exec_rw_start to brk_current (data/BSS + active brk)
     //   2. Interpreter data/BSS (ld-musl state)
     //   3. Stack (return addresses, locals)
     //   4. mmap'd pages: heap_start+heap_size to mmap pointer
@@ -112,6 +112,7 @@ struct ForkState {
     // dependency on ThreadScheduler definition. execve in fork child
     // resets g_sched; must restore parent's thread state on child exit.
     alignas(16) uint8_t saved_sched[8192];  // enough for ThreadScheduler (~5KB)
+    uint64_t saved_mmap_address = 0;
 };
 inline ForkState g_fork = {};
 inline pid_t g_next_pid = 100;
@@ -318,6 +319,8 @@ struct ExecContext {
     bool dynamic = false;                // Using dynamic linker?
 };
 inline ExecContext g_exec_ctx;
+inline ExecContext g_fork_saved_exec_ctx;
+inline bool g_fork_has_exec_ctx = false;
 
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
@@ -573,6 +576,28 @@ static void sys_exit(Machine& m) {
         // "Child" is exiting — restore parent state
         g_fork.exit_status = m.template sysarg<int>(0);
         g_fork.in_child = false;
+        // Child execve may have overwritten parent code pages at the same VA.
+        // Reload parent executable/interpreter text segments before data restore.
+        if (g_fork_has_exec_ctx) {
+            const auto& parent_ctx = g_fork_saved_exec_ctx;
+            try {
+                m.memory.evict_execute_segments();
+                if (!parent_ctx.exec_binary.empty()) {
+                    uint64_t load_base = 0;
+                    if (parent_ctx.exec_info.type == elf::ET_DYN) {
+                        auto [plo, phi] = elf::get_load_range(parent_ctx.exec_binary);
+                        (void)phi;
+                        load_base = (parent_ctx.exec_base >= plo) ? (parent_ctx.exec_base - plo) : parent_ctx.exec_base;
+                    }
+                    dynlink::load_elf_segments(m, parent_ctx.exec_binary, load_base);
+                }
+                if (!parent_ctx.interp_binary.empty() && parent_ctx.interp_base != 0) {
+                    dynlink::load_elf_segments(m, parent_ctx.interp_binary, parent_ctx.interp_base);
+                }
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[fork] parent segment reload failed: %s\n", e.what());
+            }
+        }
 
         // CRITICAL: Fix page permissions BEFORE restoring memory.
         // The parent's initial RELRO made data pages read-only. If we
@@ -588,25 +613,11 @@ static void sys_exit(Machine& m) {
                 m.memory.set_page_attr(addr, size, attr);
             }
         };
-        // Fix data/BSS + BRK region (includes RELRO pages)
-        {
-            uint64_t save_end = (g_exec_ctx.heap_start > g_exec_ctx.exec_rw_end)
-                              ? g_exec_ctx.heap_start : g_exec_ctx.exec_rw_end;
-            fix_perms(g_exec_ctx.exec_rw_start,
-                      save_end - g_exec_ctx.exec_rw_start);
-        }
-        // Fix interpreter data
-        fix_perms(g_exec_ctx.interp_rw_start,
-                  g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start);
-        // Fix mmap region
-        if (g_fork.mmap_data.size > 0) {
-            fix_perms(g_fork.mmap_data.addr, g_fork.mmap_data.size);
-        }
-        // Fix stack
-        {
-            uint64_t sp = g_fork.regs[2];  // Use saved SP, not current
-            fix_perms(sp, g_exec_ctx.original_stack_top - sp);
-        }
+        // Fix regions using the exact parent snapshot spans.
+        fix_perms(g_fork.exec_data.addr, g_fork.exec_data.size);
+        fix_perms(g_fork.interp_data.addr, g_fork.interp_data.size);
+        fix_perms(g_fork.mmap_data.addr, g_fork.mmap_data.size);
+        fix_perms(g_fork.stack_data.addr, g_fork.stack_data.size);
 
         // Now restore parent memory (data/BSS, interpreter, stack, mmap)
         auto restore = [&](ForkState::MemRegion& r) {
@@ -638,6 +649,15 @@ static void sys_exit(Machine& m) {
         // Restore cooperative thread scheduler state.
         // The fork child's execve may have reset g_sched.
         std::memcpy(&g_sched, g_fork.saved_sched, sizeof(g_sched));
+
+        // Restore parent memory layout metadata potentially mutated by child execve.
+        if (g_fork.saved_mmap_address > 0) {
+            m.memory.mmap_address() = g_fork.saved_mmap_address;
+        }
+        if (g_fork_has_exec_ctx) {
+            g_exec_ctx = g_fork_saved_exec_ctx;
+            g_fork_has_exec_ctx = false;
+        }
 
         // Restore parent registers (x0-x31)
         for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
@@ -771,18 +791,18 @@ static void sys_clone(Machine& m) {
     //
     // Memory layout (for PIE at 0x40000):
     //   exec_rw_start..exec_rw_end : data/BSS (globals, GOT, .bss)
-    //   exec_rw_end..heap_start   : BRK region (musl small allocs)
+    //   exec_rw_end..brk_current: BRK region (musl small allocs)
     //   heap_start..+heap_size    : native heap (from mmap_allocate)
     //   heap_start+heap_size..mmap: guest mmap (TLS, libc malloc pages)
     //
     // Region 1: main binary writable segments + BRK heap.
     // Covers data/BSS/GOT (exec_rw_start..exec_rw_end) and the BRK
-    // region (exec_rw_end..heap_start) where musl puts small allocs
+    // region (exec_rw_end..brk_current) where musl puts small allocs
     // (shell variables like $PWD live here).
     {
         uint64_t save_start = g_exec_ctx.exec_rw_start;
-        uint64_t save_end = (g_exec_ctx.heap_start > g_exec_ctx.exec_rw_end)
-                          ? g_exec_ctx.heap_start : g_exec_ctx.exec_rw_end;
+        uint64_t save_end = g_exec_ctx.exec_rw_end;
+        if (g_exec_ctx.brk_current > save_end) save_end = g_exec_ctx.brk_current;
         if (save_start > 0 && save_end > save_start) {
             // BRK pages may not have read attrs yet — make them readable.
             riscv::PageAttributes attr;
@@ -841,6 +861,9 @@ static void sys_clone(Machine& m) {
     // when the child exits.
     static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
+    g_fork.saved_mmap_address = m.memory.mmap_address();
+    g_fork_saved_exec_ctx = g_exec_ctx;
+    g_fork_has_exec_ctx = true;
 
     // Only set in_child AFTER all saves succeed.
     // This way if memcpy_out throws, the retry will re-enter clone
@@ -957,8 +980,8 @@ static void sys_clone3(Machine& m) {
     // Save parent memory regions BEFORE changing SP (stack save needs parent SP)
     {
         uint64_t save_start = g_exec_ctx.exec_rw_start;
-        uint64_t save_end = (g_exec_ctx.heap_start > g_exec_ctx.exec_rw_end)
-                          ? g_exec_ctx.heap_start : g_exec_ctx.exec_rw_end;
+        uint64_t save_end = g_exec_ctx.exec_rw_end;
+        if (g_exec_ctx.brk_current > save_end) save_end = g_exec_ctx.brk_current;
         if (save_start > 0 && save_end > save_start) {
             riscv::PageAttributes attr;
             attr.read = true; attr.write = true; attr.exec = true;
@@ -1000,6 +1023,9 @@ static void sys_clone3(Machine& m) {
     g_fork.parent_open_fds = get_fs(m).get_open_fds();
     static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
+    g_fork.saved_mmap_address = m.memory.mmap_address();
+    g_fork_saved_exec_ctx = g_exec_ctx;
+    g_fork_has_exec_ctx = true;
 
     g_fork.in_child = true;
     g_fork.child_reaped = false;
@@ -4463,6 +4489,8 @@ static void sys_brk(Machine& m) {
         constexpr uint64_t BRK_MAX = 16ULL << 20;  // 16MB
         static uint64_t current_brk = 0;
         if (current_brk == 0) current_brk = heap_addr;
+        if (g_exec_ctx.brk_base == 0) g_exec_ctx.brk_base = heap_addr;
+        if (g_exec_ctx.brk_current == 0) g_exec_ctx.brk_current = current_brk;
 
         static int brk_count = 0;
         ++brk_count;
@@ -4480,6 +4508,7 @@ static void sys_brk(Machine& m) {
             current_brk = new_end;
             m.set_result(current_brk);
         }
+        g_exec_ctx.brk_current = current_brk;
         fprintf(stderr, "[brk#%d] => 0x%lx\n", brk_count, (long)current_brk);
         return;
     }

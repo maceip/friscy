@@ -30,7 +30,7 @@
       "image": "friscy-nodejs"
     },
     "server": {
-      "rootfs": "./rootfs.tar",
+      "rootfs": "./goserver.tar",
       "entrypoint": [
         "/bin/echo_server"
       ],
@@ -215,6 +215,23 @@
         "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
         "GEMINI_API_KEY=PLACEHOLDER",
         "GOOGLE_API_KEY=PLACEHOLDER"
+      ],
+      "dns": [
+        "108.61.10.10"
+      ]
+    },
+    "codex": {
+      "rootfs": "./codex.tar",
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/bin/codex-repl.js"
+      ],
+      "image": "friscy-codex",
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "OPENAI_API_KEY=PLACEHOLDER"
       ],
       "dns": [
         "108.61.10.10"

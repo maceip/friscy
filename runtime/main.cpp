@@ -975,6 +975,9 @@ int main(int argc, char** argv) {
         machine.setup_native_heap(HEAP_SYSCALLS_BASE, heap_area, 64ULL << 20);
         syscalls::g_exec_ctx.heap_start = heap_area;
         syscalls::g_exec_ctx.heap_size = 64ULL << 20;
+        syscalls::g_exec_ctx.brk_base = machine.memory.heap_address();
+        syscalls::g_exec_ctx.brk_current = syscalls::g_exec_ctx.brk_base;
+        syscalls::g_exec_ctx.brk_overridden = false;
         std::cout << "[friscy] Heap area: 0x" << std::hex << heap_area << std::dec
                   << " (" << (64ULL << 20) / (1024*1024) << "MB)\n";
         machine.setup_native_memory(MEMORY_SYSCALLS_BASE);

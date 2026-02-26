@@ -2,10 +2,10 @@
 
 ## Current Focus
 
-- Complete the rv2wasm AOT compiler — the single highest-leverage task for
-  reaching 80%+ native performance in the browser.
-- Fill remaining AOT gaps: floating-point translation, atomics, br_table
-  dispatch optimization.
+- Keep cooperative fork/exec/wait regression gate green in runtime (`clone(flags=0x11)` external-command path).
+- Fresh browser ladders are green on fixed runtime for Claude/Gemini/Codex checkpoint chains.
+- Repair stale 3-demo ladder harness status detection (`scripts/run_golden_demo_checkpoint_ladders.mjs`) and rerun docs-site matrix on current UI contract.
+- Continue performance work (AOT, JIT, worker-lane optimizations) with the runtime gate enforced.
 
 ## Near-term
 

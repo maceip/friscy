@@ -427,3 +427,62 @@
 - Added host-fetch URL redaction in worker logs to prevent API key leakage:
   - `docs_site/worker.js`
   - `friscy-bundle/worker.js`
+
+## 2026-02-26T03:55Z Browser ladder rerun (Claude/Gemini/Codex) — all green
+- Objective: execute full browser ladders with live API-backed limerick + post-limerick checkpoint for all three stacks.
+- Issue encountered: Gemini/Codex harness command path could stall in prompt when `term.paste()` was not consumed in headless run mode.
+- Fix applied: `tools/node_gemini_checkpoint_chain.mjs` and `tools/node_codex_checkpoint_chain.mjs`
+  - Added `window._friscy.sendStdin()` fallback after 3s no-progress.
+  - Added completion guard parity with Claude harness to avoid false hangs.
+- Results (fresh run):
+  - Claude report: `docs/generated/node_claude_checkpoint_chain_report_latest.json` (finishedAt `2026-02-26T03:53:04.323Z`, ok=true)
+  - Gemini report: `docs/generated/node_gemini_checkpoint_chain_report_latest.json` (finishedAt `2026-02-26T03:53:39.319Z`, ok=true)
+  - Codex report: `docs/generated/node_codex_checkpoint_chain_report_latest.json` (finishedAt `2026-02-26T03:54:35.517Z`, ok=true)
+- Single-source status board added: `docs/generated/LADDER_STATUS.md`.
+
+## 2026-02-26 PTY/Fork Restore Investigation (current)
+- Reproduced Alpine PTY deadlock reliably: `stty size` prints output, then shell never returns to prompt.
+- Confirmed deadlock is runtime-side, not frontend stdin queueing: worker logs show `clone` -> `execve(/bin/stty)` -> `exit_group` and then restore-path stall/fault.
+- Added runtime instrumentation in `runtime/syscalls.hpp` around fork child restore and wait4.
+- Verified restore now reaches parent resume + wait4 in native repro, but then hits `Execution space protection fault` at `PC=0x0` immediately after wait4 path.
+- Confirmed same failure shape with `/bin/ls` (not stty-specific), so issue is generic fork/exec child-restore for external commands.
+- Node path currently not validated green under this experimental runtime state (input consumed, no visible command output in the captured probe).
+- Next concrete fix direction: repair parent return path after wait4 in cooperative fork restore (state consistency after child execve), then remove debug logging and re-run browser gates.
+
+## 2026-02-26T Root-cause status: fork/exec restore path (P0 blocker)
+- Reproduced native failure on external-command path (`/bin/sh -c '/bin/ls >/dev/null; echo OK'`) in `build-native/friscy` with `docs_site/rootfs.tar`.
+- Failure surface during investigation (instrumented build): after `clone(flags=0x11, child_stack=0)` + child `execve(/bin/ls or /bin/stty)` + `wait4`, parent control flow eventually faults with `PC=0x0` and key regs (`x1/x2/x8`) zeroed.
+- This is not a frontend stdin issue; it is runtime-side cooperative fork/exec restore behavior.
+- Additional observation: baseline `HEAD` currently stalls in the same subsystem (hangs after `clone(flags=0x11, child_stack=0)` in this repro), so the P0 remains active.
+- Most likely root cause class: current vfork-style cooperative emulation is not preserving parent state correctly across child exec lifecycle (parent stack/control-frame integrity after child path), causing either deadlock or corrupted return path.
+- Status: NOT FIXED. No ladder reruns until this runtime P0 is fixed.
+- Next required engineering direction: repair/rework cooperative fork+exec semantics first (then rerun fresh ladders only after green native repro + browser repro).
+
+## 2026-02-26T10:26:11.986Z 3-demo checkpoint continuity ladders
+- alpine: FAIL (boot timeout for alpine)
+- nodejs: FAIL (boot timeout for nodejs)
+- server: FAIL (boot timeout for server)
+
+
+## 2026-02-26T10:34:51Z P0 fork/exec/wait fix + fresh ladder reruns
+- Runtime fix landed in `runtime/syscalls.hpp` + `runtime/main.cpp` for cooperative fork path:
+  - snapshot sizing changed from `exec_rw_start..heap_start` to `exec_rw_start..brk_current` (avoids clone-time stalls),
+  - parent `mmap_address` + `g_exec_ctx` snapshot/restore added,
+  - parent code segments reloaded on child exit (child `execve` overwrote parent text VA),
+  - restore perms now use exact saved region spans.
+- Native gate now green (repeatable):
+  - `./build-native/friscy --rootfs docs_site/rootfs.tar /bin/sh -c '/bin/ls >/dev/null; echo OK'` => PASS
+  - `./build-native/friscy --rootfs docs_site/rootfs.tar /bin/sh -c 'stty -a >/dev/null; echo STTY_OK'` => PASS
+- Fresh browser checkpoint ladders (fixed runtime) all green:
+  - Claude: `docs/generated/node_claude_checkpoint_chain_report_latest.json` (ok=true, finishedAt=2026-02-26T10:31:38.577Z)
+  - Gemini: `docs/generated/node_gemini_checkpoint_chain_report_latest.json` (ok=true, finishedAt=2026-02-26T10:32:36.435Z)
+  - Codex: `docs/generated/node_codex_checkpoint_chain_report_latest.json` (ok=true, finishedAt=2026-02-26T10:33:24.586Z)
+- Note: `scripts/run_golden_demo_checkpoint_ladders.mjs` is currently stale vs UI status contract and times out at boot even when runtime is healthy; separate harness update required.
+
+## 2026-02-26T11:05:00Z docs_site server demo manifest correction
+- Fixed docs-site server demo rootfs mapping in `docs_site/manifest.json`:
+  - `examples.server.rootfs`: `./rootfs.tar` -> `./goserver.tar`
+- Verification:
+  - `tests/test_docs_site_demo_matrix.mjs` now shows server demo exiting cleanly (`Exited (0)`), no `VFS: Could not open: /bin/echo_server`.
+- Remaining matrix issue:
+  - The current docs-site matrix harness remains unreliable for Alpine/Node command-echo assertions (xterm row scraping / command injection mismatch), so chain ladders remain the authoritative browser gate for now.

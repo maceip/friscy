@@ -22,6 +22,7 @@ const ROOTFS_URL = process.env.FRISCY_TEST_ROOTFS_URL || './rootfs.tar';
 const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '';
 const WAIT_FOR_EXIT = process.env.FRISCY_TEST_WAIT_FOR_EXIT === '1';
 const METRIC_WAIT_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_METRIC_WAIT_TIMEOUT_MS || '30000', 10);
+const TEST_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_TIMEOUT_MS || '600000', 10);
 
 async function canBindPort(port) {
     return new Promise((resolve) => {
@@ -61,6 +62,7 @@ async function main() {
     let instructionCount = null;
     let jitRegionsCompiled = 0;
     let jitCompilerLoaded = false;
+    let finalJitStats = null;
     let found = false;
     let elapsedSeconds = null;
     let foundAtMs = null;
@@ -149,7 +151,7 @@ async function main() {
         console.log(`[test] Waiting for output: ${EXPECTED_OUTPUT}`);
         const start = Date.now();
 
-        while (Date.now() - start < 600000) { // 10 minute timeout
+        while (Date.now() - start < TEST_TIMEOUT_MS) {
             let content = '';
             let status = '';
             try {
@@ -225,8 +227,19 @@ async function main() {
         if (instructionCount !== null) {
             console.log(`[METRIC] instructions=${instructionCount}`);
         }
+        try {
+            finalJitStats = await page.evaluate(() => window.__friscyJitStats || null);
+        } catch {
+            finalJitStats = null;
+        }
         console.log(`[METRIC] jit_compiler_loaded=${jitCompilerLoaded ? 1 : 0}`);
         console.log(`[METRIC] jit_regions_compiled=${jitRegionsCompiled}`);
+        console.log(`[METRIC] jit_first_compile_latency_ms=${Number.isFinite(finalJitStats?.firstCompileLatencyMs) ? Number(finalJitStats.firstCompileLatencyMs).toFixed(3) : '-1'}`);
+        console.log(`[METRIC] jit_prewarm_attempts=${Number.isFinite(finalJitStats?.prewarmAttempts) ? finalJitStats.prewarmAttempts : -1}`);
+        console.log(`[METRIC] jit_prewarm_successes=${Number.isFinite(finalJitStats?.prewarmSuccesses) ? finalJitStats.prewarmSuccesses : -1}`);
+        console.log(`[METRIC] jit_prewarm_failures=${Number.isFinite(finalJitStats?.prewarmFailures) ? finalJitStats.prewarmFailures : -1}`);
+        console.log(`[METRIC] jit_compiler_prewarmed=${finalJitStats?.compilerPrewarmed ? 1 : 0}`);
+        console.log(`[METRIC] jit_queue_depth_end=${Number.isFinite(finalJitStats?.queueDepth) ? finalJitStats.queueDepth : -1}`);
         return { found, elapsedSeconds, instructionCount, jitCompilerLoaded, jitRegionsCompiled };
     } finally {
         if (originalManifest) {

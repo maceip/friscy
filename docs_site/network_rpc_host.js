@@ -122,6 +122,18 @@ export class NetworkRPCHost {
             case 2: // NET_OP_CONNECT
                 result = await this.bridge.socketConnect(fd, payload || new Uint8Array(0));
                 break;
+            case 3: // NET_OP_BIND
+                result = await this.bridge.socketBind(fd, payload || new Uint8Array(0));
+                break;
+            case 4: // NET_OP_LISTEN
+                result = await this.bridge.socketListen(fd, arg1);
+                break;
+            case 5: { // NET_OP_ACCEPT
+                const accepted = await this.bridge.socketAccept(fd);
+                result = accepted?.result ?? -11;
+                respData = accepted?.addr || null;
+                break;
+            }
             case 6: // NET_OP_SEND
                 result = await this.bridge.socketSend(fd, payload || new Uint8Array(0));
                 break;
@@ -133,7 +145,13 @@ export class NetworkRPCHost {
                 result = await this.bridge.socketClose(fd);
                 break;
             case 9: // NET_OP_HAS_DATA
-                result = 0; // Simplified
+                result = await this.bridge.socketHasData(fd);
+                break;
+            case 10: // NET_OP_HAS_PENDING_ACCEPT
+                result = await this.bridge.socketHasPendingAccept(fd);
+                break;
+            case 13: // NET_OP_SHUTDOWN
+                result = await this.bridge.socketShutdown(fd, arg1);
                 break;
         }
         return { result, data: respData };

@@ -1,10 +1,10 @@
 import { Terminal } from 'xterm';
-import { fit } from '@xterm/addon-fit';
-import { attach } from '@xterm/addon-attach';
+import { FitAddon } from '@xterm/addon-fit';
+import { SearchAddon } from '@xterm/addon-search';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { ImageAddon } from '@xterm/addon-image';
-import { WebglAddon } '@xterm/addon-webgl';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { FriscyNetworkBridge } from './network_bridge.js';
 
 // WebTransport bridge removed — VectorHeart hypercalls handle networking via JSPI
@@ -103,7 +103,7 @@ function setupDragDrop(terminalEl, term) {
     if (imageSidePanelClose) {
         imageSidePanelClose.addEventListener('click', () => {
             imageSidePanel?.classList.remove('open');
-            if (droppedImagePreview) (droppedImagePreview as HTMLImageElement).src = ''; 
+            if (droppedImagePreview) droppedImagePreview.src = '';
         });
     }
 
@@ -255,8 +255,14 @@ function handleWorkerRuntimeMessage(e) {
         (window as any).__friscyJitStats = latestJitStats;
         updateJitWarmupHud(latestJitStats);
     }
+    if (msg.type === 'suspended') {
+        if (statusEl) statusEl.textContent = 'VM Suspended';
+    }
+    if (msg.type === 'resumed') {
+        if (statusEl) statusEl.textContent = 'VM running';
+    }
     if (msg.type === 'checkpoint-exported-live') {
-        if (statusEl) statusEl.textContent = 'fast risc-v runtime for the browser & wasm';
+        if (statusEl) statusEl.textContent = 'VM running';
         const blob = new Blob([msg.data], { type: 'application/octet-stream' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -296,6 +302,7 @@ function readJitRuntimeConfig(params) {
         enableJit: !params.has('nojit'),
         jitHotThreshold: parseIntParam('jithot'),
         jitTierEnabled: !params.has('nojittier'),
+        timesliceResumeEnabled: !params.has('legacyresume'),
         jitOptimizeThreshold: parseIntParam('jitopt'),
         jitTraceEnabled: !params.has('nojittrace') && !noPredict,
         jitEdgeHotThreshold: parseIntParam('jitedgehot'),
@@ -308,17 +315,21 @@ function readJitRuntimeConfig(params) {
         jitPredictConfidence: parseFloatParam('jitpredconf'),
         jitMarkovEnabled: !params.has('nojitmarkov') && !noPredict,
         jitTripletEnabled: !params.has('nojittriplet') && !noPredict,
+        jitPrewarmEnabled: !params.has('nojitprewarm'),
         jitAwaitCompiler: params.has('jitawait'),
         jitHudEnabled: !params.has('nojithud'),
     };
     return cfg;
 }
 
-function updateNetStatus(state) {
+function updateNetStatus(state, customLabel = null) {
     if (!netStatusEl) return;
-    netStatusEl.className = 'net-status ' + state;
+    const normalized = (state === 'connected' || state === 'connecting' || state === 'disconnected')
+        ? state
+        : 'disconnected';
+    netStatusEl.className = 'net-status ' + normalized;
     const labels = { connected: 'net: on', disconnected: 'net: off', connecting: 'net: ...' };
-    netStatusEl.textContent = labels[state] || state;
+    netStatusEl.textContent = customLabel || labels[normalized];
 }
 
 function updateTerminalSize() {
@@ -384,7 +395,8 @@ function checkStdinRequest() {
     // Worker wants stdin — wait until we have data
     if (stdinQueue.length === 0) return;
 
-    const maxLen = Atomics.load(controlView, 2);
+    const requested = Atomics.load(controlView, 2);
+    const maxLen = requested > 0 ? requested : 3968;
     const controlBytes = new Uint8Array(controlSab);
     const toSend = Math.min(stdinQueue.length, maxLen, 3968);
 
@@ -784,6 +796,36 @@ function setProgress(pct, stage, detail) {
     if (detailEl) detailEl.textContent = detail || '\u00a0';
 }
 
+function normalizeErrorMessage(err) {
+    if (!err) return 'Unknown startup error';
+    if (typeof err === 'string') return err;
+    if (typeof err.message === 'string' && err.message.length > 0) return err.message;
+    return String(err);
+}
+
+function failBoot(stage, error) {
+    const msg = normalizeErrorMessage(error);
+    waveColor = ERR_COLOR;
+    waveIndeterminate = false;
+    setProgress(0, stage, msg);
+    if (statusEl) statusEl.textContent = 'Boot failed';
+    console.error('[boot] startup failed:', msg, error);
+}
+
+async function withTimeout(promise, timeoutMs, timeoutMessage) {
+    let timeoutId;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, reject) => {
+                timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+    }
+}
+
 function formatBytes(bytes) {
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
     return (bytes / 1024 / 1024).toFixed(1) + ' MB';
@@ -928,10 +970,8 @@ async function fetchWithProgress(url) {
     return result.buffer;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 async function main() {
-    // Snapshot net-status HTML before any textContent call destroys it
-    const netStatusHTML = (document.getElementById('net-status') || {outerHTML: ''}).outerHTML;
+    setProgress(-1, 'Checking browser capabilities...', 'Verifying SharedArrayBuffer + isolation headers...');
 
     // Check for SharedArrayBuffer support (requires COOP/COEP headers)
     if (typeof SharedArrayBuffer === 'undefined') {
@@ -951,17 +991,21 @@ async function main() {
         return;
     }
 
-    setProgress(-1, 'Loading manifest...', undefined);
-    const manifest = await fetch('./manifest.json').then(r => r.json());
+    setProgress(-1, 'Loading launch manifest...', 'Reading image config and boot args...');
+    const manifestResp = await fetch('./manifest.json');
+    if (!manifestResp.ok) {
+        throw new Error(`Failed to load manifest: HTTP ${manifestResp.status}`);
+    }
+    const manifest = await manifestResp.json();
 
     // Resolve example-specific config (rootfs, entrypoint, image name)
     const exampleCfg = (activeExample && manifest.examples && manifest.examples[activeExample]) || {};
     const imageName = exampleCfg.image || manifest.image;
     const rootfsUrl = exampleCfg.rootfs || manifest.rootfs || './rootfs.tar';
-    if (statusEl) statusEl.textContent = `Loading ${imageName}...`;
+    if (statusEl) statusEl.textContent = `Loading ${imageName}`;
 
     // Download rootfs with progress (+ companion rootfs for server tab)
-    setProgress(0, `Loading ${imageName}...`, 'Starting download...');
+    setProgress(0, `Downloading ${imageName} rootfs...`, 'Fetching filesystem layers...');
     let companionRootfs = null;
     let rootfs;
     if (activeExample === 'server') {
@@ -976,7 +1020,7 @@ async function main() {
     }
 
     // Initialize runtime (indeterminate)
-    setProgress(-1, 'Initializing runtime...', undefined);
+    setProgress(-1, 'Preparing terminal runtime...', 'Initializing xterm and VM worker...');
 
     // For server tab, open primary terminal in #terminal-server (dual pane)
     const isDual = activeExample === 'server';
@@ -1113,12 +1157,26 @@ async function main() {
 
 
 
-    const snapshotBtn = document.getElementById('snapshot-btn');
-    if (snapshotBtn) {
-        snapshotBtn.addEventListener('click', () => {
+    const suspendBtn = document.getElementById('suspend-btn');
+    const suspendIcon = document.getElementById('suspend-icon');
+    let isSuspended = false;
+    
+    if (suspendBtn) {
+        suspendBtn.addEventListener('click', () => {
             if (!machineRunning || !worker) return;
-            if (statusEl) statusEl.textContent = 'Saving memory snapshot...';
-            worker.postMessage({ type: 'export-checkpoint-live' });
+            if (!isSuspended) {
+                worker.postMessage({ type: 'suspend' });
+                isSuspended = true;
+                if (statusEl) statusEl.textContent = 'VM Suspended';
+                suspendBtn.style.opacity = '0.5';
+                if (suspendIcon) suspendIcon.src = './RESUME.svg';
+            } else {
+                worker.postMessage({ type: 'resume' });
+                isSuspended = false;
+                if (statusEl) statusEl.textContent = 'VM running';
+                suspendBtn.style.opacity = '1.0';
+                if (suspendIcon) suspendIcon.src = './SUSPEND.svg';
+            }
         });
     }
 
@@ -1132,7 +1190,7 @@ async function main() {
     stdoutBytes = new Uint8Array(stdoutSab);
 
     // Spawn Worker
-    setProgress(-1, 'Starting worker...', undefined);
+    setProgress(-1, 'Starting VM worker...', 'Loading WebAssembly runtime...');
     worker = new Worker('./worker.js', { type: 'module' });
 
     // Wait for Worker to be ready
@@ -1157,6 +1215,12 @@ async function main() {
         jitWarmupHudEl.classList.remove('visible');
     }
 
+    // Enable network for demos that rely on host-fetch / VectorHeart async paths.
+    const networkAllowed = activeExample === 'server'
+        || activeExample === 'dns-test'
+        || activeExample.startsWith('claude');
+    const hostFetchProxy = params.get('hostFetchProxy') || `${location.origin}/__vhfetch`;
+
     // Send init message with SABs
     worker.postMessage({
         type: 'init',
@@ -1166,6 +1230,7 @@ async function main() {
         enableJit: jitCfg.enableJit,
         jitHotThreshold: jitCfg.jitHotThreshold,
         jitTierEnabled: jitCfg.jitTierEnabled,
+        timesliceResumeEnabled: jitCfg.timesliceResumeEnabled,
         jitOptimizeThreshold: jitCfg.jitOptimizeThreshold,
         jitTraceEnabled: jitCfg.jitTraceEnabled,
         jitEdgeHotThreshold: jitCfg.jitEdgeHotThreshold,
@@ -1177,10 +1242,13 @@ async function main() {
         jitPredictConfidence: jitCfg.jitPredictConfidence,
         jitMarkovEnabled: jitCfg.jitMarkovEnabled,
         jitTripletEnabled: jitCfg.jitTripletEnabled,
+        jitPrewarmEnabled: jitCfg.jitPrewarmEnabled,
         jitAwaitCompiler: jitCfg.jitAwaitCompiler,
+        allowNetwork: networkAllowed,
+        hostFetchProxy,
     });
 
-    await workerReady;
+    await withTimeout(workerReady, 20000, 'Worker initialization timed out');
     installWorkerRuntimeHandler();
 
     let proxyUrl = params.get('proxy') || 'https://127.0.0.1:4433/connect';
@@ -1188,7 +1256,7 @@ async function main() {
     let netBridge = null;
 
     if (activeExample === 'server') {
-        updateNetStatus('connecting to WebTransport proxy...');
+        updateNetStatus('connecting', 'net: ...');
         netBridge = new FriscyNetworkBridge(proxyUrl, { certHash: proxyCertHash });
         
         // Let the worker interact with the net bridge by forwarding messages
@@ -1202,10 +1270,10 @@ async function main() {
 
         // The JSPI approach is overridden by the bridge when 'server' is used
         term.writeln('\\x1b[32mNetwork: WebTransport Proxy via ' + proxyUrl + '\\x1b[0m');
-        updateNetStatus('WebTransport Connected');
+        updateNetStatus('connected');
     } else {
-        // Network: VectorHeart hypercalls handle networking via JSPI (no proxy needed)
-        updateNetStatus('connected JSPI');
+        // Network: restricted by default for non-server examples
+        updateNetStatus('disconnected');
     }
 
     // Transition: hide overlay FIRST, then show + open terminals
@@ -1231,9 +1299,12 @@ async function main() {
     const rootfsMB = (rootfs.byteLength / 1024 / 1024).toFixed(1);
     term.writeln('\x1b[4:3m\x1b[58;2;255;0;255mdocker-in-browser\x1b[0m');
     term.writeln('');
-    term.writeln('\x1b[1;32mfriscy\x1b[0m fast risc-v runtime for the browser & wasm');
+    term.writeln('fast risc-v runtime for the browser & wasm');
     term.writeln(`Image: ${manifest.image} (${rootfsMB} MB)`);
-    term.writeln('\x1b[32mNetwork: VectorHeart (JSPI)\x1b[0m');
+    if (activeExample === 'server') {
+        term.writeln('\x1b[32mNetwork: WebTransport Proxy via ' + proxyUrl + '\x1b[0m');
+    } else {
+        term.writeln('\x1b[31mNetwork: Restricted by sandbox policy\x1b[0m');
     }
     term.writeln('');
 
@@ -1340,15 +1411,19 @@ async function main() {
     const guestCmd = Array.isArray(entrypoint) ? entrypoint : entrypoint.split(' ').filter(s => s);
     const defaultEnv = manifest.env || [];
     const exampleEnv = exampleCfg.env || [];
+    const apiKeyOverride = params.get('apiKey') || '';
     const envMap = new Map();
     for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
     for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
+    if (apiKeyOverride) {
+        envMap.set('ANTHROPIC_API_KEY', `ANTHROPIC_API_KEY=${apiKeyOverride}`);
+    }
     const envVars = [...envMap.values()];
     const envArgs = envVars.flatMap(e => ['--env', e]);
     const args = [...envArgs, '--rootfs', '/rootfs.tar', ...guestCmd];
 
-    if (statusEl) statusEl.textContent = 'Booting...';
-    setProgress(100, `Booting ${imageName}...`, 'Initializing RISC-V interpreter engine...');
+    if (statusEl) statusEl.textContent = `Booting ${imageName}`;
+    setProgress(100, `Booting ${imageName} guest...`, 'Mounting rootfs and launching entrypoint...');
     
     // Give the UI a frame to render the Booting message before WASM blocks the thread
     await new Promise(resolve => requestAnimationFrame(resolve));
@@ -1371,7 +1446,7 @@ async function main() {
         fitAddon.fit();
     }, 1500);
 
-    if (statusEl) statusEl.innerHTML = 'fast risc-v runtime for the browser &amp; wasm' + netStatusHTML;
+    if (statusEl) statusEl.textContent = 'VM running';
 
     // Server tab
     if (activeExample === 'server' && companionRootfs) {
@@ -1397,7 +1472,7 @@ async function main() {
 }
 
 // --- Tab bar ---
-const activeExample = params.get('example') || 'alpine';
+const activeExample = new URLSearchParams(window.location.search).get('example') || 'alpine';
 
 document.querySelectorAll('.tab').forEach(tab => {
     if ((tab as HTMLElement).dataset.example === activeExample) tab.classList.add('active');
@@ -1633,3 +1708,7 @@ function initImportPanel() {
         }
     }
 }
+
+main().catch((error) => {
+    failBoot('Unable to start VM', error);
+});

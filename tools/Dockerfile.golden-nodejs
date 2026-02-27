@@ -1,0 +1,27 @@
+# Golden demo Node.js rootfs source (riscv64-capable).
+# Build:
+#   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.golden-nodejs -t friscy-golden-nodejs . --load
+# Export:
+#   CID=$(docker create friscy-golden-nodejs)
+#   docker export "$CID" > docs_site/nodejs.tar
+#   docker rm "$CID"
+FROM --platform=linux/riscv64 alpine:edge
+
+# Install musl-linked Node.js from Alpine repos so it runs with
+# /lib/ld-musl-riscv64.so.1 in browser emulation.
+RUN apk add --no-cache \
+    bash \
+    ca-certificates \
+    coreutils \
+    curl \
+    git \
+    gnupg \
+    jq \
+    nano \
+    npm \
+    nodejs \
+    vim \
+    wget
+
+WORKDIR /root
+CMD ["/usr/bin/node", "--version"]

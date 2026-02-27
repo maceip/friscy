@@ -1,0 +1,6 @@
+/src/build-wasm-user/CMakeFiles/friscy.dir
+/src/build-wasm-user/CMakeFiles/edit_cache.dir
+/src/build-wasm-user/CMakeFiles/rebuild_cache.dir
+/src/build-wasm-user/libriscv/CMakeFiles/riscv.dir
+/src/build-wasm-user/libriscv/CMakeFiles/edit_cache.dir
+/src/build-wasm-user/libriscv/CMakeFiles/rebuild_cache.dir

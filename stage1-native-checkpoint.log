@@ -1,0 +1,380 @@
+[friscy] Loading rootfs: /tmp/claude-golden.tar
+[friscy] Entry point: /usr/bin/node
+[friscy] Binary size: 48783560 bytes
+[friscy] Valid RV64 ELF detected
+[friscy] ELF type: PIE/shared
+[friscy] Dynamic binary detected
+[friscy] Interpreter: /lib/ld-musl-riscv64.so.1
+[friscy] Loaded interpreter: 613016 bytes
+[friscy-debug] Constructing Machine (binary bytes=48783560)
+[friscy-debug] Machine constructed (pc=0x2f257e)
+[friscy] Loading interpreter at 0x18000000
+[friscy] Interpreter entry: 0x18056900
+[friscy] PIE base: 0x40000
+[friscy] Advancing mmap past interpreter: 0x3ff2000 -> 0x18098000
+[friscy] Heap area: 0x18098000 (64MB)
+[vh] Stage 1 active (sync-only)
+[vh] Stage 2 deferred (async paths disabled)
+[vh] VectorHeart harness ready (ecalls 600-803, 610)
+[brk#1] new_end=0x0 current=0x2ef1000 heap_addr=0x2ef1000 pc=0x180226ce
+[brk#1] => 0x2ef1000
+[brk#2] new_end=0x2ef3000 current=0x2ef1000 heap_addr=0x2ef1000 pc=0x180226ea
+[brk#2] => 0x2ef3000
+[mmap-sync] our_bump=0x0 -> mmap_address=0x1c098000
+[mmap-anon] #1 addr=0x2ef1000 len=0x1000 prot=0 flags=0x32 => 0x2ef1000 (bump=0x1c098000)
+[fcntl] fd=5 cmd=2 valid=1
+[friscy] VectorHeart Stage 2 startup: deferred
+[friscy] Setting up aux vector for dynamic linker
+[friscy] Machine stack top: 0x3ff1000
+[friscy] Stack pointer: 0x3ff0ac0
+[friscy] Starting execution...
+----------------------------------------
+[mmap] fd=5 path=/usr/lib/libz.so.1 addr=0x0 len=0x15000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c098000 (nextfree=0x1c0ad000)
+[mmap] fd=5 path=/usr/lib/libz.so.1 addr=0x1c0ab000 len=0x2000 prot=3 flags=0x12 off=0x13000
+[mmap] => 0x1c0ab000 (nextfree=0x1c0ad000)
+[fcntl] fd=6 cmd=2 valid=1
+[mmap] fd=6 path=/usr/lib/libada.so.3 addr=0x0 len=0xa4000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c0ad000 (nextfree=0x1c151000)
+[mmap] fd=6 path=/usr/lib/libada.so.3 addr=0x1c14a000 len=0x7000 prot=3 flags=0x12 off=0x9d000
+[mmap] => 0x1c14a000 (nextfree=0x1c151000)
+[fcntl] fd=7 cmd=2 valid=1
+[mmap] fd=7 path=/usr/lib/libsimdjson.so.29 addr=0x0 len=0x17000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c151000 (nextfree=0x1c168000)
+[mmap] fd=7 path=/usr/lib/libsimdjson.so.29 addr=0x1c166000 len=0x2000 prot=3 flags=0x12 off=0x15000
+[mmap] => 0x1c166000 (nextfree=0x1c168000)
+[fcntl] fd=8 cmd=2 valid=1
+[mmap] fd=8 path=/usr/lib/libsimdutf.so.29 addr=0x0 len=0x22000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c168000 (nextfree=0x1c18a000)
+[mmap] fd=8 path=/usr/lib/libsimdutf.so.29 addr=0x1c188000 len=0x2000 prot=3 flags=0x12 off=0x20000
+[mmap] => 0x1c188000 (nextfree=0x1c18a000)
+[fcntl] fd=9 cmd=2 valid=1
+[mmap] fd=9 path=/usr/lib/libbrotlidec.so.1 addr=0x0 len=0xc000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c18a000 (nextfree=0x1c196000)
+[mmap] fd=9 path=/usr/lib/libbrotlidec.so.1 addr=0x1c194000 len=0x2000 prot=3 flags=0x12 off=0xa000
+[mmap] => 0x1c194000 (nextfree=0x1c196000)
+[fcntl] fd=10 cmd=2 valid=1
+[mmap] fd=10 path=/usr/lib/libbrotlienc.so.1 addr=0x0 len=0xb0000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c196000 (nextfree=0x1c246000)
+[mmap] fd=10 path=/usr/lib/libbrotlienc.so.1 addr=0x1c244000 len=0x2000 prot=3 flags=0x12 off=0xad000
+[mmap] => 0x1c244000 (nextfree=0x1c246000)
+[fcntl] fd=11 cmd=2 valid=1
+[mmap] fd=11 path=/usr/lib/libcares.so.2 addr=0x0 len=0x36000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c246000 (nextfree=0x1c27c000)
+[mmap] fd=11 path=/usr/lib/libcares.so.2 addr=0x1c27a000 len=0x2000 prot=3 flags=0x12 off=0x34000
+[mmap] => 0x1c27a000 (nextfree=0x1c27c000)
+[fcntl] fd=12 cmd=2 valid=1
+[mmap] fd=12 path=/usr/lib/libnghttp2.so.14 addr=0x0 len=0x21000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c27c000 (nextfree=0x1c29d000)
+[mmap] fd=12 path=/usr/lib/libnghttp2.so.14 addr=0x1c299000 len=0x4000 prot=3 flags=0x12 off=0x1c000
+[mmap] => 0x1c299000 (nextfree=0x1c29d000)
+[fcntl] fd=13 cmd=2 valid=1
+[mmap] fd=13 path=/usr/lib/libsqlite3.so.0 addr=0x0 len=0x136000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c29d000 (nextfree=0x1c3d3000)
+[mmap] fd=13 path=/usr/lib/libsqlite3.so.0 addr=0x1c3ca000 len=0x9000 prot=3 flags=0x12 off=0x12c000
+[mmap] => 0x1c3ca000 (nextfree=0x1c3d3000)
+[fcntl] fd=14 cmd=2 valid=1
+[mmap] fd=14 path=/usr/lib/libzstd.so.1 addr=0x0 len=0xa8000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c3d3000 (nextfree=0x1c47b000)
+[mmap] fd=14 path=/usr/lib/libzstd.so.1 addr=0x1c479000 len=0x2000 prot=3 flags=0x12 off=0xa5000
+[mmap] => 0x1c479000 (nextfree=0x1c47b000)
+[fcntl] fd=15 cmd=2 valid=1
+[mmap] fd=15 path=/usr/lib/libcrypto.so.3 addr=0x0 len=0x3b3000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c47b000 (nextfree=0x1c82e000)
+[mmap] fd=15 path=/usr/lib/libcrypto.so.3 addr=0x1c7b7000 len=0x77000 prot=3 flags=0x12 off=0x33c000
+[mmap] => 0x1c7b7000 (nextfree=0x1c82e000)
+[mmap-sync] our_bump=0x1c098000 -> mmap_address=0x1c82e000
+[mmap-anon] #2 addr=0x1c82b000 len=0x3000 prot=3 flags=0x32 => 0x1c82b000 (bump=0x1c82e000)
+[fcntl] fd=16 cmd=2 valid=1
+[mmap] fd=16 path=/usr/lib/libssl.so.3 addr=0x0 len=0xc3000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c82e000 (nextfree=0x1c8f1000)
+[mmap] fd=16 path=/usr/lib/libssl.so.3 addr=0x1c8e3000 len=0xe000 prot=3 flags=0x12 off=0xb4000
+[mmap] => 0x1c8e3000 (nextfree=0x1c8f1000)
+[fcntl] fd=17 cmd=2 valid=1
+[mmap] fd=17 path=/usr/lib/libicui18n.so.78 addr=0x0 len=0x2c3000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1c8f1000 (nextfree=0x1cbb4000)
+[mmap] fd=17 path=/usr/lib/libicui18n.so.78 addr=0x1cb9d000 len=0x17000 prot=3 flags=0x12 off=0x2ab000
+[mmap] => 0x1cb9d000 (nextfree=0x1cbb4000)
+[mmap-sync] our_bump=0x1c82e000 -> mmap_address=0x1cbb4000
+[mmap-anon] #3 addr=0x1cbb3000 len=0x1000 prot=3 flags=0x32 => 0x1cbb3000 (bump=0x1cbb4000)
+[fcntl] fd=18 cmd=2 valid=1
+[mmap] fd=18 path=/usr/lib/libicuuc.so.78 addr=0x0 len=0x1b7000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1cbb4000 (nextfree=0x1cd6b000)
+[mmap] fd=18 path=/usr/lib/libicuuc.so.78 addr=0x1cd55000 len=0x16000 prot=3 flags=0x12 off=0x1a1000
+[mmap] => 0x1cd55000 (nextfree=0x1cd6b000)
+[mmap-sync] our_bump=0x1cbb4000 -> mmap_address=0x1cd6b000
+[mmap-anon] #4 addr=0x1cd69000 len=0x2000 prot=3 flags=0x32 => 0x1cd69000 (bump=0x1cd6b000)
+[fcntl] fd=19 cmd=2 valid=1
+[mmap] fd=19 path=/usr/lib/libstdc++.so.6 addr=0x0 len=0x258000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1cd6b000 (nextfree=0x1cfc3000)
+[mmap] fd=19 path=/usr/lib/libstdc++.so.6 addr=0x1cfad000 len=0x16000 prot=3 flags=0x12 off=0x242000
+[mmap] => 0x1cfad000 (nextfree=0x1cfc3000)
+[mmap-sync] our_bump=0x1cd6b000 -> mmap_address=0x1cfc3000
+[mmap-anon] #5 addr=0x1cfc0000 len=0x3000 prot=3 flags=0x32 => 0x1cfc0000 (bump=0x1cfc3000)
+[fcntl] fd=20 cmd=2 valid=1
+[mmap] fd=20 path=/usr/lib/libgcc_s.so.1 addr=0x0 len=0x1f000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1cfc3000 (nextfree=0x1cfe2000)
+[mmap] fd=20 path=/usr/lib/libgcc_s.so.1 addr=0x1cfe0000 len=0x2000 prot=3 flags=0x12 off=0x1c000
+[mmap] => 0x1cfe0000 (nextfree=0x1cfe2000)
+[fcntl] fd=21 cmd=2 valid=1
+[mmap] fd=21 path=/usr/lib/libbrotlicommon.so.1 addr=0x0 len=0x22000 prot=5 flags=0x2 off=0x0
+[mmap] => 0x1cfe2000 (nextfree=0x1d004000)
+[mmap] fd=21 path=/usr/lib/libbrotlicommon.so.1 addr=0x1d002000 len=0x2000 prot=3 flags=0x12 off=0x1f000
+[mmap] => 0x1d002000 (nextfree=0x1d004000)
+[fcntl] fd=22 cmd=2 valid=1
+[mmap] fd=22 path=/usr/lib/libicudata.so.78 addr=0x0 len=0x2000 prot=1 flags=0x2 off=0x0
+[mmap] => 0x1d004000 (nextfree=0x1d006000)
+[mmap] fd=22 path=/usr/lib/libicudata.so.78 addr=0x1d005000 len=0x1000 prot=3 flags=0x12 off=0x0
+[mmap] => 0x1d005000 (nextfree=0x1d006000)
+[mprotect] #1 addr=0x1c0ab000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #2 addr=0x1c14a000 len=0x2000 prot=1 pc=0x18057d90
+[mprotect] #3 addr=0x1c166000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #4 addr=0x1c188000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #5 addr=0x1c194000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #6 addr=0x1c244000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #7 addr=0x1c27a000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #8 addr=0x1c299000 len=0x3000 prot=1 pc=0x18057d90
+[mprotect] #9 addr=0x1c3ca000 len=0x4000 prot=1 pc=0x18057d90
+[mprotect] #10 addr=0x1c479000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #11 addr=0x1c7b7000 len=0x71000 prot=1 pc=0x18057d90
+[mprotect] #12 addr=0x1c8e3000 len=0xa000 prot=1 pc=0x18057d90
+[mprotect] #13 addr=0x1cb9d000 len=0x15000 prot=1 pc=0x18057d90
+[mprotect] #14 addr=0x1cd55000 len=0x13000 prot=1 pc=0x18057d90
+[mprotect] #15 addr=0x1cfad000 len=0x12000 prot=1 pc=0x18057d90
+[mprotect] #16 addr=0x1cfe0000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #17 addr=0x18094000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #18 addr=0x1d002000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #19 addr=0x1d005000 len=0x1000 prot=1 pc=0x18057d90
+[mprotect] #20 addr=0x2e25000 len=0x85000 prot=1 pc=0x18057d90
+[mmap-sync] our_bump=0x1cfc3000 -> mmap_address=0x1d006000
+[mmap-anon] #6 addr=0x0 len=0x13000 prot=3 flags=0x22 => 0x1d006000 (bump=0x1d019000)
+[brk#3] new_end=0x2ef4000 current=0x2ef3000 heap_addr=0x2ef1000 pc=0x1802262c
+[brk#3] => 0x2ef4000
+[mmap-anon] #7 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d019000 (bump=0x1d01a000)
+[mmap-anon] #8 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d01a000 (bump=0x1d01b000)
+[mmap-anon] #9 addr=0x0 len=0x2000 prot=3 flags=0x22 => 0x1d01b000 (bump=0x1d01d000)
+[mmap-anon] #10 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d01d000 (bump=0x1d01e000)
+[mmap-anon] #11 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d01e000 (bump=0x1d01f000)
+[mmap-anon] #12 addr=0x0 len=0x6000 prot=3 flags=0x22 => 0x1d01f000 (bump=0x1d025000)
+[mmap-anon] #13 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d025000 (bump=0x1d026000)
+[mmap-anon] #14 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d026000 (bump=0x1d027000)
+[mmap-anon] #15 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d027000 (bump=0x1d028000)
+[mmap-anon] #16 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d028000 (bump=0x1d029000)
+[mmap-anon] #17 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d029000 (bump=0x1d02a000)
+[mmap-anon] #18 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d02a000 (bump=0x1d02b000)
+[mmap-anon] #19 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x1d02b000 (bump=0x1d02c000)
+[mmap-anon] #20 addr=0x0 len=0x2000 prot=3 flags=0x22 => 0x1d02c000 (bump=0x1d02e000)
+[brk#4] new_end=0x2ef5000 current=0x2ef4000 heap_addr=0x2ef1000 pc=0x1802262c
+[brk#4] => 0x2ef5000
+[brk#5] new_end=0x2ef6000 current=0x2ef5000 heap_addr=0x2ef1000 pc=0x1802262c
+[brk#5] => 0x2ef6000
+[fcntl] fd=0 cmd=3 valid=1
+[fcntl] fd=1 cmd=3 valid=1
+[fcntl] fd=2 cmd=3 valid=1
+[fcntl] fd=0 cmd=2 valid=1
+[fcntl] fd=1 cmd=2 valid=1
+[fcntl] fd=2 cmd=2 valid=1
+[fcntl] fd=3 cmd=2 valid=0
+[fcntl] fd=4 cmd=2 valid=0
+[fcntl] fd=5 cmd=2 valid=0
+[fcntl] fd=6 cmd=2 valid=0
+[fcntl] fd=7 cmd=2 valid=0
+[fcntl] fd=8 cmd=2 valid=0
+[fcntl] fd=9 cmd=2 valid=0
+[fcntl] fd=10 cmd=2 valid=0
+[fcntl] fd=11 cmd=2 valid=0
+[fcntl] fd=12 cmd=2 valid=0
+[fcntl] fd=13 cmd=2 valid=0
+[fcntl] fd=14 cmd=2 valid=0
+[fcntl] fd=15 cmd=2 valid=0
+[fcntl] fd=16 cmd=2 valid=0
+[mmap] fd=23 path=/usr/share/icu/78.1/icudt78l.dat addr=0x0 len=0x2e1c80 prot=1 flags=0x1 off=0x0
+[mmap] => 0x1d07b000 (nextfree=0x1d35d000)
+[mmap-sync] our_bump=0x1d07b000 -> mmap_address=0x1d35d000
+[brk#6] new_end=0x2ef7000 current=0x2ef6000 heap_addr=0x2ef1000 pc=0x1802262c
+[brk#6] => 0x2ef7000
+[munmap] addr=0x1d36e000 len=0x4000 pc=0x18035a8a
+[munmap] addr=0x1d381000 len=0x1000 pc=0x18035a8a
+[munmap] addr=0x1d382000 len=0x1000 pc=0x18035a8a
+[brk#7] new_end=0x2ef8000 current=0x2ef7000 heap_addr=0x2ef1000 pc=0x1802262c
+[brk#7] => 0x2ef8000
+[getrandom] buf=0x1d066610 count=48 flags=0x0 pc=0x1805007e
+[epoll_create1] => fd=2000
+[fcntl] fd=25 cmd=2 valid=1
+[pipe2] flags=0x80000 => read=26 write=27
+[pipe2] flags=0x80800 => read=28 write=29
+[eventfd2] => fd=30 initval=0
+[mprotect] #21 addr=0x1d4ee000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #1 cooperative, tid=100 stack=0x1dcee968
+[epoll_create1] => fd=2001
+[pipe2] flags=0x80800 => read=31 write=32
+[eventfd2] => fd=33 initval=0
+[epoll_ctl] ADD epfd=2001 fd=31 events=0x1 data=0x1f
+[epoll_ctl] ADD epfd=2001 fd=33 events=0x1 data=0x21
+[mprotect] #22 addr=0x1dcf1000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #2 cooperative, tid=101 stack=0x1e4f1968
+[futex] WAIT switch t2->t0 addr=0x3ff06b4 exp=0x80000001
+[mprotect] #23 addr=0x1e4f4000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #3 cooperative, tid=102 stack=0x1ecf4968
+[futex] WAIT switch t3->t0 addr=0x3ff06b4 exp=0x80000001
+[mprotect] #24 addr=0x1ecf7000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #4 cooperative, tid=103 stack=0x1f4f7968
+[futex] WAIT switch t4->t0 addr=0x3ff06b4 exp=0x80000001
+[mprotect] #25 addr=0x1f4fa000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #5 cooperative, tid=104 stack=0x1fcfa968
+[futex] WAIT switch t5->t0 addr=0x3ff06b4 exp=0x80000001
+[futex] WAKE addr=0x3ff06b4 woke=1
+[futex] WAIT switch t0->t2 addr=0x3ff0614 exp=0x2
+[futex] WAKE addr=0x3ff0614 woke=1
+[futex] WAKE addr=0x3ff06b4 woke=1
+[futex] WAIT switch t2->t0 addr=0x1e4f181c exp=0x2
+[futex] WAKE addr=0x3ff06b4 woke=1
+[futex] WAIT switch t0->t3 addr=0x3ff0614 exp=0x2
+[futex] WAKE addr=0x3ff0614 woke=1
+[futex] WAKE addr=0x3ff06b4 woke=1
+[futex] WAIT switch t3->t0 addr=0x1ecf481c exp=0x2
+[futex] WAIT switch t0->t4 addr=0x3ff0614 exp=0x2
+[futex] WAKE addr=0x3ff0614 woke=1
+[futex] WAIT switch t4->t0 addr=0x1f4f781c exp=0x2
+[futex] WAIT switch t0->t5 addr=0x3ff0614 exp=0x2
+[futex] WAKE addr=0x3ff0614 woke=1
+[futex] WAIT switch t5->t0 addr=0x1fcfa81c exp=0x2
+[madvise] addr=0x1fcfb000 len=0x80000 advice=10 pc=0x180358be
+[mprotect] #26 addr=0x1fcfb000 len=0x4000 prot=3 pc=0x180359ba
+[madvise] addr=0x1fd7f000 len=0x1000f000 advice=10 pc=0x180358be
+[munmap] addr=0x1fd7f000 len=0x1000 pc=0x18035a8a
+[munmap] addr=0x2fd80000 len=0xe000 pc=0x18035a8a
+[mprotect] #27 addr=0x1fd80000 len=0x10000 prot=1 pc=0x180359ba
+[munmap] addr=0x2fd8e000 len=0x1000 pc=0x18035a8a
+[munmap] addr=0x2fd8f000 len=0x1000 pc=0x18035a8a
+[madvise] addr=0x2fd9e000 len=0x800f000 advice=10 pc=0x180358be
+[munmap] addr=0x2fd9e000 len=0x2000 pc=0x18035a8a
+[munmap] addr=0x37da0000 len=0xd000 pc=0x18035a8a
+[epoll_create1] => fd=2002
+[pipe2] flags=0x80800 => read=36 write=37
+[eventfd2] => fd=38 initval=0
+[munmap] addr=0x37dc0000 len=0x1000 pc=0x18035a8a
+[munmap] addr=0x37dc1000 len=0x4000 pc=0x18035a8a
+[munmap] addr=0x37dff000 len=0x1000 pc=0x18035a8a
+[brk#8] new_end=0x2ef9000 current=0x2ef8000 heap_addr=0x2ef1000 pc=0x1802262c
+[brk#8] => 0x2ef9000
+[madvise] addr=0x37e2b000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x37e2b000 len=0x15000 pc=0x18035a8a
+[munmap] addr=0x37e80000 len=0x2a000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0x6439580000 -> bump, len=0x7f000
+[madvise] addr=0x37eaa000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x37eaa000 len=0x16000 pc=0x18035a8a
+[munmap] addr=0x37f00000 len=0x29000 pc=0x18035a8a
+[munmap] addr=0x37edb000 len=0x25000 pc=0x18035a8a
+[munmap] addr=0x37f30000 len=0x4000 pc=0x18035a8a
+[mprotect] #28 addr=0x37e40000 len=0x40000 prot=1 pc=0x180359ba
+[mprotect] #29 addr=0x37ec0000 len=0x1b000 prot=1 pc=0x180359ba
+[munmap] addr=0x37f34000 len=0x5000 pc=0x18035a8a
+[munmap] addr=0x37e26000 len=0x5000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0x6bf0e40000 -> bump, len=0x7f000
+[madvise] addr=0x37f39000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x37f39000 len=0x7000 pc=0x18035a8a
+[munmap] addr=0x37f80000 len=0x38000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0xbf8d2c0000 -> bump, len=0x7f000
+[madvise] addr=0x37fbc000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x37fbc000 len=0x4000 pc=0x18035a8a
+[munmap] addr=0x38000000 len=0x3b000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0xf25f700000 -> bump, len=0x7f000
+[madvise] addr=0x3803b000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x3803b000 len=0x5000 pc=0x18035a8a
+[munmap] addr=0x38080000 len=0x3a000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0x9734cc0000 -> bump, len=0x7f000
+[madvise] addr=0x380ba000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x380ba000 len=0x6000 pc=0x18035a8a
+[munmap] addr=0x38100000 len=0x39000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0x4b4dd80000 -> bump, len=0x7f000
+[madvise] addr=0x3814a000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x3814a000 len=0x36000 pc=0x18035a8a
+[munmap] addr=0x381c0000 len=0x9000 pc=0x18035a8a
+[munmap] addr=0x381c9000 len=0x5000 pc=0x18035a8a
+[munmap] addr=0x38145000 len=0x5000 pc=0x18035a8a
+[munmap] addr=0x381ce000 len=0x9000 pc=0x18035a8a
+[munmap] addr=0x381d7000 len=0x9000 pc=0x18035a8a
+[munmap] addr=0x38210000 len=0x11000 pc=0x18035a8a
+[munmap] addr=0x38209000 len=0x7000 pc=0x18035a8a
+[munmap] addr=0x381e0000 len=0x7000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0xfce2100000 -> bump, len=0x7f000
+[madvise] addr=0x38247000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x38247000 len=0x39000 pc=0x18035a8a
+[munmap] addr=0x382c0000 len=0x6000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0xfee6a00000 -> bump, len=0x80000
+[madvise] addr=0x382c6000 len=0x80000 advice=10 pc=0x180358be
+[munmap] addr=0x382c6000 len=0x3a000 pc=0x18035a8a
+[munmap] addr=0x38341000 len=0x5000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0x2d1c4c0000 -> bump, len=0x7f000
+[madvise] addr=0x3834a000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x3834a000 len=0x36000 pc=0x18035a8a
+[munmap] addr=0x383c0000 len=0x9000 pc=0x18035a8a
+[munmap] addr=0x38242000 len=0x5000 pc=0x18035a8a
+[munmap] addr=0x383c9000 len=0x9000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0xa012b40000 -> bump, len=0x7f000
+[madvise] addr=0x383f1000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x383f1000 len=0xf000 pc=0x18035a8a
+[munmap] addr=0x38440000 len=0x30000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0xb28c800000 -> bump, len=0x7f000
+[madvise] addr=0x38470000 len=0x7f000 advice=10 pc=0x180358be
+[munmap] addr=0x38470000 len=0x10000 pc=0x18035a8a
+[munmap] addr=0x384c0000 len=0x2f000 pc=0x18035a8a
+[munmap] addr=0x383d9000 len=0x11000 pc=0x18035a8a
+[mmap-hint-ignore] hint=0x3de3380000 -> bump, len=0x7f000
+[madvise] addr=0x38522000 len=0x7f000 advice=10 pc=0x180358be
+[mmap-hint-ignore] hint=0x8abff80000 -> bump, len=0x7f000
+[madvise] addr=0x385a1000 len=0x7f000 advice=10 pc=0x180358be
+[mprotect] #30 addr=0x1fd90000 len=0x10000 prot=3 pc=0x180359ba
+[mmap-hint-ignore] hint=0x9856b00000 -> bump, len=0x7f000
+[madvise] addr=0x386b4000 len=0x7f000 advice=10 pc=0x180358be
+[mprotect] #31 addr=0x1fda0000 len=0x10000 prot=3 pc=0x180359ba
+[mmap-hint-ignore] hint=0x596a6c0000 -> bump, len=0x7f000
+[madvise] addr=0x3875f000 len=0x7f000 advice=10 pc=0x180358be
+[mmap-hint-ignore] hint=0x9d5ce00000 -> bump, len=0x7f000
+[madvise] addr=0x387ee000 len=0x7f000 advice=10 pc=0x180358be
+[mmap-hint-ignore] hint=0x97c5000000 -> bump, len=0x7f000
+[madvise] addr=0x38893000 len=0x7f000 advice=10 pc=0x180358be
+[mmap-hint-ignore] hint=0x7ed8500000 -> bump, len=0x7f000
+[madvise] addr=0x38958000 len=0x7f000 advice=10 pc=0x180358be
+[mmap-hint-ignore] hint=0xf8fec80000 -> bump, len=0x7f000
+[madvise] addr=0x389e3000 len=0x7f000 advice=10 pc=0x180358be
+[mmap-hint-ignore] hint=0x8c60f40000 -> bump, len=0x7f000
+[madvise] addr=0x38a69000 len=0x7f000 advice=10 pc=0x180358be
+[mprotect] #32 addr=0x38aef000 len=0x9000 prot=3 pc=0x180359ba
+[clone] thread #6 cooperative, tid=105 stack=0x38af7968
+[futex] WAIT switch t6->t0 addr=0x2ecec20 exp=0x80000000
+[fcntl] fd=39 cmd=2 valid=1
+[brk#9] new_end=0x2efa000 current=0x2ef9000 heap_addr=0x2ef1000 pc=0x1802262c
+[brk#9] => 0x2efa000
+[getrandom] buf=0x38aeaea8 count=256 flags=0x0 pc=0x180525ae
+[getrandom] buf=0x38aeaa38 count=256 flags=0x0 pc=0x180525ae
+[fcntl] fd=44 cmd=2 valid=1
+[madvise] addr=0x38d17000 len=0x3f000 advice=10 pc=0x180358be
+[mprotect] #33 addr=0x38d20000 len=0x20000 prot=3 pc=0x180359ba
+[madvise] addr=0x38eb4000 len=0x7f000 advice=10 pc=0x180358be
+[madvise] addr=0x395e7000 len=0x7f000 advice=10 pc=0x180358be
+[mprotect] #34 addr=0x1fdb0000 len=0x10000 prot=3 pc=0x180359ba
+[mprotect] #35 addr=0x3997f000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #7 cooperative, tid=106 stack=0x3a17f968
+[futex] WAIT switch t7->t0 addr=0x3a17f87c exp=0x2
+[mprotect] #36 addr=0x3a182000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #8 cooperative, tid=107 stack=0x3a982968
+[futex] WAIT switch t8->t0 addr=0x3a98287c exp=0x2
+[mprotect] #37 addr=0x3a985000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #9 cooperative, tid=108 stack=0x3b185968
+[futex] WAIT switch t9->t0 addr=0x3b18587c exp=0x2
+[mprotect] #38 addr=0x3b188000 len=0x801000 prot=3 pc=0x180359ba
+[clone] thread #10 cooperative, tid=109 stack=0x3b988968
+[futex] WAIT switch t10->t0 addr=0x3b98887c exp=0x2
+[futex] WAKE addr=0x3a17f87c woke=1
+[epoll_ctl] ADD epfd=2002 fd=36 events=0x1 data=0x24
+[epoll_ctl] ADD epfd=2002 fd=38 events=0x1 data=0x26
+[fcntl] fd=45 cmd=2 valid=1
+[fcntl] fd=46 cmd=2 valid=1
+[friscy] Saving checkpoint at stdin wait point...
+[friscy] Instructions executed: 247195916
+[checkpoint] Saved 15608 exec pages
+[checkpoint] Saved: 1252 non-zero chunks, 82051072 bytes arena data, 82201660 bytes total
+[checkpoint] Written 82201660 bytes to /tmp/node-stage1.ckpt
+[friscy] Checkpoint saved, exiting.

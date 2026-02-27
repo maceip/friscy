@@ -1,0 +1,16 @@
+# Golden demo Go echo server rootfs source
+# Build:
+#   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.golden-goserver -t friscy-golden-goserver . --load
+# Export:
+#   CID=$(docker create friscy-golden-goserver)
+#   docker export "$CID" > docs_site/goserver.tar
+#   docker rm "$CID"
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS build
+WORKDIR /src
+COPY tests/echo_server/go.mod tests/echo_server/go.sum tests/echo_server/main.go ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    GOOS=linux GOARCH=riscv64 CGO_ENABLED=0 go build -o /out/echo_server ./main.go
+
+FROM --platform=$TARGETPLATFORM alpine:3.20
+COPY --from=build /out/echo_server /bin/echo_server
+ENTRYPOINT ["/bin/echo_server"]

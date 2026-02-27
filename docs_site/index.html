@@ -27,16 +27,41 @@
             display: flex;
             flex-direction: column;
         }
+        
+        @keyframes bounceHover {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-3px); }
+        }
+        @keyframes dodgeClick {
+            0% { transform: scale(1); }
+            50% { transform: scale(0.9) translateX(8px); }
+            100% { transform: scale(1); }
+        }
+
+        .friscy-corner-logo {
+            height: 96px;
+            width: auto;
+            object-fit: contain;
+            opacity: 0.96;
+            transition: opacity 0.2s ease;
+        }
+        .friscy-corner-logo:hover {
+            opacity: 1;
+            animation: bounceHover 0.6s ease infinite;
+        }
+        .friscy-corner-logo:active {
+            animation: dodgeClick 0.28s ease;
+        }
+
         header {
-            padding: 0.75rem 1rem;
+            padding: 0.5rem 1rem;
             background: linear-gradient(180deg, rgba(13,17,23,0.5) 0%, rgba(10,14,20,0.6) 100%);
             backdrop-filter: blur(12px);
             -webkit-backdrop-filter: blur(12px);
             border-bottom: 1px solid rgba(89,194,255,0.15);
             display: flex;
-            justify-content: space-between;
+            justify-content: flex-start;
             align-items: center;
-            flex-wrap: wrap;
             position: relative;
         }
         header::after {
@@ -48,13 +73,12 @@
             height: 1px;
             background: linear-gradient(90deg, transparent, rgba(255,143,64,0.4) 20%, rgba(89,194,255,0.3) 50%, rgba(210,166,255,0.4) 80%, transparent);
         }
-        h1 { font-size: 1.2rem; font-weight: 500; }
         .status { font-size: 0.85rem; color: #888; margin-top: 0.25rem; }
         .net-status {
-            font-size: 0.75rem;
-            padding: 0.2rem 0.5rem;
-            border-radius: 3px;
-            margin-left: 0.5rem;
+            font-size: 0.85rem;
+            padding: 0.3rem 0.6rem;
+            border-radius: 4px;
+            font-weight: bold;
         }
         .net-status.connected { background: #1a4d2e; color: #a6e3a1; }
         .net-status.disconnected { background: #4d1a1a; color: #f38ba8; }
@@ -112,6 +136,7 @@
         #terminal-container {
             flex: 1;
             padding: 0.75rem;
+            padding-bottom: 4.75rem;
             display: flex;
             flex-direction: column;
             overflow: hidden;
@@ -197,21 +222,18 @@
             border-radius: 8px;
         }
         #progress-overlay.hidden { display: none; }
-        .progress-title {
-            font-size: 1.4rem;
-            font-weight: 600;
-            letter-spacing: -0.02em;
-        }
         .progress-stage {
-            font-size: 0.9rem;
+            font-size: 1.1rem;
             color: #8b949e;
+            font-weight: 500;
         }
         .progress-wave {
             width: min(400px, 80%);
             height: 24px;
+            margin-top: 1rem;
         }
         .progress-detail {
-            font-size: 0.8rem;
+            font-size: 0.85rem;
             color: #484f58;
             font-variant-numeric: tabular-nums;
         }
@@ -343,19 +365,97 @@
             text-decoration: none;
         }
         .header-link:hover { text-decoration: underline; }
-        .header-logo {
-            height: 24px;
-            opacity: 0.7;
-            margin-left: 1rem;
+        .tab-row {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 0.75rem;
+            padding: 0 1rem;
+            padding-top: 0.4rem;
         }
-        .header-logo:hover { opacity: 1; }
+        .tab-actions {
+            display: flex;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        #suspend-btn {
+            background: rgba(10, 14, 20, 0.7);
+            border: 1px solid rgba(89,194,255,0.2);
+            color: #ff8f40;
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0.32rem 0.58rem;
+            border-radius: 8px 8px 0 0;
+            min-height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+        }
+        #suspend-btn:hover { border-color: rgba(89,194,255,0.45); background: rgba(16,22,34,0.8); }
+        #suspend-icon { width: 18px; height: 18px; }
+        #pause-btn {
+            background: none;
+            border: none;
+            color: #e6e1cf;
+            cursor: pointer;
+            font-size: 1.1rem;
+            padding: 0.2rem;
+            display: inline-flex;
+            align-items: center;
+        }
+        .overlay-controls {
+            position: absolute;
+            bottom: 8px;
+            right: 8px;
+            z-index: 20;
+            display: flex;
+            gap: 0.5rem;
+            background: rgba(13,17,23,0.8);
+            backdrop-filter: blur(4px);
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid rgba(89,194,255,0.2);
+        }
+        #bottom-left-brand {
+            position: fixed;
+            left: 14px;
+            bottom: 10px;
+            z-index: 45;
+            pointer-events: auto;
+        }
+        #bottom-center-brand {
+            position: fixed;
+            left: 50%;
+            bottom: 8px;
+            transform: translateX(-50%);
+            display: flex;
+            align-items: center;
+            gap: 1.25rem;
+            z-index: 40;
+            pointer-events: none;
+        }
+        .footer-tech-logo {
+            opacity: 0.94;
+            height: 64px;
+            width: auto;
+            object-fit: contain;
+        }
+        #bottom-right-status {
+            position: fixed;
+            right: 14px;
+            bottom: 14px;
+            z-index: 45;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
         /* Mobile breakpoints */
         @media (max-width: 768px) {
             header { padding: 0.5rem 0.75rem; }
-            h1 { font-size: 1rem; }
             .status { font-size: 0.75rem; }
-            .header-logo { height: 18px; margin-left: 0.5rem; }
-            .tab-bar { padding: 0 0.5rem; gap: 1px; overflow-x: auto; scrollbar-width: none; }
+            .tab-row { padding: 0 0.5rem; padding-top: 0.35rem; gap: 0.45rem; }
+            .tab-bar { padding: 0; gap: 1px; overflow-x: auto; scrollbar-width: none; }
             .tab-bar::-webkit-scrollbar { display: none; }
             .tab { padding: 5px 8px; font-size: 0.7rem; gap: 4px; white-space: nowrap; }
             .tab-icon { width: 13px; height: 13px; }
@@ -369,36 +469,49 @@
             .import-input { font-size: 0.85rem; padding: 8px 10px; }
             #jit-warmup-hud {
                 right: 8px;
-                bottom: 8px;
+                bottom: 54px;
                 min-width: 176px;
                 font-size: 0.64rem;
             }
+            #suspend-btn { min-height: 28px; padding: 0.28rem 0.5rem; }
+            #suspend-icon { width: 16px; height: 16px; }
+            .friscy-corner-logo { height: 78px; }
+            .footer-tech-logo { height: 50px; }
+            #bottom-left-brand { left: 10px; bottom: 8px; }
+            #bottom-right-status { right: 10px; bottom: 10px; }
+            .net-status { font-size: 0.75rem; padding: 0.2rem 0.42rem; }
         }
         @media (max-width: 480px) {
             header { padding: 0.4rem 0.5rem; }
-            h1 { font-size: 0.9rem; }
             .status { font-size: 0.7rem; margin-top: 0.15rem; }
-            .net-status { font-size: 0.65rem; padding: 0.15rem 0.35rem; }
+            .tab-row { padding: 0 0.35rem; padding-top: 0.3rem; gap: 0.35rem; }
             .tab { padding: 4px 6px; font-size: 0.65rem; }
             .tab-icon { width: 12px; height: 12px; }
             #terminal-container { padding: 0.25rem; }
             #jit-warmup-hud { min-width: 165px; font-size: 0.61rem; }
+            .friscy-corner-logo { height: 66px; }
+            .footer-tech-logo { height: 40px; }
+            .net-status { font-size: 0.65rem; padding: 0.15rem 0.35rem; }
+            #suspend-btn { min-height: 25px; padding: 0.2rem 0.38rem; border-radius: 7px 7px 0 0; }
+            #suspend-icon { width: 14px; height: 14px; }
         }
         /* IME-aware: when virtual keyboard is visible, shrink terminal */
         @media (max-height: 450px) {
             header { padding: 0.25rem 0.5rem; }
-            h1 { font-size: 0.85rem; }
             .status { display: none; }
-            .tab-bar { padding: 0 0.25rem; }
+            .tab-row { padding: 0 0.25rem; padding-top: 0.25rem; }
+            .tab-bar { padding: 0; }
             .tab { padding: 3px 5px; font-size: 0.6rem; }
             #terminal-container { padding: 0.25rem; }
+            .friscy-corner-logo { height: 56px; }
+            .footer-tech-logo { height: 36px; }
         }
         .tab-bar {
             display: flex;
-            padding: 0 1rem;
-            padding-top: 0.4rem;
+            padding: 0;
             gap: 2px;
             align-items: flex-end;
+            flex: 1;
         }
         .tab {
             display: flex;
@@ -430,6 +543,11 @@
             width: 16px;
             height: 16px;
             flex-shrink: 0;
+            object-fit: contain;
+        }
+        .tab-icon-go {
+            width: 16px;
+            height: 16px;
         }
         .tab-strip-border {
             height: 0;
@@ -544,14 +662,7 @@
 </head>
 <body>
     <header>
-        <div>
-            <h1 style="display:flex; align-items:center;"><a href="https://github.com/maceip/friscy" class="header-link"><img src="./friscylogo.png" alt="friscy" style="height:28px; opacity:0.95;"></a></h1>
-            <div class="status" id="status" style="font-size:1.4rem; font-weight:700; color:#ff8f40; margin-left:0.75rem;"><span id="net-status" class="net-status disconnected">net: off</span></div>
-        </div>
-        <div style="display:flex;align-items:center;gap:0.5rem;">
-            <img src="./mcp.svg" alt="MCP" class="header-logo" title="MCP" style="opacity: 0.9; height: 20px;">
-            <img src="./riscv-logo.svg" alt="RISC-V" class="header-logo" style="opacity: 0.9; height: 20px;">
-        </div>
+        <div class="status" id="status" style="font-size:0.95rem; font-weight:700; color:#ff8f40;"></div>
     </header>
     <div id="search-bar">
         <input id="search-input" type="text" placeholder="Search terminal..." spellcheck="false" autocomplete="off">
@@ -559,23 +670,28 @@
         <button id="search-next" title="Next (Enter)">&#x25BC;</button>
         <button id="search-close" title="Close (Escape)">&#x2715;</button>
     </div>
-    <div class="tab-bar">
-        <button class="tab active" id="tab-alpine" data-example="alpine" title="Alpine Linux shell">
-            <img src="./alpine.svg" alt="" class="tab-icon">Alpine
-        </button>
-        <button class="tab" id="tab-nodejs" data-example="nodejs" title="Interactive Node.js REPL">
-            <img src="./nnode.svg" alt="" class="tab-icon">Node.js
-        </button>
-        <button class="tab" id="tab-server" data-example="server" title="HTTP echo server on port 8080">
-            <img src="./golang.svg" alt="" class="tab-icon">Go Server
-        </button>
-
+    <div class="tab-row">
+        <div class="tab-bar">
+            <button class="tab active" id="tab-alpine" data-example="alpine" title="Alpine Linux shell">
+                <img src="./alpine.svg" alt="" class="tab-icon">Alpine
+            </button>
+            <button class="tab" id="tab-nodejs" data-example="nodejs" title="Interactive Node.js REPL">
+                <img src="./nnode.svg" alt="" class="tab-icon">Node.js
+            </button>
+            <button class="tab" id="tab-server" data-example="server" title="HTTP echo server on port 8080">
+                <img src="./golang.svg" alt="" class="tab-icon tab-icon-go">Go Server
+            </button>
+        </div>
+        <div class="tab-actions">
+            <button id="suspend-btn" title="Suspend/Resume VM">
+                <img id="suspend-icon" src="./SUSPEND.svg" alt="Suspend">
+            </button>
+        </div>
     </div>
     <div class="tab-strip-border"></div>
     <div id="terminal-container">
         <div id="progress-overlay">
-            <div class="progress-title">friscy</div>
-            <div class="progress-stage" id="progress-stage">Preparing...</div>
+            <div class="progress-stage" id="progress-stage">Preparing browser runtime...</div>
             <canvas id="progress-canvas" class="progress-wave" width="800" height="48"></canvas>
             <div class="progress-detail" id="progress-detail">&nbsp;</div>
         </div>
@@ -594,12 +710,9 @@
             <div class="import-status" id="import-status">&nbsp;</div>
         </div>
         <div id="terminal-wrapper" style="position:relative;">
-            <div id="terminal" style="display:none;"></div>
-            <div style="position:absolute; bottom:8px; right:8px; z-index:20; display:flex; gap:0.5rem; background:rgba(13,17,23,0.8); backdrop-filter:blur(4px); padding:4px 8px; border-radius:6px; border:1px solid rgba(89,194,255,0.2);">
-                <button id="pause-btn" title="Pause/Resume Execoution" style="background:none; border:none; color:#e6e1cf; cursor:pointer; font-size:1.1rem; padding:0.2rem;">&#x23F8;</button>
-                <button id="suspend-btn" title="Suspend VM" style="background:none; border:none; color:#ff8f40; cursor:pointer; font-size:1.1rem; padding:0.2rem; display:flex; align-items:center;">
-                    <img id="suspend-icon" src="./SUSPEND.svg" alt="Suspend" style="width:18px;height:18px;">
-                </button>
+            <div style="display:none;" id="terminal"></div>
+            <div class="overlay-controls">
+                <button id="pause-btn" title="Pause/Resume Execution">&#x23F8;</button>
             </div>
             <div id="dual-terminal-container">
                 <div class="dual-pane primary">
@@ -624,6 +737,19 @@
     </div>
 
     <button id="reset-btn" title="Reset">&#8635;</button>
+
+    <a id="bottom-left-brand" href="https://github.com/maceip/friscy" title="friscy on GitHub">
+        <img src="./friscylogo.png" alt="friscy logo" class="friscy-corner-logo">
+    </a>
+    <div id="bottom-center-brand" aria-hidden="true">
+        <img src="./mcp.svg" alt="MCP" title="MCP" class="footer-tech-logo">
+        <img src="./riscv.svg" alt="RISC-V" class="footer-tech-logo">
+    </div>
+    <div id="bottom-right-status">
+        <span id="net-status" class="net-status disconnected">net: off</span>
+    </div>
+
+
     <div id="jit-warmup-hud">
         <div class="hud-title">JIT</div>
         <div class="hud-row"><span class="key">compiled</span><span id="jit-hud-compiled" class="val">0</span></div>
@@ -639,7 +765,7 @@
                 console.log('Service Worker registered:', reg);
                 // Reload when not yet isolated (first visit)
                 if (!crossOriginIsolated && reg.active) {
-                    location.reload();
+                    // location.reload();
                     return;
                 }
                 // Reload when a NEW service worker activates (cache update)
@@ -648,7 +774,7 @@
                     if (sw) sw.addEventListener('statechange', () => {
                         if (sw.state === 'activated') {
                             console.log('New service worker activated, reloading...');
-                            location.reload();
+                            // location.reload();
                         }
                     });
                 });

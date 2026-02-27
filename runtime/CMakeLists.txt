@@ -68,9 +68,11 @@ set(RISCV_TAILCALL_DISPATCH ON  CACHE BOOL "musttail → Wasm return_call dispat
 # --- Memory configuration ---
 # Encompassing arena: pre-allocate full guest address space
 # 28-bit = 256MB, 29-bit = 512MB, 30-bit = 1GB, 31-bit = 2GB
-# 31-bit required for Node.js/V8 (pointer cage + code spaces need ~1.15GB)
+# 31-bit (2GB) is required for the full Claude CLI path (`claude mcp list`,
+# `claude -p ...`) which can exceed the 1GB virtual mmap window and abort with
+# OOM before returning to the REPL loop.
 set(RISCV_ENCOMPASSING_ARENA ON  CACHE BOOL "Pre-allocate guest address space")
-set(RISCV_ENCOMPASSING_ARENA_BITS 31 CACHE STRING "2GB guest address space (required for Node.js/V8)")
+set(RISCV_ENCOMPASSING_ARENA_BITS 31 CACHE STRING "2GB guest address space for Claude CLI workloads")
 set(RISCV_FLAT_RW_ARENA ON  CACHE BOOL "Fast read-write arena")
 set(RISCV_MEMORY_TRAPS OFF CACHE BOOL "Disable page traps (overhead)")
 

@@ -27,7 +27,11 @@ class JITManager {
         this.pageSize = 4096;
         this.jitCompiler = null;
         this.jitCompilerLoading = null;
+        this.jitPrewarming = null;
+        this.compilerPrewarmed = false;
         this.wasmMemory = null;
+        this.runtimeInitMs = 0;
+        this.firstCompileLatencyMs = null;
         this.regionMissDemandCounts = new Map();
         this.compileFailureState = new Map();
         this.failureBaseCooldownMs = 2000;
@@ -65,6 +69,10 @@ class JITManager {
             compileQueueDropped: 0,
             compileQueuePeak: 0,
             compileFailures: 0,
+            prewarmAttempts: 0,
+            prewarmSuccesses: 0,
+            prewarmFailures: 0,
+            prewarmTimeMs: 0,
             cooldownDeferrals: 0,
             stalePrunes: 0,
             missesBeforeSteady: 0,
@@ -76,6 +84,7 @@ class JITManager {
 
     init(wasmMemory) {
         this.wasmMemory = wasmMemory;
+        if (!this.runtimeInitMs) this.runtimeInitMs = performance.now();
         this.ensureSchedulerRunning();
     }
 
@@ -127,19 +136,74 @@ class JITManager {
                 await init({ module_or_path: url });
                 const hasFast = typeof compile_region_fast === 'function';
                 const hasOptimized = typeof compile_region_optimized === 'function';
+                const resolvedVersion = (typeof version === 'function') ? version() : version;
                 this.jitCompiler = {
                     compile_region,
                     compile_region_fast: hasFast ? compile_region_fast : null,
                     compile_region_optimized: hasOptimized ? compile_region_optimized : null,
                     supportsTiering: hasFast && hasOptimized,
-                    version,
+                    version: resolvedVersion ?? 'unknown',
                 };
+                console.log(`[JIT] Compiler loaded${resolvedVersion ? ` v${resolvedVersion}` : ''}`);
             } catch (e) {
                 console.warn('[JIT] Failed to load compiler:', e.message);
                 this.jitCompiler = null;
             }
         })();
         return this.jitCompilerLoading;
+    }
+
+    async prewarmCompiler() {
+        if (this.compilerPrewarmed) return true;
+        if (!this.jitCompiler) return false;
+        if (this.jitPrewarming) return this.jitPrewarming;
+
+        this.jitPrewarming = (async () => {
+            this.stats.prewarmAttempts++;
+            const startTime = performance.now();
+            try {
+                // Light-touch warmup for wasm-bindgen glue path.
+                // Real code prewarm is done via `prewarmRegionAt(pc)` once guest code is loaded.
+                if (typeof this.jitCompiler.version === 'function') this.jitCompiler.version();
+
+                this.compilerPrewarmed = true;
+                this.stats.prewarmSuccesses++;
+                this.stats.prewarmTimeMs += (performance.now() - startTime);
+                console.log('[JIT] Compiler prewarmed (module)');
+                return true;
+            } catch (e) {
+                this.stats.prewarmFailures++;
+                console.warn('[JIT] Prewarm failed:', e.message);
+                return false;
+            } finally {
+                this.jitPrewarming = null;
+            }
+        })();
+
+        return this.jitPrewarming;
+    }
+
+    async prewarmRegionAt(pc) {
+        if (!this.jitCompiler || !this.wasmMemory || !Number.isFinite(pc)) return false;
+        const regionBase = (pc >>> 0) & ~(this.regionSize - 1);
+        const memLen = this.wasmMemory.buffer.byteLength >>> 0;
+        if (memLen === 0) return false;
+        const candidates = [regionBase, regionBase - this.regionSize, regionBase + this.regionSize]
+            .filter(addr => Number.isFinite(addr) && addr >= 0 && addr < memLen)
+            .map(addr => (addr >>> 0) & ~(this.regionSize - 1))
+            .filter((addr, idx, arr) => arr.indexOf(addr) === idx);
+        let lastError = null;
+        for (const candidate of candidates) {
+            if (this.compiledRegions.has(candidate)) return true;
+            try {
+                await this.compileRegion(candidate, 'boot-prewarm', 'baseline', { skipFailureStats: true, logFailure: false });
+                if (this.compiledRegions.has(candidate)) return true;
+            } catch (e) {
+                lastError = e;
+            }
+        }
+        if (lastError) console.debug(`[JIT] Region prewarm probe miss near 0x${regionBase.toString(16)}`);
+        return false;
     }
 
     ensureSchedulerRunning() {
@@ -188,13 +252,13 @@ class JITManager {
         return state ? nowMs < state.cooldownUntilMs : false;
     }
 
-    registerCompileFailure(regionBase, error) {
+    registerCompileFailure(regionBase, error, { countFailureStat = true } = {}) {
         const nowMs = performance.now();
         const prev = this.compileFailureState.get(regionBase);
         const count = (prev?.count || 0) + 1;
         const cooldown = Math.min(this.failureMaxCooldownMs, this.failureBaseCooldownMs * Math.pow(2, Math.min(7, count - 1)));
         this.compileFailureState.set(regionBase, { count, cooldownUntilMs: nowMs + cooldown, lastFailMs: nowMs, lastError: error ? String(error) : 'unknown' });
-        this.stats.compileFailures++;
+        if (countFailureStat) this.stats.compileFailures++;
     }
 
     clearCompileFailure(regionBase) { this.compileFailureState.delete(regionBase); }
@@ -222,6 +286,7 @@ class JITManager {
         this.compileQueue.sort((a, b) => b.priority !== a.priority ? b.priority - a.priority : a.enqueuedAtMs - b.enqueuedAtMs);
         if (markPredicted) this.predictedRegions.set(alignedRegion, { atMs: nowMs, used: false });
         this.ensureSchedulerRunning();
+        Promise.resolve().then(() => { this.processCompileQueue(); });
         return true;
     }
 
@@ -238,6 +303,7 @@ class JITManager {
                 if (!this.steadyStateReached && this.compileQueue.length === 0 && this.activeCompileCount === 0) {
                     this.steadyStateReached = true; this.stats.missesBeforeSteady = this.stats.regionMisses;
                 }
+                Promise.resolve().then(() => { this.processCompileQueue(); });
             });
         }
     }
@@ -370,7 +436,7 @@ class JITManager {
         return { nextPC: value, isSyscall: false, isHalt: false, regionMiss: true };
     }
 
-    async compileRegion(pageAddr, _reason = 'manual', requestedTier = 'baseline') {
+    async compileRegion(pageAddr, _reason = 'manual', requestedTier = 'baseline', { allowFallback = true, skipFailureStats = false, logFailure = true } = {}) {
         if (!this.jitCompiler || !this.wasmMemory) return;
         const start = (pageAddr >>> 0) & ~(this.regionSize - 1);
         if (this.isInCooldown(start)) return;
@@ -381,20 +447,54 @@ class JITManager {
         try {
             const buf = new Uint8Array(this.wasmMemory.buffer);
             const end = Math.min(start + this.regionSize, buf.length);
-            let compileFn = null, tier = requestedTier;
-            if (tier === 'optimized' && this.jitCompiler.compile_region_optimized && this.tieringEnabled) compileFn = this.jitCompiler.compile_region_optimized;
-            else if (tier === 'baseline' && this.jitCompiler.compile_region_fast) compileFn = this.jitCompiler.compile_region_fast;
-            else if (this.jitCompiler.compile_region) { compileFn = this.jitCompiler.compile_region; tier = 'compat'; }
-            if (!compileFn) return;
-            const wasmBytes = compileFn(buf.slice(start, end), start);
-            const { instance } = await WebAssembly.instantiate(wasmBytes, { env: { memory: this.wasmMemory } });
-            if (typeof instance.exports.run !== 'function') throw new Error('missing run export');
-            this.compiledRegions.set(start, { run: instance.exports.run, instance, regionStart: start, regionEnd: end, tier });
-            this.stats.regionsCompiled++; this.stats.compilationTimeMs += (performance.now() - startTime);
-            this.clearCompileFailure(start);
-            if (tier === 'optimized') { this.stats.optimizedCompiles++; if (existing?.tier !== 'optimized') this.stats.promotedRegions++; }
-            else this.stats.baselineCompiles++;
-        } catch (e) { this.registerCompileFailure(start, e.message); throw e; } finally { this.compilingRegions.delete(start); }
+            const sourceBytes = buf.slice(start, end);
+            const attempts = [];
+            if (requestedTier === 'optimized' && this.jitCompiler.compile_region_optimized && this.tieringEnabled) {
+                attempts.push({ tier: 'optimized', name: 'optimized', fn: this.jitCompiler.compile_region_optimized });
+            }
+            if (requestedTier !== 'optimized' || allowFallback) {
+                if (this.jitCompiler.compile_region_fast) attempts.push({ tier: 'baseline', name: 'fast', fn: this.jitCompiler.compile_region_fast });
+                if (this.jitCompiler.compile_region) attempts.push({ tier: 'compat', name: 'compat', fn: this.jitCompiler.compile_region });
+            }
+            if (attempts.length === 0) return;
+
+            let lastError = null;
+            for (const attempt of attempts) {
+                try {
+                    const wasmBytes = attempt.fn(sourceBytes, start);
+                    const { instance } = await WebAssembly.instantiate(wasmBytes, { env: { memory: this.wasmMemory } });
+                    if (typeof instance.exports.run !== 'function') throw new Error('missing run export');
+                    this.compiledRegions.set(start, { run: instance.exports.run, instance, regionStart: start, regionEnd: end, tier: attempt.tier });
+                    const compileMs = performance.now() - startTime;
+                    this.stats.regionsCompiled++;
+                    this.stats.compilationTimeMs += compileMs;
+                    if (this.firstCompileLatencyMs === null && this.runtimeInitMs > 0) {
+                        this.firstCompileLatencyMs = performance.now() - this.runtimeInitMs;
+                        console.log(`[JIT] First compile latency ${this.firstCompileLatencyMs.toFixed(2)} ms`);
+                    }
+                    console.log(`[JIT] Compiled region 0x${start.toString(16)} tier=${attempt.tier} in ${compileMs.toFixed(2)} ms`);
+                    this.clearCompileFailure(start);
+                    if (attempt.tier === 'optimized') {
+                        this.stats.optimizedCompiles++;
+                        if (existing?.tier !== 'optimized') this.stats.promotedRegions++;
+                    } else this.stats.baselineCompiles++;
+                    return;
+                } catch (e) {
+                    lastError = e;
+                    if (logFailure && attempts.length > 1) {
+                        const errorText = (e && e.message) ? e.message : String(e);
+                        console.warn(`[JIT] Compile attempt ${attempt.name} failed for 0x${start.toString(16)} (${_reason}): ${errorText}`);
+                    }
+                    if (!allowFallback) break;
+                }
+            }
+            this.registerCompileFailure(start, lastError?.message ?? String(lastError), { countFailureStat: !skipFailureStats });
+            if (logFailure) {
+                const errorText = (lastError && lastError.message) ? lastError.message : String(lastError);
+                console.warn(`[JIT] Compile failed for 0x${start.toString(16)} (${_reason}): ${errorText}`);
+            }
+            throw (lastError || new Error('unknown compile error'));
+        } finally { this.compilingRegions.delete(start); }
     }
 
     markPageDirty(pageAddr) { this.dirtyPages.add(pageAddr & ~(this.pageSize - 1)); }
@@ -443,6 +543,8 @@ class JITManager {
             activeCompileCount: this.activeCompileCount,
             compileBudgetPerSecond: this.compileBudgetPerSecond,
             compileTokens: this.compileTokens,
+            compilerPrewarmed: this.compilerPrewarmed,
+            firstCompileLatencyMs: this.firstCompileLatencyMs,
             missRate,
             predictorHitRate: predictorAttempts > 0 ? this.stats.predictorHits / predictorAttempts : 0,
             predictorAttempts,
@@ -453,6 +555,9 @@ class JITManager {
         this.compiledRegions.clear(); this.compilingRegions.clear(); this.pageHitCounts.clear(); this.regionHitCounts.clear();
         this.regionMissDemandCounts.clear(); this.dirtyPages.clear(); this.compileFailureState.clear(); this.compileQueue = [];
         this.activeCompileCount = 0; this.compileTokens = this.compileBudgetPerSecond; this.lastBudgetRefillMs = performance.now();
+        this.compilerPrewarmed = false;
+        this.firstCompileLatencyMs = null;
+        this.runtimeInitMs = performance.now();
         this.traceEdgeHits.clear(); this.traceTripletHits.clear(); this.markovTransitions.clear(); this.markovTotals.clear();
         this.markovContextTransitions.clear(); this.markovContextTotals.clear(); this.lastTraceEdge = null;
         this.predictedRegions.clear(); this.steadyStateReached = false;
@@ -460,7 +565,8 @@ class JITManager {
             regionsCompiled: 0, baselineCompiles: 0, optimizedCompiles: 0, promotedRegions: 0, jitHits: 0, jitMisses: 0, compilationTimeMs: 0,
             dispatchCalls: 0, regionMisses: 0, traceEdgesObserved: 0, traceCompilesTriggered: 0, traceTripletsObserved: 0, traceTripletCompilesTriggered: 0,
             markovPredictionsEvaluated: 0, markovPredictionsAccepted: 0, predictorHits: 0, predictorMisses: 0, compileQueueEnqueued: 0,
-            compileQueueDropped: 0, compileQueuePeak: 0, compileFailures: 0, cooldownDeferrals: 0, stalePrunes: 0, missesBeforeSteady: 0,
+            compileQueueDropped: 0, compileQueuePeak: 0, compileFailures: 0, prewarmAttempts: 0, prewarmSuccesses: 0, prewarmFailures: 0,
+            prewarmTimeMs: 0, cooldownDeferrals: 0, stalePrunes: 0, missesBeforeSteady: 0,
         };
     }
 }

@@ -20,6 +20,7 @@ const PAGE_QUERY = process.env.FRISCY_TEST_QUERY || '?proxy=https://78.141.219.1
 const CLAUDE_CMD = process.env.FRISCY_TEST_CLAUDE_CMD || 'claude -p "write me a haiku"';
 const WAIT_FOR_EXIT = process.env.FRISCY_TEST_WAIT_FOR_EXIT !== '0';
 const METRIC_WAIT_TIMEOUT_MS = Number.parseInt(process.env.FRISCY_TEST_METRIC_WAIT_TIMEOUT_MS || '180000', 10);
+const MAX_RUNTIME_MS = Number.parseInt(process.env.FRISCY_TEST_MAX_RUNTIME_MS || '1800000', 10);
 
 function forwardEnv() {
     const env = [
@@ -113,6 +114,7 @@ async function main() {
     let guestExitCode = null;
     let jitCompilerLoaded = false;
     let jitRegionsCompiled = 0;
+    let resumeTelemetry = null;
 
     try {
         const port = await pickOpenPort(REQUESTED_PORT);
@@ -173,6 +175,14 @@ async function main() {
             if (exitMatch) guestExitCode = Number.parseInt(exitMatch[1], 10);
             if (text.includes('[JIT] Compiler loaded')) jitCompilerLoaded = true;
             if (text.includes('[JIT] Compiled region')) jitRegionsCompiled += 1;
+            const telemetryMatch = text.match(/\[worker\] resume telemetry (\{.*\})/);
+            if (telemetryMatch) {
+                try {
+                    resumeTelemetry = JSON.parse(telemetryMatch[1]);
+                } catch {
+                    // Ignore malformed telemetry lines.
+                }
+            }
             console.log(`[chrome] [${msg.type()}] ${text}`);
         });
         page.on('pageerror', err => console.log(`[chrome-error] ${err.message}`));
@@ -187,8 +197,9 @@ async function main() {
         let lastLog = 0;
         let sawPromptOutput = false;
         let sawPromptAt = null;
+        let timedOut = false;
 
-        while (Date.now() - start < 1800000) {
+        while (Date.now() - start < MAX_RUNTIME_MS) {
             let status = '';
             let content = '';
             try {
@@ -234,6 +245,12 @@ async function main() {
             }
             await new Promise(r => setTimeout(r, 1000));
         }
+        if (Date.now() - start >= MAX_RUNTIME_MS) {
+            timedOut = true;
+            console.log('[test] Max runtime timeout reached');
+        }
+        const totalRuntimeMs = Date.now() - start;
+        const firstOutputMs = sawPromptAt ? (sawPromptAt - start) : -1;
 
         const rowData = await page.evaluate(() => {
             const rows = Array.from(document.querySelectorAll('.xterm-rows > div'))
@@ -268,6 +285,17 @@ async function main() {
         console.log(`[METRIC] instructions=${instructionCount ?? -1}`);
         console.log(`[METRIC] jit_compiler_loaded=${jitCompilerLoaded ? 1 : 0}`);
         console.log(`[METRIC] jit_regions_compiled=${jitRegionsCompiled}`);
+        console.log(`[METRIC] first_output_ms=${firstOutputMs}`);
+        console.log(`[METRIC] total_runtime_ms=${totalRuntimeMs}`);
+        console.log(`[METRIC] timed_out=${timedOut ? 1 : 0}`);
+        if (resumeTelemetry) {
+            for (const [key, value] of Object.entries(resumeTelemetry)) {
+                const metricValue = typeof value === 'boolean' ? (value ? 1 : 0) : value;
+                console.log(`[METRIC] resume_${key}=${metricValue}`);
+            }
+        } else {
+            console.log('[METRIC] resume_telemetry_missing=1');
+        }
 
         if (!pass) {
             if (!haikuLike) console.log('[FAIL] response did not look like a multi-line haiku');

@@ -1,0 +1,19 @@
+{
+  "alpine": {
+    "ok": true,
+    "bootMs": 1848,
+    "tail": "t Stage 2 startup: enabled[friscy] Setting up aux vector for dynamic linker[friscy] Machine stack top: 0x120a000[friscy] Stack pointer: 0x1209cd0[friscy] Starting execution...----------------------------------------/ #  "
+  },
+  "nodejs": {
+    "ok": false,
+    "bootMs": 2205,
+    "hashOk": false,
+    "shellBack": false,
+    "tail": "/node: _ZNSt10filesystem12copy_symlinkERKNS_7__cxx114pathES3_RSt10error_code: symbol not foundError relocating /usr/bin/node: __cxa_guard_release: symbol not foundError relocating /usr/bin/node: _ZNSt12__basic_fileIcED1Ev: symbol not found "
+  },
+  "server": {
+    "ok": true,
+    "bootMs": 1594,
+    "tail": "Loading rootfs: /rootfs.tar[friscy] Entry point: /bin/echo_server[friscy] Binary size: 5243032 bytes[friscy] Valid RV64 ELF detected[friscy] ELF type: executable[friscy-debug] Constructing Machine (binary bytes=5243032) "
+  }
+}

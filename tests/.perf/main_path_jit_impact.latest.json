@@ -1,0 +1,136 @@
+{
+  "benchmark": "main_path_jit_impact",
+  "commit": "dcc8ac30a9026609290dbaec404434a1d6febde5",
+  "timestampUtc": "2026-02-23T13:34:05Z",
+  "rootfsUrl": "./rootfs.tar",
+  "guestCommand": "i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; echo done",
+  "runs": 1,
+  "modes": {
+    "legacy": {
+      "query": "?example=alpine&legacyresume=1&jithot=1&jitawait=1",
+      "elapsedMs": {
+        "runs": 1,
+        "min": 2494,
+        "median": 2494,
+        "mean": 2494,
+        "p95": 2494,
+        "max": 2494,
+        "values": [
+          2494
+        ]
+      },
+      "doneRate": 0,
+      "resumeCount": {
+        "runs": 1,
+        "min": 0,
+        "median": 0,
+        "mean": 0,
+        "p95": 0,
+        "max": 0,
+        "values": [
+          0
+        ]
+      },
+      "jitActivityScore": {
+        "runs": 1,
+        "min": 2,
+        "median": 2,
+        "mean": 2,
+        "p95": 2,
+        "max": 2,
+        "values": [
+          2
+        ]
+      },
+      "jitLoadedRuns": 1,
+      "jitRegionsCompiled": {
+        "runs": 1,
+        "min": 0,
+        "median": 0,
+        "mean": 0,
+        "p95": 0,
+        "max": 0,
+        "values": [
+          0
+        ]
+      }
+    },
+    "enabled": {
+      "query": "?example=alpine&jithot=1&jitawait=1",
+      "elapsedMs": {
+        "runs": 1,
+        "min": 50743,
+        "median": 50743,
+        "mean": 50743,
+        "p95": 50743,
+        "max": 50743,
+        "values": [
+          50743
+        ]
+      },
+      "doneRate": 1,
+      "resumeCount": {
+        "runs": 1,
+        "min": 1894,
+        "median": 1894,
+        "mean": 1894,
+        "p95": 1894,
+        "max": 1894,
+        "values": [
+          1894
+        ]
+      },
+      "jitActivityScore": {
+        "runs": 1,
+        "min": 4,
+        "median": 4,
+        "mean": 4,
+        "p95": 4,
+        "max": 4,
+        "values": [
+          4
+        ]
+      },
+      "jitLoadedRuns": 1,
+      "jitRegionsCompiled": {
+        "runs": 1,
+        "min": 0,
+        "median": 0,
+        "mean": 0,
+        "p95": 0,
+        "max": 0,
+        "values": [
+          0
+        ]
+      }
+    }
+  },
+  "comparisons": {
+    "doneRateDeltaPctPoints": 100,
+    "elapsedMedianPctDelta": 1934.6030473135525
+  },
+  "gates": {
+    "semantic": {
+      "description": "enabled mode must perform resumable execution (resumeCount median > 0)",
+      "pass": true,
+      "enabledResumeMedian": 1894
+    },
+    "jit_activity": {
+      "description": "enabled mode must show JIT activity score >= threshold on every run",
+      "pass": true,
+      "threshold": 1,
+      "enabledJitActivityRuns": 1,
+      "enabledJitLoadedRuns": 1
+    },
+    "impact": {
+      "description": "enabled mode must increase executed resume work and/or improve completion/latency",
+      "pass": true,
+      "minMedianWinPct": 5,
+      "legacyResumeMedian": 0,
+      "enabledResumeMedian": 1894,
+      "doneRateDeltaPctPoints": 100,
+      "elapsedMedianPctDelta": 1934.6030473135525
+    }
+  },
+  "pass": true
+}

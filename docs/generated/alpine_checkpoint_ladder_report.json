@@ -1,0 +1,29 @@
+{
+  "at": "2026-02-23T17:25:34.678Z",
+  "example": "alpine",
+  "ok": true,
+  "timings": {
+    "boot0Ms": 1292,
+    "action0Ms": 254,
+    "export1Ms": 843,
+    "boot1Ms": 1018,
+    "action1Ms": 252,
+    "export2Ms": 775,
+    "boot2Ms": 1013,
+    "action2Ms": 252
+  },
+  "checkpoints": {
+    "stage1": {
+      "path": "docs_site/alpine-stage1.ckpt",
+      "bytes": 4536656,
+      "sha256": "7c0f38f6d7c7a477652f60822f4c700bce228e177891197f3fd77ce99b20125e"
+    },
+    "stage2": {
+      "path": "docs_site/alpine-stage2.ckpt",
+      "bytes": 4536656,
+      "sha256": "c76c136415d4615d821ed8a90d868350f00e865ef21c51affd3aafa77b23d7b6"
+    }
+  },
+  "error": null,
+  "termTail": "[friscy] Loading rootfs: /rootfs.tar\n[friscy] Entry point: /usr/bin/git\n[friscy] Binary size: 2841720 bytes\n[friscy] Valid RV64 ELF detected\n[friscy] ELF type: PIE/shared\n[friscy] Dynamic binary detected\n[friscy] Interpreter: /lib/ld-musl-riscv64.so.1\n[friscy] Loaded interpreter: 613016 bytes\n[friscy-debug] Constructing Machine (binary bytes=2841720)\n[friscy-debug] Machine constructed (pc=0x5f444)\n[friscy] Loading interpreter at 0x18000000\n[friscy] Interpreter entry: 0x18056900\n[friscy] PIE base: 0x40000\n[friscy] Advancing mmap past interpreter: 0x141d000 -> 0x18098000\n[friscy] Heap area: 0x18098000 (256MB)\n[friscy] VectorHeart Stage 2 startup: enabled\n[friscy] Setting up aux vector for dynamic linker\n[friscy] Machine stack top: 0x141c000\n[friscy] Stack pointer: 0x141bcf0\n0123456789012345678901234567890123456789-s2-1771867540504 missing\n"
+}

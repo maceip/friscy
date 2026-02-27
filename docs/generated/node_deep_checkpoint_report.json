@@ -1,0 +1,27 @@
+{
+  "at": "2026-02-23T16:36:14.033Z",
+  "url": "http://127.0.0.1:9095/?example=nodejs&t=1771864574033",
+  "metrics": {
+    "bootMs": 3105,
+    "requireCryptoMs": 1207,
+    "shaCommandMs": 202,
+    "fsCommandMs": 201,
+    "deep1ExportUploadMs": 9575,
+    "deep2ExportUploadMs": 9344
+  },
+  "checkpoints": {
+    "deep1": {
+      "path": "docs_site/node-repl-crypto-deep1.ckpt",
+      "bytes": 82136108,
+      "sha256": "7e30236b677f68b07cac3816e05d915774d6501681ded288dbfb62c6049fd816"
+    },
+    "deep2": {
+      "path": "docs_site/node-repl-crypto-deep2.ckpt",
+      "bytes": 82136108,
+      "sha256": "11b149c4e8927caf64883d115bac2660e52d3ced7f4d5ffa1a8631dd8475c746"
+    }
+  },
+  "expectedSha": "31a978a76555747c85c9a240624de85ca063df982c1791c349726f1de55c32cd",
+  "finalStatus": "running:nodejs",
+  "termTail": "[friscy] Loading rootfs: /rootfs.tar\n[friscy] Entry point: /usr/bin/node\n[friscy] Binary size: 48783560 bytes\n[friscy] Valid RV64 ELF detected\n[friscy] ELF type: PIE/shared\n[friscy] Dynamic binary detected\n[friscy] Interpreter: /lib/ld-musl-riscv64.so.1\n[friscy] Loaded interpreter: 613016 bytes\n[friscy-debug] Constructing Machine (binary bytes=48783560)\n[friscy-debug] Machine constructed (pc=0x2f2622)\n[friscy] Loading interpreter at 0x18000000\n[friscy] Interpreter entry: 0x18056900\n[friscy] PIE base: 0x40000\n[friscy] Advancing mmap past interpreter: 0x3ff2000 -> 0x18098000\n[friscy] Heap area: 0x18098000 (64MB)\n[friscy] VectorHeart Stage 2 startup: enabled\n[friscy] Setting up aux vector for dynamic linker\n[friscy] Machine stack top: 0x3ff1000\n[friscy] Stack pointer: 0x3ff0aa0\n> '31a978a76555747c85c9a240624de85ca063df982c1791c349726f1de55c32cd'\n> 'fs-ok'\n> "
+}

@@ -9,6 +9,61 @@ and how to validate correctness with real-world programs that detect regressions
 and prevent "cheating" (optimizations that appear fast but silently produce
 wrong results).
 
+## Near-Term Impact Shortlist (2026-02-23)
+
+These are the current highest-impact, shortest-term changes for the browser
+runtime path (`claude -p "write me a haiku"` focus):
+
+1. **Main-path JIT activation for one-shot runs (DONE)**  
+   Ensure non-interactive workloads re-enter resumable execution slices so JIT
+   dispatch/predictor logic can engage before process exit.
+2. **Preload + prewarm JIT compiler at boot (IN PROGRESS)**  
+   Load `rv2wasm_jit` assets during boot overlay so first hot-region compile
+   latency is paid early.
+3. **Stream rootfs into Worker instead of full prebuffer**  
+   Start unpack/boot before download completion to cut time-to-prompt.
+4. **Delta checkpoints (dirty-page only)**  
+   Save/restore only changed guest pages rather than full arena scans.
+5. **Remove hot-loop JS overhead (polling/copies/allocations)**  
+   Replace idle polling with event-driven wakeups and reduce avoidable copying
+   in stdout/JIT/syscall paths.
+
+### Main-Path JIT Activation: Current Implementation Notes
+
+- Runtime now exports a stop-reason bitmask (`stdin`, `host-fetch`,
+  `timeslice`) so the Worker can distinguish timeslice yields from true
+  completion.
+- Worker resume loop is stop-reason-driven and continues execution on
+  timeslice-only yields (instead of incorrectly exiting the loop).
+- Added Worker resume telemetry (`[worker] resume telemetry {...}`) to capture:
+  - resume count and elapsed loop time,
+  - stop-reason counters,
+  - timeslice-triggered resume attempts,
+  - JIT dispatch/fallback counters.
+- Added A/B query toggle: `?legacyresume=1` forces the previous behavior for
+  comparison runs.
+
+### Boot JIT Prewarm: Current Implementation Notes
+
+- Worker init now preloads compiler module/assets immediately once JIT manager
+  is configured.
+- Added module-level warmup hook (`prewarmCompiler`) and explicit logs:
+  `[JIT] Compiler loaded ...`, `[JIT] Compiler prewarmed (module)`.
+- Added prewarm control flag/query toggle:
+  - `jitPrewarmEnabled` (worker init option, default `true`)
+  - `?nojitprewarm` to disable for A/B comparisons.
+- Added early run-path attempt to prewarm the stopped region before entering
+  resume loop (`prewarmRegionAt(pc)`), with log outcome:
+  `JIT region prewarmed ...` or `JIT region prewarm skipped ...`.
+- Added reliability hardening in the JIT manager:
+  - compile queue now triggers immediate drain on enqueue and compile-complete
+    events (in addition to interval scheduling),
+  - region prewarm probes nearby region starts (`pc`, `pc-region`, `pc+region`)
+    instead of only exact region hits,
+  - compile fallback chain now retries `fast -> compat` before final failure,
+  - compile failures now emit explicit reasoned logs,
+  - speculative prewarm probes no longer inflate `compileFailures` telemetry.
+
 **Implementation order (Phases 1-6 complete):**
 
 | Phase | Technique | Files Modified | Expected Impact | Risk | Status |

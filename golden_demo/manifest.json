@@ -63,8 +63,24 @@
         "/usr/local/bin/gemini-repl.js"
       ],
       "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
         "GEMINI_API_KEY=PLACEHOLDER",
         "GOOGLE_API_KEY=PLACEHOLDER"
+      ],
+      "allowNetwork": true
+    },
+    "codex": {
+      "image": "friscy-codex",
+      "rootfs": "/docs_site/codex.tar",
+      "entrypoint": [
+        "/usr/bin/node",
+        "--jitless",
+        "--max-old-space-size=256",
+        "/usr/local/bin/codex-repl.js"
+      ],
+      "env": [
+        "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js",
+        "OPENAI_API_KEY=PLACEHOLDER"
       ],
       "allowNetwork": true
     }

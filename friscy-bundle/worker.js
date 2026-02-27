@@ -302,7 +302,13 @@ function maybePostJitStats(force = false) {
 function getStopReason(friscy_stop_reason, friscy_stopped) {
     if (typeof friscy_stop_reason === 'function') {
         const mask = friscy_stop_reason() | 0;
-        return Number.isFinite(mask) ? mask : STOP_REASON_NONE;
+        if (Number.isFinite(mask) && mask !== 0) return mask;
+        // Some stop transitions (notably after fork/exec restore paths)
+        // can transiently report mask=0 while the VM is still stopped.
+        // Fall back to stopped() so resume loop does not exit prematurely.
+        return (typeof friscy_stopped === 'function' && friscy_stopped())
+            ? STOP_REASON_STDIN
+            : STOP_REASON_NONE;
     }
     // Backwards compatibility with older runtimes.
     return (typeof friscy_stopped === 'function' && friscy_stopped())

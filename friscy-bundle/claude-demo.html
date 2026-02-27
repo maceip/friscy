@@ -249,9 +249,13 @@
             const envMap = new Map();
             for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
             for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
-            const envVars = [...envMap.values()].map(e =>
-                e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + userApiKey : e
-            );
+            const envVars = [...envMap.values()].map((e) => {
+                if (e.startsWith('ANTHROPIC_API_KEY=')) return 'ANTHROPIC_API_KEY=' + userApiKey;
+                if (e.startsWith('GEMINI_API_KEY=')) return 'GEMINI_API_KEY=' + userApiKey;
+                if (e.startsWith('GOOGLE_API_KEY=')) return 'GOOGLE_API_KEY=' + userApiKey;
+                if (e.startsWith('OPENAI_API_KEY=')) return 'OPENAI_API_KEY=' + userApiKey;
+                return e;
+            });
             const envArgs = envVars.flatMap(e => ['--env', e]);
             const args = [...envArgs, '--rootfs', '/rootfs.tar', ...(example.entrypoint || ['/bin/sh'])];
 
@@ -268,7 +272,15 @@
 
             machineRunning = true;
             pendingShellRestart = false;
-            console.log('[friscy] launchWorkerRun args:', JSON.stringify(args));
+            const redactedArgs = args.map((arg) => {
+                if (typeof arg !== 'string') return arg;
+                if (arg.startsWith('ANTHROPIC_API_KEY=')) return 'ANTHROPIC_API_KEY=[REDACTED]';
+                if (arg.startsWith('GEMINI_API_KEY=')) return 'GEMINI_API_KEY=[REDACTED]';
+                if (arg.startsWith('GOOGLE_API_KEY=')) return 'GOOGLE_API_KEY=[REDACTED]';
+                if (arg.startsWith('OPENAI_API_KEY=')) return 'OPENAI_API_KEY=[REDACTED]';
+                return arg;
+            });
+            console.log('[friscy] launchWorkerRun args:', JSON.stringify(redactedArgs));
             const rootfsArray = new Uint8Array(rootfs);
             const msg = {
                 type: 'run',
@@ -329,11 +341,46 @@
             });
         }
 
+        function downloadCheckpointBlob(data, filename = 'claude-live.ckpt') {
+            const blob = new Blob([data], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        }
+
+        async function uploadCheckpointBlob(data, filename = 'claude-live.ckpt') {
+            const safeName = String(filename || 'claude-live.ckpt').replace(/[^a-zA-Z0-9._-]/g, '_');
+            const body = (data instanceof Blob) ? data : new Blob([data], { type: 'application/octet-stream' });
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/__upload_checkpoint/' + encodeURIComponent(safeName), true);
+                xhr.responseType = 'json';
+                xhr.timeout = 10 * 60 * 1000;
+                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                xhr.onload = () => {
+                    if (xhr.status < 200 || xhr.status >= 300) {
+                        reject(new Error('checkpoint upload failed: HTTP ' + xhr.status));
+                        return;
+                    }
+                    resolve(xhr.response || JSON.parse(xhr.responseText || '{}'));
+                };
+                xhr.onerror = () => reject(new Error('checkpoint upload failed: network error'));
+                xhr.ontimeout = () => reject(new Error('checkpoint upload failed: timeout'));
+                xhr.send(body);
+            });
+        }
+
         function checkStdinRequest() {
             if (!controlView) return;
             if (Atomics.load(controlView, 0) !== CMD_STDIN_REQUEST) return;
             if (stdinQueue.length === 0) return;
-            const maxLen = Atomics.load(controlView, 2);
+            const requested = Atomics.load(controlView, 2);
+    const maxLen = requested > 0 ? requested : 3968;
             const cb = new Uint8Array(controlSab);
             const toSend = Math.min(stdinQueue.length, maxLen, 3968);
             for (let i = 0; i < toSend; i++) cb[64 + i] = stdinQueue.shift();
@@ -396,7 +443,14 @@
                 worker.onerror = (e) => reject(new Error('Worker failed: ' + (e.message || 'unknown')));
                 setTimeout(() => reject('Worker timeout (30s)'), 30000);
             });
-            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            worker.postMessage({
+                type: 'init',
+                controlSab,
+                stdoutSab,
+                netSab,
+                allowNetwork: true,
+                hostFetchProxy: `${location.origin}/__vhfetch`,
+            });
             await workerReady;
 
             // Build args for /bin/sh -i (merge manifest + example env)
@@ -407,9 +461,13 @@
             const envMap = new Map();
             for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
             for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
-            const envVars = [...envMap.values()].map(e =>
-                e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + apiKey : e
-            );
+            const envVars = [...envMap.values()].map((e) => {
+                if (e.startsWith('ANTHROPIC_API_KEY=')) return 'ANTHROPIC_API_KEY=' + apiKey;
+                if (e.startsWith('GEMINI_API_KEY=')) return 'GEMINI_API_KEY=' + apiKey;
+                if (e.startsWith('GOOGLE_API_KEY=')) return 'GOOGLE_API_KEY=' + apiKey;
+                if (e.startsWith('OPENAI_API_KEY=')) return 'OPENAI_API_KEY=' + apiKey;
+                return e;
+            });
             const envArgs = envVars.flatMap(e => ['--env', e]);
             const args = [...envArgs, '--rootfs', '/rootfs.tar', '/bin/sh', '-i'];
 
@@ -965,9 +1023,10 @@
             // Fetch rootfs + checkpoint in parallel
             term.writeln('\x1b[2m[friscy] Downloading rootfs...\x1b[0m');
             const fetchPromises = [fetch(example.rootfs)];
-            if (example.checkpoint) {
+            const checkpointPath = params.get('ckpt') || example.checkpoint;
+            if (checkpointPath) {
                 term.writeln('\x1b[2m[friscy] Downloading checkpoint...\x1b[0m');
-                fetchPromises.push(fetch(example.checkpoint));
+                fetchPromises.push(fetch(checkpointPath));
             }
             const responses = await Promise.all(fetchPromises);
             const rootfsResp = responses[0];
@@ -1007,7 +1066,14 @@
                 worker.onerror = (e) => reject(new Error('Worker failed: ' + (e.message || 'unknown')));
                 setTimeout(() => reject('Worker timeout (30s)'), 30000);
             });
-            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            worker.postMessage({
+                type: 'init',
+                controlSab,
+                stdoutSab,
+                netSab,
+                allowNetwork: true,
+                hostFetchProxy: `${location.origin}/__vhfetch`,
+            });
             await workerReady;
 
             // Network bridge (same auto-detection as index.html)
@@ -1076,6 +1142,16 @@
             get apiKey() { return apiKey; },
             get rawOutputBuf() { return rawOutputBuf; },
             sendStdin,
+            exportLiveCheckpointDownload: async (filename = 'claude-live.ckpt') => {
+                const { data } = await requestLiveCheckpointExport();
+                downloadCheckpointBlob(data, filename);
+                return { ok: true, bytes: data?.byteLength || 0 };
+            },
+            exportLiveCheckpointUpload: async (filename = 'claude-live.ckpt') => {
+                const { data } = await requestLiveCheckpointExport();
+                const result = await uploadCheckpointBlob(data, filename);
+                return { ok: true, bytes: data?.byteLength || 0, result };
+            },
         };
 
         // Update net status indicator

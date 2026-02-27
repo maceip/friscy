@@ -3,7 +3,9 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [master]
-    paths: [friscy-bundle/**]
+    paths: 
+      - 'friscy-bundle/**'
+      - 'docs_site/**'
   workflow_dispatch:
 
 permissions:
@@ -22,6 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Sync docs_site to friscy-bundle
+        run: |
+          chmod +x sync-docs-to-bundle.sh
+          ./sync-docs-to-bundle.sh
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

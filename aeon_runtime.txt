@@ -1,0 +1,16 @@
+AEON/runtime/:
+checkpoint.hpp
+claude-repl.js
+claude-repl.js.inc
+claude-repl-llrt.js
+CMakeLists.txt
+elf_loader.hpp
+gen-js-inc.sh
+guest.cpp
+library_vectorheart.js
+main.cpp
+network.hpp
+syscalls.hpp
+vfs.hpp
+vh_harness.hpp
+vh_preload.c

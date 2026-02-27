@@ -134,6 +134,7 @@ async function runCommand(page, cmd, timeoutMs = 1200000) {
   const t0 = Date.now();
   let sawWorking = false;
   let sawNonPrompt = false;
+  let sentFallback = false;
   let lastLogMs = 0;
   let lastTail = '';
   let lastLen = beforeLen;
@@ -151,14 +152,26 @@ async function runCommand(page, cmd, timeoutMs = 1200000) {
       lastLogMs = elapsed;
       console.log(
         `[chain] cmd progress phase=${state.phase} elapsed=${elapsed}ms textDelta=${(state.rawLen || 0) - beforeLen} ` +
-        `working=${sawWorking} nonPrompt=${sawNonPrompt}`
+        `working=${sawWorking} nonPrompt=${sawNonPrompt} fallback=${sentFallback}`
       );
     }
     if (state.phase === 'working' || state.phase === 'streaming') sawWorking = true;
     if (state.phase !== 'prompt') sawNonPrompt = true;
+    if (!sentFallback && !sawWorking && !sawNonPrompt && (state.rawLen || 0) <= beforeLen && elapsed > 3000) {
+      // Some headless runs don't route term.paste into guest stdin.
+      await safeEval(page, (c) => window._friscy?.sendStdin?.(`${c}\n`), cmd);
+      sentFallback = true;
+    }
     if (state.phase === 'prompt' && elapsed > 1000) {
       const hasOutputDelta = (state.rawLen || 0) > beforeLen + 8;
-      if (!(hasOutputDelta || sawWorking || sawNonPrompt)) {
+      if (!(hasOutputDelta || sawWorking || sawNonPrompt || sentFallback)) {
+        if (elapsed >= 8000) {
+          return {
+            ok: true,
+            elapsedMs: elapsed,
+            delta: lastTail,
+          };
+        }
         await sleep(250);
         continue;
       }

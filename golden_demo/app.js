@@ -117,6 +117,21 @@ function activeExample() {
   return new URLSearchParams(location.search).get('example') || 'alpine';
 }
 
+function applyRuntimeKeyOverrides(envList, params) {
+  const shared = params.get('apiKey') || '';
+  const anthropic = params.get('anthropicKey') || shared;
+  const gemini = params.get('geminiKey') || shared;
+  const google = params.get('googleKey') || gemini || shared;
+  const openai = params.get('openaiKey') || shared;
+  return envList.map((entry) => {
+    if (entry.startsWith('ANTHROPIC_API_KEY=')) return 'ANTHROPIC_API_KEY=' + anthropic;
+    if (entry.startsWith('GEMINI_API_KEY=')) return 'GEMINI_API_KEY=' + gemini;
+    if (entry.startsWith('GOOGLE_API_KEY=')) return 'GOOGLE_API_KEY=' + google;
+    if (entry.startsWith('OPENAI_API_KEY=')) return 'OPENAI_API_KEY=' + openai;
+    return entry;
+  });
+}
+
 function readOptimizationConfig(params) {
   const num = (k, dflt) => {
     const v = params.get(k);
@@ -388,7 +403,7 @@ async function boot() {
 
   setBoot(`boot: launching guest ${cfg.image}`);
   const entry = Array.isArray(cfg.entrypoint) ? cfg.entrypoint : String(cfg.entrypoint || '').split(' ');
-  const mergedEnv = [...(manifest.env || []), ...(cfg.env || [])];
+  const mergedEnv = applyRuntimeKeyOverrides([...(manifest.env || []), ...(cfg.env || [])], params);
   const envArgs = mergedEnv.flatMap((e) => ['--env', e]);
   const args = [...envArgs, '--rootfs', '/rootfs.tar', ...entry];
   const msg = {

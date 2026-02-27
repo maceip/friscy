@@ -1,0 +1,26 @@
+FROM --platform=linux/riscv64 alpine:latest
+
+# Golden demo Alpine with practical CLI/dev tooling.
+RUN apk add --no-cache \
+    bash \
+    ca-certificates \
+    coreutils \
+    curl \
+    findutils \
+    gawk \
+    git \
+    gnupg \
+    grep \
+    jq \
+    less \
+    nano \
+    ncurses \
+    openssh-client \
+    screen \
+    sed \
+    tmux \
+    vim \
+    wget
+
+WORKDIR /root
+CMD ["/bin/bash"]

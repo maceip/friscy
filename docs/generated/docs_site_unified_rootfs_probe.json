@@ -1,0 +1,30 @@
+{
+  "alpine": {
+    "ok": false,
+    "bootMs": 122139,
+    "tail": "-----------------------------bash: cannot set terminal process group (-1): Not supportedbash: no job control in this shellbash: /etc/bash/bashrc: No error informationexit-5.3# Process exited (code 0) ",
+    "logTail": [
+      "[log] [friscy-err] [mmap-anon] #13 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x28150000 (bump=0x28151000)",
+      "[log] [friscy-err] [mmap-anon] #14 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x28151000 (bump=0x28152000)",
+      "[log] [friscy-err] [munmap] addr=0x28150000 len=0x1000 pc=0x18035a8a",
+      "[log] [friscy-err] [mmap-anon] #15 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x28152000 (bump=0x28153000)",
+      "[log] [friscy-err] [mmap-anon] #16 addr=0x0 len=0x1000 prot=3 flags=0x22 => 0x28153000 (bump=0x28154000)",
+      "[log] [friscy-err] [mmap-anon] #17 addr=0x0 len=0x2000 prot=3 flags=0x22 => 0x28154000 (bump=0x28156000)",
+      "[log] [friscy-err] [mmap-anon] #18 addr=0x0 len=0x4000 prot=3 flags=0x22 => 0x28156000 (bump=0x2815a000)",
+      "[log] [friscy-err] [mmap-anon] #19 addr=0x0 len=0x4000 prot=3 flags=0x22 => 0x2815a000 (bump=0x2815e000)",
+      "[log] [friscy-err] [mmap-anon] #20 addr=0x0 len=0x4000 prot=3 flags=0x22 => 0x2815e000 (bump=0x28162000)",
+      "[log] [friscy-err] [munmap] addr=0x28174000 len=0x1000 pc=0x18035a8a",
+      "[log] [friscy-err] [munmap] addr=0x28175000 len=0x1000 pc=0x18035a8a",
+      "[log] [friscy-err] [fcntl] fd=0 cmd=3 valid=1",
+      "[log] [friscy-err] [fcntl] fd=0 cmd=3 valid=1",
+      "[log] [friscy-err] [brk#3] new_end=0x10b000 current=0x10a000 heap_addr=0x108000 pc=0x1802262c",
+      "[log] [friscy-err] [brk#3] => 0x10b000",
+      "[log] [friscy-err] [ioctl] fd=-1 request=0x5410 => -ENOTSUP",
+      "[log] [friscy-err] [exit_group] code=0 from thread t0 (tid=-1)",
+      "[log] [friscy-err] [resume] #1 instructions=2901715 stopped=0",
+      "[log] [worker] resume telemetry {\"outcome\":\"finished_after_resume\",\"elapsedMs\":27,\"resumeCount\":1,\"timesliceResumeEnabled\":true,\"stopStdin\":0,\"stopHostFetch\":0,\"stopTimeslice\":1,\"timesliceResumeAttempts\":1,\"jitDispatches\":1,\"jitFallbacks\":1,\"jitDirectRuns\":0,\"jitRegionMisses\":0,\"jitSyscalls\":0,\"jitHalts\":0,\"jitSummary\":{\"compiledRegionCount\":0,\"compileFailures\":0,\"queueDepth\":0,\"prewarmAttempts\":1,\"prewarmSuccesses\":1,\"prewarmFailures\":0,\"compilerPrewarmed\":true,\"firstCompileLatencyMs\":null}}",
+      "[log] [worker] resume loop: machine finished after 1 resumes"
+    ]
+  },
+  "fatal": "Protocol error (Runtime.callFunctionOn): Target closed"
+}

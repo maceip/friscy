@@ -1,0 +1,23 @@
+{
+  "updatedAt": "2026-02-23T16:14:56.337Z",
+  "bootTimeoutMs": 90000,
+  "cmdTimeoutMs": 60000,
+  "examples": {
+    "alpine": {
+      "bootMs": 411,
+      "commandMs": {
+        "alpine echo": 1506
+      }
+    },
+    "nodejs": {
+      "bootMs": 808,
+      "commandMs": {
+        "node stdin": 3007
+      }
+    },
+    "server": {
+      "bootMs": 407,
+      "commandMs": {}
+    }
+  }
+}

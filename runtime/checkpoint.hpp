@@ -25,7 +25,7 @@ namespace checkpoint {
 using Machine = riscv::Machine<riscv::RISCV64>;
 
 static constexpr char MAGIC[8] = {'F','R','I','S','C','Y','C','K'};
-static constexpr uint32_t VERSION = 2;
+static constexpr uint32_t VERSION = 3;
 static constexpr uint64_t CHUNK_SIZE = 65536;  // 64KB sparse scan
 static constexpr uint64_t SENTINEL_ADDR = 0xFFFFFFFFFFFFFFFFULL;
 
@@ -153,6 +153,12 @@ inline std::vector<uint8_t> save_checkpoint(Machine& machine) {
     for (const auto& [fd, counter] : syscalls::g_eventfd_counters) {
         emit_val<int32_t>(out, fd);
         emit_val<uint64_t>(out, counter);
+    }
+
+    // --- TTY fd aliases (/dev/tty dup/dup2 set) ---
+    emit_val<uint32_t>(out, static_cast<uint32_t>(syscalls::g_tty_fds.size()));
+    for (int fd : syscalls::g_tty_fds) {
+        emit_val<int32_t>(out, fd);
     }
 
     // --- Executable page list ---
@@ -329,6 +335,19 @@ inline void load_checkpoint(Machine& machine, const uint8_t* data, size_t size) 
             syscalls::g_eventfd_counters[fd] = counter;
         }
         fprintf(stderr, "[checkpoint] Restored %u eventfd counters\n", num_eventfd);
+    }
+
+    // --- TTY fd aliases ---
+    {
+        uint32_t num_tty_fds = r.read<uint32_t>();
+        syscalls::g_tty_fds.clear();
+        for (uint32_t i = 0; i < num_tty_fds; i++) {
+            syscalls::g_tty_fds.insert(r.read<int32_t>());
+        }
+        if (syscalls::g_tty_fds.empty()) {
+            syscalls::g_tty_fds = {0, 1, 2};
+        }
+        fprintf(stderr, "[checkpoint] Restored %u tty fd aliases\n", num_tty_fds);
     }
 
     // --- Executable page list ---

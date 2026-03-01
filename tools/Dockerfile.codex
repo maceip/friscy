@@ -1,14 +1,93 @@
-# Dockerfile.codex - Lean riscv64 rootfs for browser Codex checkpoint ladders.
+# Dockerfile.codex - RISC-V codex rootfs for browser Codex checkpoint ladders (sandbox-disabled build).
 #
 # Usage:
 #   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.codex -t friscy-codex . --load
 
+# True cross-compile builder: amd64 host + riscv64 musl toolchain (no qemu rustc loop).
+FROM --platform=$BUILDPLATFORM ghcr.io/cross-rs/riscv64gc-unknown-linux-musl:edge AS codex-builder
+ARG CODEX_RUST_TAG=rust-v0.106.0
+ARG RUST_TARGET=riscv64gc-unknown-linux-musl
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV PATH=/root/.cargo/bin:${PATH}
+ENV CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-unknown-linux-musl-gcc
+ENV CC_riscv64gc_unknown_linux_musl=riscv64-unknown-linux-musl-gcc
+ENV CXX_riscv64gc_unknown_linux_musl=riscv64-unknown-linux-musl-g++
+ENV AR_riscv64gc_unknown_linux_musl=riscv64-unknown-linux-musl-ar
+
+# Build dependencies + Rust toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git pkg-config libssl-dev perl python3 xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+RUN rustup target add ${RUST_TARGET}
+RUN rustup toolchain install 1.93.0-x86_64-unknown-linux-gnu --profile minimal
+RUN rustup target add ${RUST_TARGET} --toolchain 1.93.0-x86_64-unknown-linux-gnu
+
+# Fetch source.
+RUN git clone --depth 1 --branch ${CODEX_RUST_TAG} https://github.com/openai/codex.git /tmp/codex-src
+
+# Codex upstream only vendors openssl-sys for x86_64/aarch64 musl; add riscv64 musl too.
+RUN cat >> /tmp/codex-src/codex-rs/core/Cargo.toml <<'PATCHEOF'
+
+# Build OpenSSL from source for musl builds.
+[target.riscv64gc-unknown-linux-musl.dependencies]
+openssl-sys = { workspace = true, features = ["vendored"] }
+PATCHEOF
+
+# Disable linux sandbox support for this emergency build by replacing the
+# codex-linux-sandbox crate with a tiny stub that satisfies arg0 dispatch.
+RUN rm -f /tmp/codex-src/codex-rs/linux-sandbox/build.rs && \
+    mkdir -p /tmp/codex-src/codex-rs/linux-sandbox/src
+
+RUN cat > /tmp/codex-src/codex-rs/linux-sandbox/Cargo.toml <<'CARGOEOF'
+[package]
+name = "codex-linux-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "codex-linux-sandbox"
+path = "src/main.rs"
+
+[lib]
+name = "codex_linux_sandbox"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+CARGOEOF
+
+RUN cat > /tmp/codex-src/codex-rs/linux-sandbox/src/lib.rs <<'LIBEOF'
+pub fn run_main() -> ! {
+    eprintln!("codex-linux-sandbox is disabled in this build");
+    std::process::exit(0);
+}
+LIBEOF
+
+RUN cat > /tmp/codex-src/codex-rs/linux-sandbox/src/main.rs <<'MAINEOF'
+fn main() {
+    codex_linux_sandbox::run_main();
+}
+MAINEOF
+
+WORKDIR /tmp/codex-src/codex-rs
+RUN cargo build --release --target ${RUST_TARGET} --bin codex
+RUN test -x /tmp/codex-src/codex-rs/target/${RUST_TARGET}/release/codex
+
 FROM --platform=linux/riscv64 alpine:edge
 
-# Keep image deterministic and small for repeated checkpoint runs.
-RUN apk add --no-cache nodejs nodejs-dev npm bash curl ca-certificates gcc musl-dev
+# Runtime base + node for existing browser ladder harness.
+RUN apk add --no-cache nodejs nodejs-dev npm bash curl ca-certificates gcc musl-dev git ripgrep libstdc++
 
-# Deterministic command-loop runner used by browser ladders.
+# Install native Codex binary built from source.
+COPY --from=codex-builder /tmp/codex-src/codex-rs/target/riscv64gc-unknown-linux-musl/release/codex /usr/local/bin/codex
+RUN chmod +x /usr/local/bin/codex
+
+# Deterministic command-loop bridge used by browser ladders.
 COPY runtime/codex-repl.js /usr/local/bin/codex-repl.js
 RUN chmod +x /usr/local/bin/codex-repl.js
 

@@ -100,22 +100,213 @@ struct ForkState {
         std::vector<uint8_t> data;
         uint64_t addr;
         uint64_t size;
+        // Sparse snapshot for very large regions (typically mmap arena):
+        // stores only present pages to avoid huge contiguous copies.
+        std::vector<uint64_t> sparse_page_addrs;
+        std::vector<uint8_t> sparse_page_data;  // PAGE_SIZE bytes per address
+        bool sparse = false;
     };
     MemRegion exec_data;     // data/BSS + BRK region
     MemRegion interp_data;
     MemRegion stack_data;
     MemRegion mmap_data;     // guest mmap allocations (TLS, malloc)
-    // VFS fd snapshot: fds open before fork. On child exit, close any
-    // fds not in this set to undo child's dup2/pipe/open changes.
-    std::set<int> parent_open_fds;
+    // Full parent FD state snapshot (required for dup2 on existing fd numbers).
+    vfs::VirtualFS::OpenFDState parent_fd_state;
+    std::unordered_map<int, int> parent_fd_cloexec_flags;
+    std::unordered_map<int, int> parent_fd_status_flags;
+    std::set<int> parent_tty_fds;
     // Thread scheduler snapshot: saved as raw bytes to avoid ordering
     // dependency on ThreadScheduler definition. execve in fork child
     // resets g_sched; must restore parent's thread state on child exit.
     alignas(16) uint8_t saved_sched[8192];  // enough for ThreadScheduler (~5KB)
     uint64_t saved_mmap_address = 0;
+    std::unordered_map<int, EpollInstance> saved_epoll_instances;
+    std::unordered_map<int, uint64_t> saved_eventfd_counters;
+    int saved_next_epoll_fd = 0;
 };
 inline ForkState g_fork = {};
 inline pid_t g_next_pid = 100;
+
+enum class ChildLifecycle : uint8_t {
+    Running = 0,
+    Zombie  = 1,
+    Reaped  = 2,
+};
+
+struct ChildProcessEntry {
+    pid_t pid = 0;
+    int exit_status = 0;  // raw exit code from sys_exit/sys_exit_group
+    ChildLifecycle state = ChildLifecycle::Running;
+    uint64_t birth_seq = 0;  // monotonic order for deterministic "any child"
+};
+
+inline std::unordered_map<pid_t, ChildProcessEntry> g_child_table;
+inline uint64_t g_child_birth_seq = 1;
+
+static inline void child_table_register_running(pid_t pid) {
+    ChildProcessEntry entry;
+    entry.pid = pid;
+    entry.exit_status = 0;
+    entry.state = ChildLifecycle::Running;
+    entry.birth_seq = g_child_birth_seq++;
+    g_child_table[pid] = entry;
+}
+
+static inline void child_table_mark_zombie(pid_t pid, int exit_status) {
+    auto it = g_child_table.find(pid);
+    if (it == g_child_table.end()) {
+        ChildProcessEntry entry;
+        entry.pid = pid;
+        entry.birth_seq = g_child_birth_seq++;
+        g_child_table.emplace(pid, entry);
+        it = g_child_table.find(pid);
+    }
+    it->second.exit_status = exit_status;
+    it->second.state = ChildLifecycle::Zombie;
+}
+
+static inline bool wait4_pid_matches(int wait_pid, pid_t child_pid) {
+    // wait4/waitpid selector semantics:
+    //   >0  exact pid
+    //   -1  any child
+    //    0  any child in caller pgrp (approximated as any child)
+    //   <-1 specific pgrp (not modeled; reject by never matching)
+    if (wait_pid > 0) return child_pid == wait_pid;
+    if (wait_pid == -1 || wait_pid == 0) return true;
+    return false;
+}
+
+static inline bool waitid_id_matches(int idtype, int id, pid_t child_pid) {
+    // idtype: P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3
+    switch (idtype) {
+        case 0: return true;                   // P_ALL
+        case 1: return child_pid == id;        // P_PID
+        case 2: return id == 0;                // P_PGID (approximate current pgrp only)
+        default: return false;                 // unsupported here
+    }
+}
+
+template <typename Pred>
+static inline size_t child_count_unreaped(Pred pred) {
+    size_t count = 0;
+    for (const auto& [pid, child] : g_child_table) {
+        (void)pid;
+        if (child.state == ChildLifecycle::Reaped) continue;
+        if (!pred(child)) continue;
+        count++;
+    }
+    return count;
+}
+
+template <typename Pred>
+static inline ChildProcessEntry* child_find_oldest_zombie(Pred pred) {
+    ChildProcessEntry* selected = nullptr;
+    for (auto& [pid, child] : g_child_table) {
+        (void)pid;
+        if (child.state != ChildLifecycle::Zombie) continue;
+        if (!pred(child)) continue;
+        if (selected == nullptr || child.birth_seq < selected->birth_seq) {
+            selected = &child;
+        }
+    }
+    return selected;
+}
+
+static inline bool child_any_zombie() {
+    for (const auto& [pid, child] : g_child_table) {
+        (void)pid;
+        if (child.state == ChildLifecycle::Zombie) return true;
+    }
+    return false;
+}
+
+static inline bool child_any_unreaped() {
+    for (const auto& [pid, child] : g_child_table) {
+        (void)pid;
+        if (child.state != ChildLifecycle::Reaped) return true;
+    }
+    return false;
+}
+
+// Set when a fork child exits; consumed by epoll_pwait as a synthetic wake.
+inline bool g_child_exit_pending = false;
+static constexpr uint64_t FORK_SPARSE_MMAP_THRESHOLD = 128ULL << 20;  // 128MB
+
+static inline void clear_mem_region(ForkState::MemRegion& r) {
+    r.data.clear();
+    r.data.shrink_to_fit();
+    r.sparse_page_addrs.clear();
+    r.sparse_page_addrs.shrink_to_fit();
+    r.sparse_page_data.clear();
+    r.sparse_page_data.shrink_to_fit();
+    r.sparse = false;
+}
+
+static inline void snapshot_mem_region(
+    Machine& m, ForkState::MemRegion& r, uint64_t addr, uint64_t size, bool allow_sparse)
+{
+    clear_mem_region(r);
+    r.addr = addr;
+    r.size = size;
+    if (size == 0) return;
+
+    const uint64_t page_size = riscv::Page::size();
+    const bool can_sparse =
+        allow_sparse &&
+        size >= FORK_SPARSE_MMAP_THRESHOLD &&
+        (addr % page_size) == 0 &&
+        (size % page_size) == 0;
+
+    if (can_sparse) {
+        const uint64_t start_pageno = addr / page_size;
+        const uint64_t end_pageno = (addr + size) / page_size;  // exclusive
+        const uint64_t span_pages = end_pageno - start_pageno;
+        const auto& pages = m.memory.pages();
+
+        // First pass: estimate sparsity. Dense ranges are faster with contiguous memcpy.
+        uint64_t present_pages = 0;
+        for (const auto& [pageno, page] : pages) {
+            if (pageno < start_pageno || pageno >= end_pageno) continue;
+            if (!page.attr.read) continue;
+            present_pages++;
+        }
+
+        if (present_pages > 0 && (present_pages * 10) < (span_pages * 9)) {
+            r.sparse_page_addrs.reserve(static_cast<size_t>(present_pages));
+            r.sparse_page_data.reserve(static_cast<size_t>(present_pages * page_size));
+            for (const auto& [pageno, page] : pages) {
+                if (pageno < start_pageno || pageno >= end_pageno) continue;
+                if (!page.attr.read) continue;
+                r.sparse_page_addrs.push_back(pageno * page_size);
+                const size_t prev = r.sparse_page_data.size();
+                r.sparse_page_data.resize(prev + page_size);
+                std::memcpy(r.sparse_page_data.data() + prev, page.data(), page_size);
+            }
+            r.sparse = true;
+            fprintf(stderr,
+                    "[fork] sparse snapshot addr=0x%lx size=%lu pages=%zu bytes=%zu\n",
+                    (long)addr, (unsigned long)size, r.sparse_page_addrs.size(),
+                    r.sparse_page_data.size());
+            return;
+        }
+
+        if (present_pages == 0) {
+            r.sparse = true;
+            fprintf(stderr,
+                    "[fork] sparse snapshot addr=0x%lx size=%lu pages=0 bytes=0\n",
+                    (long)addr, (unsigned long)size);
+            return;
+        }
+
+        fprintf(stderr,
+                "[fork] sparse bypass addr=0x%lx size=%lu dense_pages=%lu/%lu\n",
+                (long)addr, (unsigned long)size,
+                (unsigned long)present_pages, (unsigned long)span_pages);
+    }
+
+    r.data.resize(size);
+    m.memory.memcpy_out(r.data.data(), addr, size);
+}
 
 // Terminal (tty) state — stored per-fd for stdin/stdout/stderr.
 // Makes isatty(0) return true, enables raw mode for interactive shells.
@@ -355,6 +546,7 @@ namespace nr {
     constexpr int fstat         = 80;
     constexpr int exit          = 93;
     constexpr int exit_group    = 94;
+    constexpr int waitid        = 95;
     constexpr int set_tid_address = 96;
     constexpr int set_robust_list = 99;
     constexpr int clock_gettime = 113;
@@ -575,7 +767,12 @@ static void sys_exit(Machine& m) {
     if (g_fork.in_child) {
         // "Child" is exiting — restore parent state
         g_fork.exit_status = m.template sysarg<int>(0);
+        fprintf(stderr,
+                "[fork-restore] begin child_pid=%d exit=%d sched_current=%d sched_count=%d\n",
+                g_fork.child_pid, g_fork.exit_status, g_sched.current, g_sched.count);
         g_fork.in_child = false;
+        child_table_mark_zombie(g_fork.child_pid, g_fork.exit_status);
+        g_fork.child_reaped = false;
         // Child execve may have overwritten parent code pages at the same VA.
         // Reload parent executable/interpreter text segments before data restore.
         if (g_fork_has_exec_ctx) {
@@ -604,27 +801,42 @@ static void sys_exit(Machine& m) {
         // try to memcpy to those pages first, the write triggers a
         // protection fault that propagates out of resume(), leaving
         // the state half-restored and causing the parent to crash.
-        auto fix_perms = [&](uint64_t addr, uint64_t size) {
-            if (addr > 0 && size > 0) {
-                riscv::PageAttributes attr;
-                attr.read = true;
-                attr.write = true;
-                attr.exec = true;
-                m.memory.set_page_attr(addr, size, attr);
+        auto fix_perms = [&](ForkState::MemRegion& r) {
+            if (r.addr == 0 || r.size == 0) return;
+            riscv::PageAttributes attr;
+            attr.read = true;
+            attr.write = true;
+            attr.exec = true;
+
+            if (r.sparse) {
+                const uint64_t page_size = riscv::Page::size();
+                for (uint64_t addr : r.sparse_page_addrs) {
+                    m.memory.set_page_attr(addr, page_size, attr);
+                }
+            } else {
+                m.memory.set_page_attr(r.addr, r.size, attr);
             }
         };
         // Fix regions using the exact parent snapshot spans.
-        fix_perms(g_fork.exec_data.addr, g_fork.exec_data.size);
-        fix_perms(g_fork.interp_data.addr, g_fork.interp_data.size);
-        fix_perms(g_fork.mmap_data.addr, g_fork.mmap_data.size);
-        fix_perms(g_fork.stack_data.addr, g_fork.stack_data.size);
+        fix_perms(g_fork.exec_data);
+        fix_perms(g_fork.interp_data);
+        fix_perms(g_fork.mmap_data);
+        fix_perms(g_fork.stack_data);
 
         // Now restore parent memory (data/BSS, interpreter, stack, mmap)
         auto restore = [&](ForkState::MemRegion& r) {
+            if (r.sparse) {
+                const uint64_t page_size = riscv::Page::size();
+                for (size_t i = 0; i < r.sparse_page_addrs.size(); i++) {
+                    const uint8_t* src = r.sparse_page_data.data() + (i * page_size);
+                    m.memory.memcpy(r.sparse_page_addrs[i], src, page_size);
+                }
+                clear_mem_region(r);
+                return;
+            }
             if (!r.data.empty()) {
                 m.memory.memcpy(r.addr, r.data.data(), r.size);
-                r.data.clear();
-                r.data.shrink_to_fit();
+                clear_mem_region(r);
             }
         };
         restore(g_fork.exec_data);
@@ -632,18 +844,27 @@ static void sys_exit(Machine& m) {
         restore(g_fork.stack_data);
         restore(g_fork.mmap_data);
 
-        // Restore VFS fd state: close any fds the child opened/dup2'd
-        // that the parent didn't have. This undoes pipe redirections
-        // (e.g. dup2(pipe_fd, 1)) so parent's stdout goes to terminal.
+        // Restore full VFS fd table and per-fd flags.
+        // Child dup2() may overwrite existing descriptors (1/2), so restoring
+        // only "extra fds" is insufficient.
         {
             auto& fs = get_fs(m);
-            auto current_fds = fs.get_open_fds();
-            for (int fd : current_fds) {
-                if (g_fork.parent_open_fds.count(fd) == 0) {
-                    fs.close(fd);
-                }
+            fs.restore_open_fd_state(g_fork.parent_fd_state);
+            g_fork.parent_fd_state = {};
+            g_fd_cloexec_flags = g_fork.parent_fd_cloexec_flags;
+            g_fd_status_flags = g_fork.parent_fd_status_flags;
+            g_tty_fds = g_fork.parent_tty_fds;
+            g_epoll_instances = g_fork.saved_epoll_instances;
+            g_eventfd_counters = g_fork.saved_eventfd_counters;
+            if (g_fork.saved_next_epoll_fd > 0) {
+                g_next_epoll_fd = g_fork.saved_next_epoll_fd;
             }
-            g_fork.parent_open_fds.clear();
+            g_fork.parent_fd_cloexec_flags.clear();
+            g_fork.parent_fd_status_flags.clear();
+            g_fork.parent_tty_fds.clear();
+            g_fork.saved_epoll_instances.clear();
+            g_fork.saved_eventfd_counters.clear();
+            g_fork.saved_next_epoll_fd = 0;
         }
 
         // Restore cooperative thread scheduler state.
@@ -666,7 +887,33 @@ static void sys_exit(Machine& m) {
         // Resume parent at instruction after the clone ecall
         m.cpu.jump(g_fork.pc);
         // Parent sees child PID as clone() return value
+        // Parent sees child PID as clone() return value
         m.set_result(g_fork.child_pid);
+
+        // Signal child-exit wake on any eventfd watched by restored epoll sets.
+        {
+            auto& fs = get_fs(m);
+            for (auto& [epfd2, inst] : g_epoll_instances) {
+                for (auto& [fd2, interest2] : inst.interests) {
+                    if ((interest2.events & 0x01) == 0) continue;
+                    if (!g_eventfd_counters.count(fd2)) continue;
+                    if (g_eventfd_counters[fd2] == 0) g_eventfd_counters[fd2] = 1;
+                    auto entry2 = fs.get_entry(fd2);
+                    if (entry2) {
+                        entry2->content.resize(8);
+                        uint64_t ctr = g_eventfd_counters[fd2];
+                        std::memcpy(entry2->content.data(), &ctr, 8);
+                        entry2->size = 8;
+                    }
+                    fs.lseek(fd2, 0, 0);
+                }
+            }
+        }
+
+        g_child_exit_pending = true;
+        fprintf(stderr,
+                "[fork-restore] done child_pid=%d sched_current=%d sched_count=%d pc=0x%lx pending=1\n",
+                g_fork.child_pid, g_sched.current, g_sched.count, (long)g_fork.pc);
         return;
     }
     int exit_code = m.template sysarg<int>(0);
@@ -774,6 +1021,7 @@ static void sys_clone(Machine& m) {
     g_fork.pc = m.cpu.pc();  // Already past the ecall
     g_fork.child_pid = g_next_pid++;
     g_fork.exit_status = 0;
+    child_table_register_running(g_fork.child_pid);
 
     // Set child's stack pointer if provided (non-zero).
     // musl's __clone stores the child function pointer and arg
@@ -809,32 +1057,24 @@ static void sys_clone(Machine& m) {
             attr.read = true; attr.write = true; attr.exec = true;
             m.memory.set_page_attr(save_start, save_end - save_start, attr);
 
-            auto& r = g_fork.exec_data;
-            r.addr = save_start;
-            r.size = save_end - save_start;
-            r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            snapshot_mem_region(m, g_fork.exec_data, save_start, save_end - save_start, false);
         }
     }
 
     // Region 2: interpreter writable segments
     if (g_exec_ctx.interp_rw_start > 0 && g_exec_ctx.interp_rw_end > g_exec_ctx.interp_rw_start) {
-        auto& r = g_fork.interp_data;
-        r.addr = g_exec_ctx.interp_rw_start;
-        r.size = g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start;
-        r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        snapshot_mem_region(
+            m, g_fork.interp_data,
+            g_exec_ctx.interp_rw_start,
+            g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start,
+            false);
     }
 
     // Region 3: stack (SP to stack top)
     {
         uint64_t sp = m.cpu.reg(riscv::REG_SP);
         uint64_t stack_top = g_exec_ctx.original_stack_top;
-        auto& r = g_fork.stack_data;
-        r.addr = sp;
-        r.size = stack_top - sp;
-        r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        snapshot_mem_region(m, g_fork.stack_data, sp, stack_top - sp, false);
     }
 
     // Region 4: guest mmap allocations (TLS, libc malloc pages)
@@ -845,16 +1085,25 @@ static void sys_clone(Machine& m) {
         uint64_t mmap_region_start = g_exec_ctx.heap_start + g_exec_ctx.heap_size;
         uint64_t mmap_frontier = m.memory.mmap_allocate(0);
         if (mmap_frontier > mmap_region_start) {
-            auto& r = g_fork.mmap_data;
-            r.addr = mmap_region_start;
-            r.size = mmap_frontier - mmap_region_start;
-            r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            snapshot_mem_region(
+                m, g_fork.mmap_data,
+                mmap_region_start,
+                mmap_frontier - mmap_region_start,
+                true);
         }
     }
 
-    // Save VFS open fd set so child's dup2/pipe/open can be undone
-    g_fork.parent_open_fds = get_fs(m).get_open_fds();
+    // Save full parent FD table and per-fd flags.
+    {
+        auto& fs = get_fs(m);
+        g_fork.parent_fd_state = fs.snapshot_open_fd_state();
+    }
+    g_fork.parent_fd_cloexec_flags = g_fd_cloexec_flags;
+    g_fork.parent_fd_status_flags = g_fd_status_flags;
+    g_fork.parent_tty_fds = g_tty_fds;
+    g_fork.saved_epoll_instances = g_epoll_instances;
+    g_fork.saved_eventfd_counters = g_eventfd_counters;
+    g_fork.saved_next_epoll_fd = g_next_epoll_fd;
 
     // Save cooperative thread scheduler state. The fork child's execve
     // resets g_sched, and we need to restore the parent's thread state
@@ -976,6 +1225,7 @@ static void sys_clone3(Machine& m) {
     g_fork.pc = m.cpu.pc();
     g_fork.child_pid = g_next_pid++;
     g_fork.exit_status = 0;
+    child_table_register_running(g_fork.child_pid);
 
     // Save parent memory regions BEFORE changing SP (stack save needs parent SP)
     {
@@ -986,41 +1236,42 @@ static void sys_clone3(Machine& m) {
             riscv::PageAttributes attr;
             attr.read = true; attr.write = true; attr.exec = true;
             m.memory.set_page_attr(save_start, save_end - save_start, attr);
-            auto& r = g_fork.exec_data;
-            r.addr = save_start;
-            r.size = save_end - save_start;
-            r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            snapshot_mem_region(m, g_fork.exec_data, save_start, save_end - save_start, false);
         }
     }
     if (g_exec_ctx.interp_rw_start > 0 && g_exec_ctx.interp_rw_end > g_exec_ctx.interp_rw_start) {
-        auto& r = g_fork.interp_data;
-        r.addr = g_exec_ctx.interp_rw_start;
-        r.size = g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start;
-        r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        snapshot_mem_region(
+            m, g_fork.interp_data,
+            g_exec_ctx.interp_rw_start,
+            g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start,
+            false);
     }
     {
         uint64_t sp = m.cpu.reg(riscv::REG_SP);
         uint64_t stack_top = g_exec_ctx.original_stack_top;
-        auto& r = g_fork.stack_data;
-        r.addr = sp;
-        r.size = stack_top - sp;
-        r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        snapshot_mem_region(m, g_fork.stack_data, sp, stack_top - sp, false);
     }
     if (g_exec_ctx.heap_start > 0 && g_exec_ctx.heap_size > 0) {
         uint64_t mmap_region_start = g_exec_ctx.heap_start + g_exec_ctx.heap_size;
         uint64_t mmap_frontier = m.memory.mmap_allocate(0);
         if (mmap_frontier > mmap_region_start) {
-            auto& r = g_fork.mmap_data;
-            r.addr = mmap_region_start;
-            r.size = mmap_frontier - mmap_region_start;
-            r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            snapshot_mem_region(
+                m, g_fork.mmap_data,
+                mmap_region_start,
+                mmap_frontier - mmap_region_start,
+                true);
         }
     }
-    g_fork.parent_open_fds = get_fs(m).get_open_fds();
+    {
+        auto& fs = get_fs(m);
+        g_fork.parent_fd_state = fs.snapshot_open_fd_state();
+    }
+    g_fork.parent_fd_cloexec_flags = g_fd_cloexec_flags;
+    g_fork.parent_fd_status_flags = g_fd_status_flags;
+    g_fork.parent_tty_fds = g_tty_fds;
+    g_fork.saved_epoll_instances = g_epoll_instances;
+    g_fork.saved_eventfd_counters = g_eventfd_counters;
+    g_fork.saved_next_epoll_fd = g_next_epoll_fd;
     static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
     g_fork.saved_mmap_address = m.memory.mmap_address();
@@ -1038,26 +1289,162 @@ static void sys_clone3(Machine& m) {
     m.set_result(0);
 }
 
-// wait4 — return status of the cooperatively-forked child.
-// In our model the child has always already exited by the time
-// the parent resumes, so this never blocks.
+// wait4 — wait on child exit state changes (exit-only in this runtime).
 static void sys_wait4(Machine& m) {
-    // After the first reap, return ECHILD (no more children).
-    // This prevents infinite loops in shells that call waitpid
-    // until all children are reaped.
-    if (g_fork.child_reaped || g_fork.child_pid == 0) {
+    const int wait_pid = m.template sysarg<int>(0);
+    const uint64_t wstatus_addr = m.sysarg(1);
+    const uint32_t options = static_cast<uint32_t>(m.template sysarg<int>(2));
+
+    constexpr uint32_t K_WNOHANG    = 0x00000001u;
+    constexpr uint32_t K_WUNTRACED  = 0x00000002u;
+    constexpr uint32_t K_WCONTINUED = 0x00000008u;
+    constexpr uint32_t K___WNOTHREAD = 0x20000000u;
+    constexpr uint32_t K___WALL      = 0x40000000u;
+    constexpr uint32_t K___WCLONE    = 0x80000000u;
+
+    constexpr uint32_t K_WAIT4_ALLOWED =
+        K_WNOHANG | K_WUNTRACED | K_WCONTINUED | K___WNOTHREAD | K___WALL | K___WCLONE;
+
+    if ((options & ~K_WAIT4_ALLOWED) != 0) {
+        m.set_result(-22);  // -EINVAL
+        return;
+    }
+
+    auto matches = [&](const ChildProcessEntry& child) {
+        return wait4_pid_matches(wait_pid, child.pid);
+    };
+
+    const size_t matching_children = child_count_unreaped(matches);
+    ChildProcessEntry* zombie = child_find_oldest_zombie(matches);
+
+    fprintf(stderr,
+            "[wait4] pid=%d options=0x%x matching=%zu zombie=%d\n",
+            wait_pid, options, matching_children, zombie ? zombie->pid : -1);
+
+    if (matching_children == 0) {
         m.set_result(-10);  // -ECHILD
         return;
     }
 
-    auto wstatus_addr = m.sysarg(1);
+    if (zombie == nullptr) {
+        if (options & K_WNOHANG) {
+            m.set_result(0);
+            return;
+        }
+        // Blocking wait in this runtime is modeled as an interruptible wait.
+        m.set_result(-4);  // -EINTR
+        return;
+    }
+
     if (wstatus_addr != 0) {
-        // Encode in wait status format: WEXITSTATUS = (status & 0xff) << 8
-        int32_t wstatus = (g_fork.exit_status & 0xff) << 8;
+        // wait status: exited => (code << 8)
+        int32_t wstatus = (zombie->exit_status & 0xff) << 8;
         m.memory.template write<int32_t>(wstatus_addr, wstatus);
     }
-    g_fork.child_reaped = true;
-    m.set_result(g_fork.child_pid);
+
+    zombie->state = ChildLifecycle::Reaped;
+    if (zombie->pid == g_fork.child_pid) {
+        g_fork.child_reaped = true;
+    }
+    g_child_exit_pending = child_any_zombie();
+    m.set_result(zombie->pid);
+}
+
+// waitid — canonical idtype/options matching for exited children.
+static void sys_waitid(Machine& m) {
+    const int idtype = m.template sysarg<int>(0);
+    const int id = m.template sysarg<int>(1);
+    const uint64_t infop = m.sysarg(2);
+    const uint32_t options = static_cast<uint32_t>(m.template sysarg<int>(3));
+
+    constexpr uint32_t K_WNOHANG     = 0x00000001u;
+    constexpr uint32_t K_WSTOPPED    = 0x00000002u;
+    constexpr uint32_t K_WEXITED     = 0x00000004u;
+    constexpr uint32_t K_WCONTINUED  = 0x00000008u;
+    constexpr uint32_t K_WNOWAIT     = 0x01000000u;
+    constexpr uint32_t K___WNOTHREAD = 0x20000000u;
+    constexpr uint32_t K___WALL      = 0x40000000u;
+    constexpr uint32_t K___WCLONE    = 0x80000000u;
+
+    constexpr uint32_t K_WAITID_ALLOWED =
+        K_WNOHANG | K_WSTOPPED | K_WEXITED | K_WCONTINUED | K_WNOWAIT |
+        K___WNOTHREAD | K___WALL | K___WCLONE;
+
+    constexpr int K_P_ALL   = 0;
+    constexpr int K_P_PID   = 1;
+    constexpr int K_P_PGID  = 2;
+    constexpr int K_P_PIDFD = 3;
+    constexpr int SIGCHLD = 17;
+    constexpr int CLD_EXITED = 1;
+
+    if ((options & ~K_WAITID_ALLOWED) != 0) {
+        m.set_result(-22);  // -EINVAL
+        return;
+    }
+    if ((options & (K_WEXITED | K_WSTOPPED | K_WCONTINUED)) == 0) {
+        m.set_result(-22);  // -EINVAL
+        return;
+    }
+    if (idtype != K_P_ALL && idtype != K_P_PID && idtype != K_P_PGID && idtype != K_P_PIDFD) {
+        m.set_result(-22);  // -EINVAL
+        return;
+    }
+    if (idtype == K_P_PIDFD) {
+        m.set_result(-22);  // -EINVAL (pidfd wait not emulated)
+        return;
+    }
+
+    auto matches = [&](const ChildProcessEntry& child) {
+        return waitid_id_matches(idtype, id, child.pid);
+    };
+
+    const size_t matching_children = child_count_unreaped(matches);
+    ChildProcessEntry* zombie = (options & K_WEXITED) ? child_find_oldest_zombie(matches) : nullptr;
+
+    fprintf(stderr,
+            "[waitid] idtype=%d id=%d options=0x%x matching=%zu zombie=%d\n",
+            idtype, id, options, matching_children, zombie ? zombie->pid : -1);
+
+    if (matching_children == 0) {
+        m.set_result(-10);  // -ECHILD
+        return;
+    }
+
+    if (zombie == nullptr) {
+        if (infop != 0 && (options & K_WNOHANG)) {
+            uint8_t si[128] = {};
+            m.memory.memcpy(infop, si, sizeof(si));
+            m.set_result(0);
+            return;
+        }
+        m.set_result((options & K_WNOHANG) ? 0 : -4);  // 0 for nohang, else -EINTR
+        return;
+    }
+
+    if (infop != 0) {
+        uint8_t si[128] = {};
+        // siginfo_t (kernel layout):
+        //  0: si_signo, 4: si_errno, 8: si_code, 16: _pid, 20: _uid, 24: _status
+        auto wr32 = [&](size_t off, int32_t v) {
+            std::memcpy(si + off, &v, sizeof(v));
+        };
+        wr32(0, SIGCHLD);
+        wr32(4, 0);
+        wr32(8, CLD_EXITED);
+        wr32(16, zombie->pid);
+        wr32(20, 0);
+        wr32(24, zombie->exit_status & 0xff);
+        m.memory.memcpy(infop, si, sizeof(si));
+    }
+
+    if ((options & K_WNOWAIT) == 0) {
+        zombie->state = ChildLifecycle::Reaped;
+        if (zombie->pid == g_fork.child_pid) {
+            g_fork.child_reaped = true;
+        }
+        g_child_exit_pending = child_any_zombie();
+    }
+    m.set_result(0);
 }
 
 // Helper: resolve a VFS path through symlinks (up to 10 levels).
@@ -1593,8 +1980,14 @@ static void sys_read(Machine& m) {
             return;
         }
         uint64_t val = g_eventfd_counters[fd];
+        if (fd == 46 || fd == 48 || fd == 57 || fd == 61) {
+            fprintf(stderr, "[read-eventfd] fd=%d count=%zu val=%lu\n", fd, count, (unsigned long)val);
+        }
         if (val == 0) {
             // No signal pending — would block (EAGAIN for nonblock)
+            if (fd == 46 || fd == 48 || fd == 57 || fd == 61) {
+                fprintf(stderr, "[read-eventfd] fd=%d => EAGAIN\n", fd);
+            }
             m.set_result(-11);  // -EAGAIN
             return;
         }
@@ -1736,6 +2129,9 @@ static void sys_read(Machine& m) {
 
     std::vector<uint8_t> buf(count);
     ssize_t n = fs.read(fd, buf.data(), count);
+    if (fd == 46 || fd == 48 || fd == 57 || fd == 61) {
+        fprintf(stderr, "[read-fs] fd=%d count=%zu n=%zd path=%s\n", fd, count, (ssize_t)n, fs.get_path(fd).c_str());
+    }
     if (n > 0) {
         m.memory.memcpy(buf_addr, buf.data(), n);
     }
@@ -3444,6 +3840,20 @@ static void sys_epoll_ctl(Machine& m) {
         uint32_t events = m.memory.template read<uint32_t>(event_addr);
         uint64_t data   = m.memory.template read<uint64_t>(event_addr + 8);
         it->second.interests[fd] = EpollInterest{events, data};
+        if (op == EPOLL_CTL_ADD && (events & 0x01) && child_any_unreaped() && g_eventfd_counters.count(fd)) {
+            auto& fs = get_fs(m);
+            if (g_eventfd_counters[fd] == 0) g_eventfd_counters[fd] = 1;
+            auto entry = fs.get_entry(fd);
+            if (entry) {
+                entry->content.resize(8);
+                uint64_t ctr = g_eventfd_counters[fd];
+                std::memcpy(entry->content.data(), &ctr, 8);
+                entry->size = 8;
+                fs.lseek(fd, 0, 0);
+            }
+            fprintf(stderr, "[epoll_ctl] child-exit wake armed epfd=%d fd=%d ctr=%lu\n",
+                    epfd, fd, (unsigned long)g_eventfd_counters[fd]);
+        }
         fprintf(stderr, "[epoll_ctl] %s epfd=%d fd=%d events=0x%x data=0x%lx\n",
                 op == 1 ? "ADD" : "MOD", epfd, fd, events, (unsigned long)data);
         m.set_result(0);
@@ -3483,6 +3893,13 @@ static void sys_epoll_pwait(Machine& m) {
 
     auto& fs = get_fs(m);
     int ready = 0;
+#ifndef __EMSCRIPTEN__
+    static int native_epoll_trace_budget = 240;
+    const bool trace_native_epoll = (epfd == 2003 && native_epoll_trace_budget > 0);
+    if (trace_native_epoll) {
+        fprintf(stderr, "[epoll-native] epfd=%d timeout=%d maxev=%d interests=%zu\n", epfd, timeout, maxevents, it->second.interests.size());
+    }
+#endif
 #ifdef __EMSCRIPTEN__
     bool socket_waiting_for_data = false;  // Socket has EPOLLIN interest but no data yet
 #endif
@@ -3564,6 +3981,20 @@ static void sys_epoll_pwait(Machine& m) {
         }
 #endif
 
+#ifndef __EMSCRIPTEN__
+        if (trace_native_epoll) {
+            bool is_eventfd = g_eventfd_counters.count(fd) > 0;
+            auto e0 = fs.is_open(fd) ? fs.get_entry(fd) : nullptr;
+            const char* ty0 = (!e0) ? "none" : (e0->type == vfs::FileType::Fifo ? "fifo" : "other");
+            size_t esz0 = e0 ? e0->content.size() : 0;
+            uint64_t evctr = is_eventfd ? g_eventfd_counters[fd] : 0;
+            fprintf(stderr, "[epoll-native]   fd=%d ev=0x%x revents=0x%x eventfd=%d ctr=%lu type=%s esz=%zu path=%s\n",
+                    fd, interest.events, revents, (int)is_eventfd, (unsigned long)evctr, ty0, esz0, fs.get_path(fd).c_str());
+            if (--native_epoll_trace_budget == 0) {
+                fprintf(stderr, "[epoll-native] trace budget exhausted\n");
+            }
+        }
+#endif
         if (revents) {
             // struct epoll_event { uint32_t events; [4 pad]; uint64_t data; } = 16 bytes
             uint64_t offset = events_addr + ready * 16;
@@ -3584,6 +4015,85 @@ static void sys_epoll_pwait(Machine& m) {
         fprintf(stderr, "[epoll] result: ready=%d socket_waiting=%d\n", ready, (int)socket_waiting_for_data);
     }
 #endif
+
+    if (g_child_exit_pending) {
+        g_child_exit_pending = false;
+
+        // Prefer waking non-eventfd pipe watchers first (libuv child-process
+        // watcher path), then eventfd watchers.
+        int sel_pipe_fd = -1;
+        uint64_t sel_pipe_data = 0;
+        int sel_pipe_fd_any = -1;
+        uint64_t sel_pipe_data_any = 0;
+        for (auto& [fd0, interest0] : it->second.interests) {
+            if ((interest0.events & 0x01) == 0) continue;
+            if (g_eventfd_counters.count(fd0)) continue;
+            if (!fs.is_open(fd0)) continue;
+            auto e0 = fs.get_entry(fd0);
+            if (!e0 || e0->type != vfs::FileType::Fifo) continue;
+            if (sel_pipe_fd_any < 0 || fd0 < sel_pipe_fd_any) {
+                sel_pipe_fd_any = fd0;
+                sel_pipe_data_any = interest0.data;
+            }
+            if (!e0->content.empty()) continue;
+            if (sel_pipe_fd < 0 || fd0 < sel_pipe_fd) {
+                sel_pipe_fd = fd0;
+                sel_pipe_data = interest0.data;
+            }
+        }
+        if (sel_pipe_fd < 0) {
+            sel_pipe_fd = sel_pipe_fd_any;
+            sel_pipe_data = sel_pipe_data_any;
+        }
+        if (sel_pipe_fd >= 0) {
+            auto e0 = fs.get_entry(sel_pipe_fd);
+            if (e0) {
+                // libuv signal pipe expects an int signum payload.
+                // Use SIGCHLD (17) to trigger child watcher processing.
+                int32_t signum = 17;
+                const uint8_t* psg = reinterpret_cast<const uint8_t*>(&signum);
+                e0->content.insert(e0->content.end(), psg, psg + sizeof(signum));
+                e0->size = e0->content.size();
+                fs.lseek(sel_pipe_fd, 0, 0);
+            }
+            if (maxevents > 0) {
+                m.memory.template write<uint32_t>(events_addr, 0x01);
+                m.memory.template write<uint32_t>(events_addr + 4, 0);
+                m.memory.template write<uint64_t>(events_addr + 8, sel_pipe_data);
+                fprintf(stderr, "[epoll] child-exit pending => synthetic pipe fd=%d epfd=%d data=0x%lx\n",
+                        sel_pipe_fd, epfd, (unsigned long)sel_pipe_data);
+                m.set_result(1);
+                return;
+            }
+        }
+
+        for (auto& [fd0, interest0] : it->second.interests) {
+            if ((interest0.events & 0x01) == 0) continue;
+            if (!g_eventfd_counters.count(fd0)) continue;
+            if (g_eventfd_counters[fd0] == 0) g_eventfd_counters[fd0] = 1;
+            auto e0 = fs.get_entry(fd0);
+            if (e0) {
+                e0->content.resize(8);
+                uint64_t ctr = g_eventfd_counters[fd0];
+                std::memcpy(e0->content.data(), &ctr, 8);
+                e0->size = 8;
+                fs.lseek(fd0, 0, 0);
+            }
+            if (maxevents > 0) {
+                m.memory.template write<uint32_t>(events_addr, 0x01);
+                m.memory.template write<uint32_t>(events_addr + 4, 0);
+                m.memory.template write<uint64_t>(events_addr + 8, interest0.data);
+                fprintf(stderr, "[epoll] child-exit pending => synthetic eventfd fd=%d epfd=%d data=0x%lx\n",
+                        fd0, epfd, (unsigned long)interest0.data);
+                m.set_result(1);
+                return;
+            }
+        }
+
+        fprintf(stderr, "[epoll] child-exit pending => one-shot EINTR epfd=%d\n", epfd);
+        m.set_result(-4);
+        return;
+    }
 
     if (ready > 0) {
         g_idle_epoll_count = 0;  // Reset idle counter on activity
@@ -4620,6 +5130,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::clone3, sys_clone3);
     machine.install_syscall_handler(nr::execve, sys_execve);
     machine.install_syscall_handler(nr::wait4, sys_wait4);
+    machine.install_syscall_handler(nr::waitid, sys_waitid);
     // brk: override to handle post-execve memory layout changes
     machine.install_syscall_handler(nr::brk, sys_brk);
     // mmap: override to handle file-backed mappings via VFS

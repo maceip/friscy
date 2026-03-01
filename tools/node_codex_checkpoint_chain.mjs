@@ -312,14 +312,14 @@ async function main() {
     report.steps.push('boot: base codex');
     report.timings.bootBaseMs = await bootPage(page, null);
 
-    const probeCmd = '__CODEX_PROBE__';
-    console.log('[chain] run: codex install probe');
-    report.steps.push('cmd: codex install probe');
+    const probeCmd = 'codex --version';
+    console.log('[chain] run: codex native version probe');
+    report.steps.push('cmd: codex native version probe');
     const probe = await runCommand(page, probeCmd, 300000);
     report.timings.installProbeMs = probe.elapsedMs;
     report.installProbePreview = (probe.delta || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-    if (!probe.ok) throw new Error('codex install probe did not complete');
-    assertCommandSucceeded(probe, 'codex install probe');
+    if (!probe.ok) throw new Error('codex native version probe did not complete');
+    assertCommandSucceeded(probe, 'codex native version probe');
 
     console.log('[chain] checkpoint: post-probe');
     report.steps.push('checkpoint: post-probe');

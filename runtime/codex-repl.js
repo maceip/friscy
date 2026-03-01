@@ -2,7 +2,7 @@
 'use strict';
 
 const fs = require('fs');
-const https = require('https');
+const cp = require('child_process');
 
 function readLine() {
   return new Promise((resolve) => {
@@ -54,92 +54,82 @@ function extractCodexPrompt(command) {
   return unquote(m[1]);
 }
 
-function parseResponsesText(json) {
-  if (typeof json?.output_text === 'string' && json.output_text.trim()) return json.output_text;
-  const out = json?.output;
-  if (Array.isArray(out)) {
-    const chunks = [];
-    for (const item of out) {
-      const content = item?.content;
-      if (!Array.isArray(content)) continue;
-      for (const part of content) {
-        if (typeof part?.text === 'string' && part.text) chunks.push(part.text);
-      }
-    }
-    if (chunks.length) return chunks.join('\n');
-  }
-  return '';
+function ensureTrailingNewline(text) {
+  const out = String(text || '');
+  return out.endsWith('\n') ? out : (out + '\n');
 }
 
-function runCodexPrompt(prompt) {
+function runNativeCodex(args, timeoutMs = 20 * 60 * 1000) {
   return new Promise((resolve) => {
-    const key = process.env.OPENAI_API_KEY || '';
-    if (!key || /PLACEHOLDER|YOUR_API_KEY_HERE/.test(key)) {
-      resolve('Error: OPENAI_API_KEY is missing.\n');
-      return;
-    }
-
-    const model = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
-    const payload = JSON.stringify({
-      model,
-      input: prompt || 'write me a haiku',
-      max_output_tokens: 384,
+    const child = cp.spawn('/usr/local/bin/codex', args, {
+      env: { ...process.env, CI: process.env.CI || '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    const req = https.request({
-      hostname: 'api.openai.com',
-      port: 443,
-      path: '/v1/responses',
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'authorization': 'Bearer ' + key,
-        'content-length': Buffer.byteLength(payload),
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => { data += c; });
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data || '{}');
-          if (json && json.error && json.error.message) {
-            resolve('Error: ' + json.error.message + '\n');
-            return;
-          }
-          const text = parseResponsesText(json);
-          if (text) {
-            resolve((text || '') + (text.endsWith('\n') ? '' : '\n'));
-            return;
-          }
-        } catch (_e) {}
-        resolve((data || `HTTP ${res.statusCode || 0}`) + '\n');
-      });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const finish = (text) => {
+      if (settled) return;
+      settled = true;
+      resolve(ensureTrailingNewline(text || ''));
+    };
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch (_e) {}
+      finish('Error: codex command timeout\n');
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk || '');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '');
     });
 
-    req.on('error', (e) => {
-      resolve('Error: ' + (e && e.message ? e.message : String(e)) + '\n');
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      finish('Error: ' + (e?.message || String(e)) + '\n');
     });
 
-    req.setTimeout(120000, () => {
-      req.destroy(new Error('request timeout'));
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        finish(stdout || stderr || '');
+        return;
+      }
+      const suffix = signal ? `, signal=${signal}` : '';
+      finish(`Command failed (exit ${code ?? 'null'}${suffix})\n${stdout}${stderr}`);
     });
-
-    req.write(payload);
-    req.end();
   });
+}
+
+function missingKey() {
+  const key = process.env.OPENAI_API_KEY || '';
+  return !key || /PLACEHOLDER|YOUR_API_KEY_HERE/.test(key);
 }
 
 async function runCommand(command) {
   const cmd = sanitizeCommand(command);
 
-  if (cmd.includes('__CODEX_PROBE__')) return 'codex fast-path\n';
-  if (cmd.includes('__CODEX_HAIKU__')) return runCodexPrompt('write me a haiku');
-  if (cmd.includes('__CODEX_LIMERICK__')) return runCodexPrompt('write me a limerick');
-  if (cmd === 'codex --version' || cmd === 'codex -v' || cmd === 'codex -V') return 'codex fast-path\n';
-  if (cmd === 'codex --help' || cmd === 'codex -h') return 'Usage: codex e <prompt>\n';
+  if (cmd.includes('__CODEX_PROBE__')) return runNativeCodex(['--version'], 120000);
+  if (cmd.includes('__CODEX_HAIKU__')) {
+    if (missingKey()) return 'Error: OPENAI_API_KEY is missing.\n';
+    return runNativeCodex(['e', 'write me a haiku']);
+  }
+  if (cmd.includes('__CODEX_LIMERICK__')) {
+    if (missingKey()) return 'Error: OPENAI_API_KEY is missing.\n';
+    return runNativeCodex(['e', 'write me a limerick']);
+  }
+  if (cmd === 'codex --version' || cmd === 'codex -v' || cmd === 'codex -V') return runNativeCodex(['--version'], 120000);
+  if (cmd === 'codex --help' || cmd === 'codex -h') return runNativeCodex(['--help'], 120000);
 
   const prompt = extractCodexPrompt(cmd);
-  if (prompt !== null) return runCodexPrompt(prompt);
+  if (prompt !== null) {
+    if (missingKey()) return 'Error: OPENAI_API_KEY is missing.\n';
+    return runNativeCodex(['e', prompt]);
+  }
 
   if (!cmd) return '';
   return `Unsupported command in codex runner: ${cmd}\n`;

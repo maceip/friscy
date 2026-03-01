@@ -76,6 +76,25 @@ struct DirHandle {
 
 class VirtualFS {
 public:
+    struct OpenFileState {
+        int fd;
+        std::shared_ptr<Entry> entry;
+        uint64_t offset;
+        int flags;
+        std::string path;
+    };
+    struct OpenDirState {
+        int fd;
+        std::shared_ptr<Entry> entry;
+        size_t index;
+        std::string path;
+    };
+    struct OpenFDState {
+        int next_fd;
+        std::vector<OpenFileState> files;
+        std::vector<OpenDirState> dirs;
+    };
+
     VirtualFS() {
         // Create root directory
         root_ = std::make_shared<Entry>();
@@ -354,11 +373,33 @@ public:
         auto& fh = it->second;
         if (fh->entry->is_dir()) return -21;  // EISDIR
 
-        size_t available = fh->entry->content.size() - fh->offset;
+        if (fh->entry->type == FileType::Fifo) {
+            size_t available = fh->entry->content.size();
+            size_t to_read = std::min(count, available);
+            if (to_read == 0) {
+                bool writer_open = false;
+                for (const auto& [ofd, ofh] : open_files_) {
+                    if (ofh->entry.get() != fh->entry.get()) continue;
+                    if ((ofh->flags & 1) != 0) { writer_open = true; break; }
+                }
+                return writer_open ? -11 : 0;
+            }
+            memcpy(buf, fh->entry->content.data(), to_read);
+            fh->entry->content.erase(fh->entry->content.begin(), fh->entry->content.begin() + to_read);
+            fh->entry->size = fh->entry->content.size();
+            fh->offset = 0;
+            return static_cast<ssize_t>(to_read);
+        }
+
+        size_t available = (fh->offset >= fh->entry->content.size())
+            ? 0
+            : (fh->entry->content.size() - fh->offset);
         size_t to_read = std::min(count, available);
 
-        memcpy(buf, fh->entry->content.data() + fh->offset, to_read);
-        fh->offset += to_read;
+        if (to_read > 0) {
+            memcpy(buf, fh->entry->content.data() + fh->offset, to_read);
+            fh->offset += to_read;
+        }
 
         return static_cast<ssize_t>(to_read);
     }
@@ -370,6 +411,14 @@ public:
 
         auto& fh = it->second;
         if (fh->entry->is_dir()) return -21;  // EISDIR
+
+        if (fh->entry->type == FileType::Fifo) {
+            const auto* src = static_cast<const uint8_t*>(buf);
+            fh->entry->content.insert(fh->entry->content.end(), src, src + count);
+            fh->entry->size = fh->entry->content.size();
+            fh->offset = fh->entry->content.size();
+            return static_cast<ssize_t>(count);
+        }
 
         // Extend if needed
         size_t end_pos = fh->offset + count;
@@ -758,6 +807,51 @@ public:
         for (const auto& p : open_files_) fds.insert(p.first);
         for (const auto& p : open_dirs_) fds.insert(p.first);
         return fds;
+    }
+
+    // Snapshot and restore full FD table. Needed by cooperative fork restore
+    // because child dup2() can mutate existing fd numbers (e.g. 1/2), not just add new ones.
+    OpenFDState snapshot_open_fd_state() const {
+        OpenFDState state;
+        state.next_fd = next_fd_;
+        state.files.reserve(open_files_.size());
+        state.dirs.reserve(open_dirs_.size());
+
+        for (const auto& [fd, fh] : open_files_) {
+            state.files.push_back(OpenFileState{
+                fd,
+                fh->entry,
+                fh->offset,
+                fh->flags,
+                fh->path,
+            });
+        }
+        for (const auto& [fd, dh] : open_dirs_) {
+            state.dirs.push_back(OpenDirState{
+                fd,
+                dh->entry,
+                dh->index,
+                dh->path,
+            });
+        }
+        return state;
+    }
+
+    void restore_open_fd_state(const OpenFDState& state) {
+        open_files_.clear();
+        open_dirs_.clear();
+        next_fd_ = state.next_fd;
+
+        for (const auto& f : state.files) {
+            auto h = std::make_unique<FileHandle>(f.entry, f.flags, f.path);
+            h->offset = f.offset;
+            open_files_[f.fd] = std::move(h);
+        }
+        for (const auto& d : state.dirs) {
+            auto h = std::make_unique<DirHandle>(d.entry, d.path);
+            h->index = d.index;
+            open_dirs_[d.fd] = std::move(h);
+        }
     }
 
     // Get the path of an open fd

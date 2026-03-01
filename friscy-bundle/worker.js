@@ -65,10 +65,18 @@ const CMD_RESIZE = 6;
 const CMD_NETWORK_RPC_DONE = 7;
 const CMD_EXPORT_VFS = 8;
 
+const PROCESS_EVENT_KIND_SPAWN = 1;
+const PROCESS_EVENT_KIND_EXIT = 2;
+const PROCESS_EVENT_KIND_WAIT_WAKEUP = 3;
+const PROCESS_EVENT_RECORD_DWORDS = 5;
+
 const STOP_REASON_NONE = 0;
 const STOP_REASON_STDIN = 1 << 0;
 const STOP_REASON_HOST_FETCH = 1 << 1;
 const STOP_REASON_TIMESLICE = 1 << 2;
+const FRISCY_FAULT_NONE = 0;
+const FRISCY_FAULT_MACHINE_EXCEPTION = 1;
+const FRISCY_FAULT_EBREAK = 2;
 
 // Network RPC operation codes (stored in payload[0])
 const NET_OP_SOCKET_CREATE = 1;
@@ -133,6 +141,11 @@ let jitPrewarmEnabled = true;
 let netWorker = null;
 let netRpcId = 1;
 const pendingRpcs = new Map();
+let processDrainResolved = false;
+let processDrainMissingLogged = false;
+let processEventsDirectPathSeen = false;
+let lastProcessExitStatus = null;
+let lastProcessWaitWakeStatus = null;
 
 const encoder = new TextEncoder();
 
@@ -171,6 +184,10 @@ function writeStdoutRing(data) {
  */
 function requestStdin(maxLen) {
     if (!controlView || !controlBytes) return new Uint8Array(0);
+    // callMain() can run for a long time without returning in the interactive
+    // shell path. Drain process events opportunistically on stdin boundaries
+    // so process lifecycle events are surfaced while the VM is running.
+    drainProcessEvents();
 
     Atomics.store(controlView, 2, maxLen);
     Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
@@ -191,6 +208,7 @@ function requestStdin(maxLen) {
     }
 
     Atomics.store(controlView, 0, CMD_IDLE);
+    drainProcessEvents();
     return result;
 }
 
@@ -299,10 +317,126 @@ function maybePostJitStats(force = false) {
     }
 }
 
+function getRuntimeFaultInfo() {
+    const kind = (typeof emModule?._friscy_get_last_fault_kind === 'function')
+        ? (emModule._friscy_get_last_fault_kind() | 0)
+        : FRISCY_FAULT_NONE;
+    const pc = (typeof emModule?._friscy_get_last_fault_pc === 'function')
+        ? (emModule._friscy_get_last_fault_pc() >>> 0)
+        : 0;
+    const data = (typeof emModule?._friscy_get_last_fault_data === 'function')
+        ? (emModule._friscy_get_last_fault_data() >>> 0)
+        : 0;
+    return { kind, pc, data };
+}
+
+function classifyRunFailure(error) {
+    const stopped = (typeof emModule?._friscy_stopped === 'function')
+        ? !!emModule._friscy_stopped()
+        : false;
+    const stopReason = (typeof emModule?._friscy_stop_reason === 'function')
+        ? (emModule._friscy_stop_reason() | 0)
+        : STOP_REASON_NONE;
+    const fault = getRuntimeFaultInfo();
+    const processExitSuccess = (lastProcessExitStatus === 0) || (lastProcessWaitWakeStatus === 0);
+    const processExitFailure =
+        (lastProcessExitStatus !== null && lastProcessExitStatus !== 0) ||
+        (lastProcessWaitWakeStatus !== null && lastProcessWaitWakeStatus !== 0);
+    const message = error?.message || String(error || '');
+    const mentionsEbreak = typeof message === 'string' && message.includes('EBREAK');
+
+    const gracefulByRuntime = stopped && stopReason === STOP_REASON_NONE
+        && (fault.kind === FRISCY_FAULT_NONE || fault.kind === FRISCY_FAULT_EBREAK);
+    const graceful = processExitSuccess || gracefulByRuntime;
+
+    return {
+        graceful,
+        diagnostics: {
+            stopped,
+            stopReason,
+            faultKind: fault.kind,
+            faultPc: fault.pc,
+            faultData: fault.data,
+            processExitStatus: lastProcessExitStatus,
+            processWaitWakeStatus: lastProcessWaitWakeStatus,
+            processExitSuccess,
+            processExitFailure,
+            mentionsEbreak,
+        },
+    };
+}
+
+function drainProcessEvents() {
+    if (processEventsDirectPathSeen) return;
+    const direct = emModule?._friscy_drain_process_events;
+    const wasmExport = emModule?.wasmExports?.friscy_drain_process_events;
+    const drain = typeof direct === 'function' ? direct : wasmExport;
+    if (!processDrainResolved && typeof drain === 'function') {
+        processDrainResolved = true;
+        console.log('[worker] Process drain export resolved');
+    }
+    if (typeof drain !== 'function' || !emModule._malloc || !emModule._free) {
+        if (!processDrainMissingLogged) {
+            processDrainMissingLogged = true;
+            console.warn('[worker] Process drain export missing');
+        }
+        return;
+    }
+
+    const maxEvents = 8;
+    const ptr = emModule._malloc(maxEvents * PROCESS_EVENT_RECORD_DWORDS * 4);
+    if (!ptr) return;
+
+    try {
+        const n = drain(ptr, maxEvents) >>> 0;
+        if (n <= 0) return;
+        const raw = new Uint32Array(emModule.HEAPU32.buffer, ptr, n * PROCESS_EVENT_RECORD_DWORDS);
+        const events = [];
+        const kindName = (k) => {
+            switch (k) {
+            case PROCESS_EVENT_KIND_SPAWN:
+                return 'spawn';
+            case PROCESS_EVENT_KIND_EXIT:
+                return 'exit';
+            case PROCESS_EVENT_KIND_WAIT_WAKEUP:
+                return 'wait_wakeup';
+            default:
+                return 'unknown';
+            }
+        };
+        for (let i = 0; i < n; i++) {
+            const base = i * PROCESS_EVENT_RECORD_DWORDS;
+            const event = {
+                kind: raw[base] | 0,
+                kindName: kindName(raw[base] | 0),
+                pid: raw[base + 1] | 0,
+                ppid: raw[base + 2] | 0,
+                pgid: raw[base + 3] | 0,
+                status: raw[base + 4] | 0,
+            };
+            if (event.kind === PROCESS_EVENT_KIND_EXIT) {
+                lastProcessExitStatus = event.status | 0;
+            } else if (event.kind === PROCESS_EVENT_KIND_WAIT_WAKEUP) {
+                lastProcessWaitWakeStatus = event.status | 0;
+            }
+            events.push(event);
+        }
+        self.postMessage({ type: 'process-events', events });
+    } catch (e) {
+        console.warn('[worker] Failed to drain process events:', e.message);
+    } finally {
+        emModule._free(ptr);
+    }
+}
+
 function getStopReason(friscy_stop_reason, friscy_stopped) {
     if (typeof friscy_stop_reason === 'function') {
         const mask = friscy_stop_reason() | 0;
-        return Number.isFinite(mask) ? mask : STOP_REASON_NONE;
+        if (Number.isFinite(mask) && mask !== 0) return mask;
+        // Some transitions report mask=0 while still stopped; don't exit early.
+        return (typeof friscy_stopped === 'function' && friscy_stopped())
+            ? STOP_REASON_STDIN
+            : STOP_REASON_NONE;
     }
     // Backwards compatibility with older runtimes.
     return (typeof friscy_stopped === 'function' && friscy_stopped())
@@ -435,6 +569,7 @@ async function runResumeLoop() {
                 Atomics.store(controlView, 0, CMD_IDLE);
             }
         }
+        drainProcessEvents();
         maybePostJitStats();
 
         if ((stopReason & STOP_REASON_HOST_FETCH) && friscy_host_fetch_pending && friscy_host_fetch_pending()) {
@@ -648,12 +783,39 @@ self.onmessage = async function(e) {
             print: function(text) {
                 console.log('[friscy]', text);
                 writeStdoutRing(encoder.encode(text + '\n'));
+                drainProcessEvents();
             },
             printErr: function(text) {
                 console.error('[friscy-err]', text);
+                drainProcessEvents();
             },
             _termWrite: function(text) {
                 writeStdoutRing(encoder.encode(text));
+                drainProcessEvents();
+            },
+            _friscyEmitProcessEvent: function(kind, pid, ppid, pgid, status) {
+                processEventsDirectPathSeen = true;
+                const k = kind | 0;
+                const event = {
+                    kind: k,
+                    kindName: (k === PROCESS_EVENT_KIND_SPAWN)
+                        ? 'spawn'
+                        : (k === PROCESS_EVENT_KIND_EXIT)
+                            ? 'exit'
+                            : (k === PROCESS_EVENT_KIND_WAIT_WAKEUP)
+                                ? 'wait_wakeup'
+                                : 'unknown',
+                    pid: pid | 0,
+                    ppid: ppid | 0,
+                    pgid: pgid | 0,
+                    status: status | 0,
+                };
+                if (event.kind === PROCESS_EVENT_KIND_EXIT) {
+                    lastProcessExitStatus = event.status | 0;
+                } else if (event.kind === PROCESS_EVENT_KIND_WAIT_WAKEUP) {
+                    lastProcessWaitWakeStatus = event.status | 0;
+                }
+                self.postMessage({ type: 'process-events', events: [event] });
             },
             _decoder: new TextDecoder(),
             _stdinBuffer: stdinBuffer,
@@ -669,6 +831,9 @@ self.onmessage = async function(e) {
             },
             onExit: function(code) {
                 signalExit(code);
+            },
+            onAbort: function(reason) {
+                console.error('[worker] Module abort reason:', reason);
             },
         });
 
@@ -822,6 +987,11 @@ self.onmessage = async function(e) {
     if (msg.type === 'run') {
         const args = msg.args || [];
         try {
+            lastProcessExitStatus = null;
+            lastProcessWaitWakeStatus = null;
+            if (typeof emModule?._friscy_clear_last_fault === 'function') {
+                emModule._friscy_clear_last_fault();
+            }
             if (msg.rootfsData) {
                 emModule.FS.writeFile('/rootfs.tar', new Uint8Array(msg.rootfsData));
             }
@@ -833,6 +1003,8 @@ self.onmessage = async function(e) {
             }
 
             await emModule.callMain(args);
+            // Drain any process lifecycle events produced during normal run completion.
+            drainProcessEvents();
             if (emModule._friscy_stopped && emModule._friscy_stopped()) {
                 if (jitPrewarmEnabled && jitManager.jitCompiler && typeof jitManager.prewarmRegionAt === 'function') {
                     try {
@@ -845,13 +1017,24 @@ self.onmessage = async function(e) {
                     }
                 }
                 await runResumeLoop();
+                drainProcessEvents();
             }
             maybePostJitStats(true);
             signalExit(0);
         } catch (e) {
             const errMsg = e?.message || String(e);
             const errStack = e?.stack ? `\n${e.stack}` : '';
-            console.error('[worker] Run failed:', errMsg, e?.stack || '');
+            const cls = classifyRunFailure(e);
+            if (cls.graceful) {
+                const diag = JSON.stringify(cls.diagnostics);
+                console.warn(`[worker] callMain threw after graceful completion, suppressing error: ${diag}`);
+                drainProcessEvents();
+                maybePostJitStats(true);
+                signalExit(0);
+                return;
+            }
+            const diag = JSON.stringify(cls.diagnostics);
+            console.error(`[worker] Run failed: ${errMsg} ${diag}`, e?.stack || '');
             writeStdoutRing(encoder.encode(`\r\n[worker] Error: ${errMsg}${errStack}\r\n`));
             maybePostJitStats(true);
             signalExit(1);

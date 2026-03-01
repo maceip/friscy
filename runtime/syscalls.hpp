@@ -7,6 +7,8 @@
 #include <libriscv/machine.hpp>
 #include "vfs.hpp"
 #include "elf_loader.hpp"
+#include <array>
+#include <algorithm>
 #include <ctime>
 #include <cstring>
 #include <random>
@@ -77,10 +79,164 @@ struct EpollInstance {
 inline std::unordered_map<int, EpollInstance> g_epoll_instances;
 inline int g_next_epoll_fd = 2000;
 
-// Cooperative fork state — single-process vfork emulation.
-// On clone(): save parent registers, return 0 (child runs).
-// On exit_group() in child: restore parent registers, return child PID.
-// On wait4(): return saved exit status.
+// Process model scaffolding for transition to host-orchestrated process semantics.
+// Phase 0/1 goals:
+// - explicit pid/ppid/pgid fields
+// - explicit lifecycle state
+// - deterministic identity for identity syscalls (getpid/getppid)
+enum class ProcessEventKind : uint32_t {
+    Spawn = 1,
+    Exit = 2,
+    WaitWakeup = 3,
+};
+
+struct ProcessEvent {
+    uint32_t kind = 0;
+    pid_t pid = 0;
+    pid_t ppid = 0;
+    pid_t pgid = 0;
+    int32_t exit_status = 0;
+};
+
+enum class ProcessState : uint8_t {
+    Running = 0,
+    Exited  = 1,
+    Reaped  = 2,
+};
+
+struct ProcessInfo {
+    pid_t pid  = 0;
+    pid_t ppid = 0;
+    pid_t pgid = 0;
+    ProcessState state = ProcessState::Reaped;
+    int32_t exit_status = 0;
+};
+
+struct ProcessModel {
+    static constexpr size_t MAX_PROCS = 256;
+    static constexpr size_t MAX_EVENTS = 64;
+    std::array<ProcessInfo, MAX_PROCS> table{};
+    int count = 0;
+    pid_t current_pid = 1;
+    pid_t current_ppid = 0;
+    pid_t current_pgid = 1;
+    pid_t next_pid = 100;
+    bool initialized = false;
+    std::array<ProcessEvent, MAX_EVENTS> event_ring{};
+    int event_head = 0;
+    int event_count = 0;
+
+    void init() {
+        if (initialized) return;
+        table[0] = {1, 0, 1, ProcessState::Running, 0};
+        count = 1;
+        next_pid = 100;
+        initialized = true;
+    }
+
+    ProcessInfo* find(pid_t pid) {
+        init();
+        for (int i = 0; i < count; i++) {
+            if (table[i].pid == pid) return &table[i];
+        }
+        return nullptr;
+    }
+
+    pid_t allocate_pid() {
+        init();
+        if (count >= (int)MAX_PROCS) return -1;
+        return next_pid++;
+    }
+
+    bool register_process(pid_t pid, pid_t ppid, pid_t pgid) {
+        init();
+        if (count >= (int)MAX_PROCS) return false;
+        table[count++] = {pid, ppid, pgid, ProcessState::Running, 0};
+        return true;
+    }
+
+    pid_t spawn_child(pid_t ppid, pid_t pgid) {
+        pid_t pid = allocate_pid();
+        if (pid < 0) return -1;
+        if (!register_process(pid, ppid, pgid)) return -1;
+        return pid;
+    }
+
+    void set_current(pid_t pid) {
+        init();
+        auto* p = find(pid);
+        if (!p) return;
+        current_pid = pid;
+        current_ppid = p->ppid;
+        current_pgid = p->pgid;
+    }
+
+    bool mark_reaped(pid_t pid, int32_t status = 0) {
+        init();
+        auto* p = find(pid);
+        if (!p) return false;
+        p->state = ProcessState::Reaped;
+        p->exit_status = status;
+        return true;
+    }
+
+    void mark_exited(pid_t pid, int32_t status) {
+        init();
+        auto* p = find(pid);
+        if (!p) return;
+        p->state = ProcessState::Exited;
+        p->exit_status = status;
+    }
+
+    bool push_event(ProcessEventKind kind, pid_t pid, pid_t ppid, pid_t pgid, int32_t exit_status) {
+        if (event_count >= (int)MAX_EVENTS) {
+            event_head = (event_head + 1) % (int)MAX_EVENTS;
+            event_count--;
+        }
+        const int idx = (event_head + event_count) % (int)MAX_EVENTS;
+        event_ring[idx] = {
+            static_cast<uint32_t>(kind),
+            pid,
+            ppid,
+            pgid,
+            exit_status,
+        };
+        event_count++;
+#ifdef __EMSCRIPTEN__
+        EM_ASM({
+            if (typeof Module._friscyEmitProcessEvent === 'function') {
+                Module._friscyEmitProcessEvent(($0)|0, ($1)|0, ($2)|0, ($3)|0, ($4)|0);
+            }
+        }, static_cast<int>(kind), static_cast<int>(pid), static_cast<int>(ppid),
+           static_cast<int>(pgid), static_cast<int>(exit_status));
+#endif
+        return true;
+    }
+
+    uint32_t drain_events(ProcessEvent* out, uint32_t max_events) {
+        if (!out || max_events == 0) return 0;
+        uint32_t n = std::min<uint32_t>(max_events, static_cast<uint32_t>(event_count));
+        for (uint32_t i = 0; i < n; i++) {
+            out[i] = event_ring[event_head];
+            event_head = (event_head + 1) % (int)MAX_EVENTS;
+            event_count--;
+        }
+        return n;
+    }
+
+    int pending_events() const {
+        return event_count;
+    }
+};
+
+inline ProcessModel g_process_model = {};
+
+// Transitional process state for the old in-VM fork path.
+// On clone()/clone3() (fork variant): save parent registers and return 0.
+// Child execution currently uses g_fork restoration semantics while process ids
+// and lifecycle are moved toward explicit model tracking (g_process_model).
+// On exit_group()/exit() in child: restore parent registers and return child PID.
+// On wait4(): still assumes the child exits before parent continues in this phase.
 struct ForkState {
     uint64_t regs[32];  // Saved parent registers (x0-x31)
     uint64_t pc;        // Saved parent PC (the ecall instruction)
@@ -88,10 +244,13 @@ struct ForkState {
     pid_t child_pid;    // PID assigned to child
     bool in_child;      // True while "child" is running
     bool child_reaped;  // True after wait4 has reaped the child
+    pid_t parent_pid;   // Parent process id captured on fork
+    pid_t parent_pgid;  // Parent pgid captured on fork
+    pid_t child_pgid;   // Child pgid for this fork child
     // Memory snapshots: saved at clone, restored when child exits.
     // With FLAT_RW_ARENA, all arena memory is contiguous so we can
     // save large ranges without worrying about unmapped pages.
-    //   1. Data+BRK: exec_rw_start to heap_start (data/BSS + brk region)
+    //   1. Data+BRK: exec_rw_start to brk_current (data/BSS + active brk)
     //   2. Interpreter data/BSS (ld-musl state)
     //   3. Stack (return addresses, locals)
     //   4. mmap'd pages: heap_start+heap_size to mmap pointer
@@ -112,6 +271,7 @@ struct ForkState {
     // dependency on ThreadScheduler definition. execve in fork child
     // resets g_sched; must restore parent's thread state on child exit.
     alignas(16) uint8_t saved_sched[8192];  // enough for ThreadScheduler (~5KB)
+    uint64_t saved_mmap_address = 0;
 };
 inline ForkState g_fork = {};
 inline pid_t g_next_pid = 100;
@@ -164,6 +324,7 @@ inline std::set<int> g_tty_fds = {0, 1, 2};
 // - F_GETFL / F_SETFL -> g_fd_status_flags (O_* status flags)
 inline std::unordered_map<int, int> g_fd_cloexec_flags;
 inline std::unordered_map<int, int> g_fd_status_flags;
+inline bool g_stdio_open[3] = {true, true, true};
 
 // Cooperative thread scheduler for CLONE_THREAD.
 // When clone creates a thread, we save the parent's state and let the child
@@ -318,6 +479,8 @@ struct ExecContext {
     bool dynamic = false;                // Using dynamic linker?
 };
 inline ExecContext g_exec_ctx;
+inline ExecContext g_fork_saved_exec_ctx;
+inline bool g_fork_has_exec_ctx = false;
 
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
@@ -415,6 +578,7 @@ namespace nr {
     constexpr int membarrier    = 283;
     constexpr int statx         = 291;
     constexpr int close_range   = 436;
+    constexpr int openat2       = 437;
     constexpr int rseq          = 293;
     constexpr int io_uring_setup = 425;
     constexpr int clone3        = 435;
@@ -538,6 +702,13 @@ static void sys_exit_group(Machine& m) {
 }
 
 static void sys_exit(Machine& m) {
+    // Fork child exit must be handled before cooperative thread teardown.
+    // Otherwise a fork child running on a non-main scheduler slot can be
+    // consumed by the thread-exit path, skipping process-model exit/wakeup.
+    if (g_fork.in_child) {
+        goto fork_child_exit;
+    }
+
     // If a cooperative thread is exiting (not the main thread or a fork child),
     // remove it from the scheduler and switch to another thread.
     if (g_sched.count > 1 && g_sched.current != 0) {
@@ -570,9 +741,42 @@ static void sys_exit(Machine& m) {
     }
 
     if (g_fork.in_child) {
+fork_child_exit:
         // "Child" is exiting — restore parent state
         g_fork.exit_status = m.template sysarg<int>(0);
+        g_process_model.push_event(
+            ProcessEventKind::Exit,
+            g_fork.child_pid,
+            g_fork.parent_pid,
+            g_fork.child_pgid,
+            g_fork.exit_status);
+        g_process_model.mark_exited(g_fork.child_pid, g_fork.exit_status);
         g_fork.in_child = false;
+
+        // Child execve may have overwritten parent code pages at the same VA.
+        // Reload parent executable/interpreter text segments before data restore.
+        if (g_fork_has_exec_ctx) {
+            const auto& parent_ctx = g_fork_saved_exec_ctx;
+            try {
+                m.memory.evict_execute_segments();
+                if (!parent_ctx.exec_binary.empty()) {
+                    uint64_t load_base = 0;
+                    if (parent_ctx.exec_info.type == elf::ET_DYN) {
+                        auto [plo, phi] = elf::get_load_range(parent_ctx.exec_binary);
+                        (void)phi;
+                        load_base = (parent_ctx.exec_base >= plo)
+                            ? (parent_ctx.exec_base - plo)
+                            : parent_ctx.exec_base;
+                    }
+                    dynlink::load_elf_segments(m, parent_ctx.exec_binary, load_base);
+                }
+                if (!parent_ctx.interp_binary.empty() && parent_ctx.interp_base != 0) {
+                    dynlink::load_elf_segments(m, parent_ctx.interp_binary, parent_ctx.interp_base);
+                }
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[fork] parent segment reload failed: %s\n", e.what());
+            }
+        }
 
         // CRITICAL: Fix page permissions BEFORE restoring memory.
         // The parent's initial RELRO made data pages read-only. If we
@@ -588,25 +792,11 @@ static void sys_exit(Machine& m) {
                 m.memory.set_page_attr(addr, size, attr);
             }
         };
-        // Fix data/BSS + BRK region (includes RELRO pages)
-        {
-            uint64_t save_end = (g_exec_ctx.heap_start > g_exec_ctx.exec_rw_end)
-                              ? g_exec_ctx.heap_start : g_exec_ctx.exec_rw_end;
-            fix_perms(g_exec_ctx.exec_rw_start,
-                      save_end - g_exec_ctx.exec_rw_start);
-        }
-        // Fix interpreter data
-        fix_perms(g_exec_ctx.interp_rw_start,
-                  g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start);
-        // Fix mmap region
-        if (g_fork.mmap_data.size > 0) {
-            fix_perms(g_fork.mmap_data.addr, g_fork.mmap_data.size);
-        }
-        // Fix stack
-        {
-            uint64_t sp = g_fork.regs[2];  // Use saved SP, not current
-            fix_perms(sp, g_exec_ctx.original_stack_top - sp);
-        }
+        // Fix regions using the exact parent snapshot spans.
+        fix_perms(g_fork.exec_data.addr, g_fork.exec_data.size);
+        fix_perms(g_fork.interp_data.addr, g_fork.interp_data.size);
+        fix_perms(g_fork.mmap_data.addr, g_fork.mmap_data.size);
+        fix_perms(g_fork.stack_data.addr, g_fork.stack_data.size);
 
         // Now restore parent memory (data/BSS, interpreter, stack, mmap)
         auto restore = [&](ForkState::MemRegion& r) {
@@ -639,10 +829,20 @@ static void sys_exit(Machine& m) {
         // The fork child's execve may have reset g_sched.
         std::memcpy(&g_sched, g_fork.saved_sched, sizeof(g_sched));
 
+        // Restore parent memory layout metadata potentially mutated by child execve.
+        if (g_fork.saved_mmap_address > 0) {
+            m.memory.mmap_address() = g_fork.saved_mmap_address;
+        }
+        if (g_fork_has_exec_ctx) {
+            g_exec_ctx = g_fork_saved_exec_ctx;
+            g_fork_has_exec_ctx = false;
+        }
+
         // Restore parent registers (x0-x31)
         for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
             m.cpu.reg(i) = g_fork.regs[i];
         }
+        g_process_model.set_current(g_fork.parent_pid);
         // Resume parent at instruction after the clone ecall
         m.cpu.jump(g_fork.pc);
         // Parent sees child PID as clone() return value
@@ -751,8 +951,21 @@ static void sys_clone(Machine& m) {
     for (int i = 0; i < 32; i++) {
         g_fork.regs[i] = m.cpu.reg(i);
     }
+    g_process_model.init();
     g_fork.pc = m.cpu.pc();  // Already past the ecall
-    g_fork.child_pid = g_next_pid++;
+    g_fork.parent_pid = g_process_model.current_pid;
+    g_fork.parent_pgid = g_process_model.current_pgid;
+    g_fork.child_pid = g_process_model.allocate_pid();
+    if (g_fork.child_pid < 0) {
+        m.set_result(-12);  // -ENOMEM
+        return;
+    }
+    g_fork.child_pgid = g_fork.child_pid;
+    if (!g_process_model.register_process(g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid)) {
+        m.set_result(-12);  // -ENOMEM
+        return;
+    }
+    g_process_model.push_event(ProcessEventKind::Spawn, g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid, 0);
     g_fork.exit_status = 0;
 
     // Set child's stack pointer if provided (non-zero).
@@ -780,9 +993,12 @@ static void sys_clone(Machine& m) {
     // region (exec_rw_end..heap_start) where musl puts small allocs
     // (shell variables like $PWD live here).
     {
+        uint64_t brk_end = (g_exec_ctx.brk_current > 0)
+                         ? g_exec_ctx.brk_current
+                         : g_exec_ctx.exec_rw_end;
+        if (brk_end < g_exec_ctx.exec_rw_end) brk_end = g_exec_ctx.exec_rw_end;
         uint64_t save_start = g_exec_ctx.exec_rw_start;
-        uint64_t save_end = (g_exec_ctx.heap_start > g_exec_ctx.exec_rw_end)
-                          ? g_exec_ctx.heap_start : g_exec_ctx.exec_rw_end;
+        uint64_t save_end = brk_end;
         if (save_start > 0 && save_end > save_start) {
             // BRK pages may not have read attrs yet — make them readable.
             riscv::PageAttributes attr;
@@ -841,10 +1057,14 @@ static void sys_clone(Machine& m) {
     // when the child exits.
     static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
+    g_fork.saved_mmap_address = m.memory.mmap_address();
+    g_fork_saved_exec_ctx = g_exec_ctx;
+    g_fork_has_exec_ctx = true;
 
     // Only set in_child AFTER all saves succeed.
     // This way if memcpy_out throws, the retry will re-enter clone
     // with in_child still false, allowing the save to be retried.
+    g_process_model.set_current(g_fork.child_pid);
     g_fork.in_child = true;
     g_fork.child_reaped = false;
 
@@ -950,15 +1170,31 @@ static void sys_clone3(Machine& m) {
     for (int i = 0; i < 32; i++) {
         g_fork.regs[i] = m.cpu.reg(i);
     }
+    g_process_model.init();
     g_fork.pc = m.cpu.pc();
-    g_fork.child_pid = g_next_pid++;
+    g_fork.parent_pid = g_process_model.current_pid;
+    g_fork.parent_pgid = g_process_model.current_pgid;
+    g_fork.child_pid = g_process_model.allocate_pid();
+    if (g_fork.child_pid < 0) {
+        m.set_result(-12);  // -ENOMEM
+        return;
+    }
+    g_fork.child_pgid = g_fork.child_pid;
+    if (!g_process_model.register_process(g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid)) {
+        m.set_result(-12);  // -ENOMEM
+        return;
+    }
+    g_process_model.push_event(ProcessEventKind::Spawn, g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid, 0);
     g_fork.exit_status = 0;
 
     // Save parent memory regions BEFORE changing SP (stack save needs parent SP)
     {
         uint64_t save_start = g_exec_ctx.exec_rw_start;
-        uint64_t save_end = (g_exec_ctx.heap_start > g_exec_ctx.exec_rw_end)
-                          ? g_exec_ctx.heap_start : g_exec_ctx.exec_rw_end;
+        uint64_t brk_end = (g_exec_ctx.brk_current > 0)
+                         ? g_exec_ctx.brk_current
+                         : g_exec_ctx.exec_rw_end;
+        if (brk_end < g_exec_ctx.exec_rw_end) brk_end = g_exec_ctx.exec_rw_end;
+        uint64_t save_end = brk_end;
         if (save_start > 0 && save_end > save_start) {
             riscv::PageAttributes attr;
             attr.read = true; attr.write = true; attr.exec = true;
@@ -1000,6 +1236,9 @@ static void sys_clone3(Machine& m) {
     g_fork.parent_open_fds = get_fs(m).get_open_fds();
     static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
+    g_fork.saved_mmap_address = m.memory.mmap_address();
+    g_fork_saved_exec_ctx = g_exec_ctx;
+    g_fork_has_exec_ctx = true;
 
     g_fork.in_child = true;
     g_fork.child_reaped = false;
@@ -1008,14 +1247,18 @@ static void sys_clone3(Machine& m) {
     if (stack != 0 && stack_size != 0) {
         m.cpu.reg(riscv::REG_SP) = stack + stack_size;
     }
+    g_process_model.set_current(g_fork.child_pid);
 
     m.set_result(0);
 }
 
 // wait4 — return status of the cooperatively-forked child.
-// In our model the child has always already exited by the time
-// the parent resumes, so this never blocks.
+// Phase 0/1: parent is resumed only after child exit, so this path does not
+// block yet; true wait/wakeup is implemented in later phases.
 static void sys_wait4(Machine& m) {
+    const auto options = m.template sysarg<int>(2);
+    auto* child = g_process_model.find(g_fork.child_pid);
+    constexpr int WAIT4_WNOHANG = 1;
     // After the first reap, return ECHILD (no more children).
     // This prevents infinite loops in shells that call waitpid
     // until all children are reaped.
@@ -1023,13 +1266,35 @@ static void sys_wait4(Machine& m) {
         m.set_result(-10);  // -ECHILD
         return;
     }
+    child = g_process_model.find(g_fork.child_pid);
+    if (!child || child->state == ProcessState::Reaped) {
+        g_fork.child_reaped = true;
+        m.set_result(-10);  // -ECHILD
+        return;
+    }
+    if (child->state == ProcessState::Running) {
+        if (options & WAIT4_WNOHANG) {
+            m.set_result(0);
+            return;
+        }
+        m.set_result(-11);  // -EAGAIN (temporary until phase2 waiter wakeup)
+        return;
+    }
 
     auto wstatus_addr = m.sysarg(1);
     if (wstatus_addr != 0) {
         // Encode in wait status format: WEXITSTATUS = (status & 0xff) << 8
-        int32_t wstatus = (g_fork.exit_status & 0xff) << 8;
+        int32_t wstatus = (child->exit_status & 0xff) << 8;
         m.memory.template write<int32_t>(wstatus_addr, wstatus);
     }
+    g_process_model.push_event(
+        ProcessEventKind::WaitWakeup,
+        g_fork.child_pid,
+        g_fork.parent_pid,
+        g_fork.child_pgid,
+        child->exit_status);
+    g_process_model.mark_reaped(g_fork.child_pid, child->exit_status);
+    g_fork.exit_status = child->exit_status;
     g_fork.child_reaped = true;
     m.set_result(g_fork.child_pid);
 }
@@ -1480,16 +1745,18 @@ static void sys_openat(Machine& m) {
     int dirfd = m.template sysarg<int>(0);
     auto path_addr = m.sysarg(1);
     int flags = m.template sysarg<int>(2);
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
 
     std::string path;
     try {
         path = m.memory.memstring(path_addr);
     } catch (...) {
         m.set_result(err::INVAL);
+        return;
+    }
+    // Linux: for absolute paths, dirfd is ignored.
+    // We only reject non-AT_FDCWD for relative paths (not yet implemented).
+    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
+        m.set_result(err::NOTSUP);
         return;
     }
 
@@ -1512,7 +1779,99 @@ static void sys_openat(Machine& m) {
 #endif
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
+    if (fd > 2) {
+        for (int sfd = 0; sfd < 3; sfd++) {
+            if (!g_stdio_open[sfd]) {
+                int remap = fs.dup2(fd, sfd);
+                if (remap >= 0) {
+                    fs.close(fd);
+                    fd = sfd;
+                    g_stdio_open[sfd] = true;
+                }
+                break;
+            }
+        }
+    }
     // Track /dev/tty and /dev/pts/* opens as tty fds for ioctl
+    if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
+                    || path.rfind("/dev/pts/", 0) == 0)) {
+        g_tty_fds.insert(fd);
+    }
+    if (fd >= 0) {
+        g_fd_cloexec_flags[fd] = (flags & O_CLOEXEC) ? 1 : 0;
+        g_fd_status_flags[fd] = flags;
+    }
+    m.set_result(fd);
+}
+
+static void sys_openat2(Machine& m) {
+    auto& fs = get_fs(m);
+    int dirfd = m.template sysarg<int>(0);
+    auto path_addr = m.sysarg(1);
+    auto how_addr = m.sysarg(2);
+    auto size = m.sysarg(3);
+
+    std::string path;
+    try {
+        path = m.memory.memstring(path_addr);
+    } catch (...) {
+        m.set_result(err::INVAL);
+        return;
+    }
+
+    // struct open_how starts with flags (u64), mode (u64), resolve (u64)
+    // We currently only honor flags.
+    if (size < 8) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    uint64_t flags64 = 0;
+    try {
+        flags64 = m.memory.template read<uint64_t>(how_addr);
+    } catch (...) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    int flags = static_cast<int>(flags64);
+
+    // Linux: for absolute paths, dirfd is ignored.
+    // We only reject non-AT_FDCWD for relative paths (not yet implemented).
+    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    // Virtual device files: create synthetic VFS entries on demand via open+O_CREAT
+    if ((path == "/dev/urandom" || path == "/dev/random" || path == "/dev/null")
+        && !fs.resolve(path)) {
+        fs.open(path, 0100 /* O_CREAT */);  // creates empty file via VFS open path
+    }
+
+    // Intercept /mnt/host access for local folder sharing
+#ifdef __EMSCRIPTEN__
+    if (path.size() >= 10 && path.compare(0, 10, "/mnt/host/") == 0) {
+        std::string vh_path = path;
+        if (flags & O_DIRECTORY) vh_path += "/";
+        long vh_fd = js_opfs_io(0, (void*)vh_path.c_str(), flags, 600, 0);
+        m.set_result(vh_fd);
+        return;
+    }
+#endif
+
+    int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
+    if (fd > 2) {
+        for (int sfd = 0; sfd < 3; sfd++) {
+            if (!g_stdio_open[sfd]) {
+                int remap = fs.dup2(fd, sfd);
+                if (remap >= 0) {
+                    fs.close(fd);
+                    fd = sfd;
+                    g_stdio_open[sfd] = true;
+                }
+                break;
+            }
+        }
+    }
     if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
                     || path.rfind("/dev/pts/", 0) == 0)) {
         g_tty_fds.insert(fd);
@@ -1530,6 +1889,7 @@ static void sys_close(Machine& m) {
         fprintf(stderr, "[TRACE] close(fd=%d) pc=0x%lx\n", fd, (long)m.cpu.pc());
     // Remove from tty tracking (but never remove 0/1/2)
     if (fd > 2) g_tty_fds.erase(fd);
+    if (fd >= 0 && fd <= 2) g_stdio_open[fd] = false;
     g_fd_cloexec_flags.erase(fd);
     g_fd_status_flags.erase(fd);
     // Clean up epoll/eventfd state
@@ -2008,16 +2368,16 @@ static void sys_newfstatat(Machine& m) {
         return;
     }
 
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string path;
     try {
         path = m.memory.memstring(path_addr);
     } catch (...) {
         m.set_result(err::INVAL);
+        return;
+    }
+    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
+    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
+        m.set_result(err::NOTSUP);
         return;
     }
 
@@ -2105,16 +2465,16 @@ static void sys_readlinkat(Machine& m) {
     auto buf_addr = m.sysarg(2);
     size_t bufsiz = m.sysarg(3);
 
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string path;
     try {
         path = m.memory.memstring(path_addr);
     } catch (...) {
         m.set_result(err::INVAL);
+        return;
+    }
+    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
+    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
+        m.set_result(err::NOTSUP);
         return;
     }
 
@@ -2156,11 +2516,6 @@ static void sys_faccessat(Machine& m) {
     auto& fs = get_fs(m);
     int dirfd = m.template sysarg<int>(0);
 
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string path;
     try {
         path = m.memory.memstring(m.sysarg(1));
@@ -2168,17 +2523,26 @@ static void sys_faccessat(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
+    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
+    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
 
     vfs::Entry entry;
-    m.set_result(fs.stat(path, entry) ? 0 : err::NOENT);
+    const int rc = fs.stat(path, entry) ? 0 : err::NOENT;
+    m.set_result(rc);
 }
 
 static void sys_getpid(Machine& m) {
+    g_process_model.set_current(g_process_model.current_pid);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] getpid() => 1 pc=0x%lx\n", (long)m.cpu.pc());
-    m.set_result(1);
+        fprintf(stderr, "[TRACE] getpid() => %d pc=0x%lx\n", (int)g_process_model.current_pid, (long)m.cpu.pc());
+    m.set_result(g_process_model.current_pid);
 }
-static void sys_getppid(Machine& m) { m.set_result(0); }
+static void sys_getppid(Machine& m) {
+    m.set_result(g_process_model.current_ppid);
+}
 static void sys_gettid(Machine& m) {
     int tid;
     if (g_sched.count > 0) {
@@ -2635,7 +2999,10 @@ static void sys_getrlimit(Machine& m) {
         m.memory.template write<uint64_t>(rlim_addr, cur);
         m.memory.template write<uint64_t>(rlim_addr + 8, max);
     }
-    fprintf(stderr, "[getrlimit] resource=%u => cur=%lu max=%lu\n", resource, cur, max);
+    fprintf(stderr, "[getrlimit] resource=%u => cur=%llu max=%llu\n",
+            resource,
+            (unsigned long long)cur,
+            (unsigned long long)max);
     m.set_result(0);
 }
 static void sys_rseq(Machine& m) { m.set_result(err::NOSYS); }
@@ -2915,6 +3282,7 @@ static void sys_dup3(Machine& m) {
     auto& fs = get_fs(m);
     int oldfd = m.template sysarg<int>(0);
     int newfd = m.template sysarg<int>(1);
+    int flags = m.template sysarg<int>(2);
     if (oldfd == newfd) {
         m.set_result(err::INVAL);
         return;
@@ -2927,6 +3295,7 @@ static void sys_dup3(Machine& m) {
         else if (newfd > 2)
             g_tty_fds.erase(newfd);  // dup'd non-tty over a tty fd
         g_fd_cloexec_flags[newfd] = 0;  // dup2() clears FD_CLOEXEC on target fd
+        if (newfd >= 0 && newfd <= 2) g_stdio_open[newfd] = true;
         g_fd_status_flags[newfd] = g_fd_status_flags.count(oldfd) ? g_fd_status_flags[oldfd]
                                                                    : ((oldfd == 0) ? O_RDONLY : ((oldfd == 1 || oldfd == 2) ? O_WRONLY : O_RDWR));
     }
@@ -3807,16 +4176,16 @@ static void sys_statx(Machine& m) {
     // uint32_t mask = m.template sysarg<uint32_t>(3);  // unused — we fill all
     auto buf_addr = m.sysarg(4);
 
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string path;
     try {
         path = m.memory.memstring(path_addr);
     } catch (...) {
         m.set_result(err::INVAL);
+        return;
+    }
+    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
+    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
+        m.set_result(err::NOTSUP);
         return;
     }
 
@@ -4116,11 +4485,6 @@ static void sys_faccessat2(Machine& m) {
     // int mode = m.template sysarg<int>(2);
     // int flags = m.template sysarg<int>(3);  // AT_SYMLINK_NOFOLLOW etc.
 
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string path;
     try {
         path = m.memory.memstring(path_addr);
@@ -4128,9 +4492,15 @@ static void sys_faccessat2(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
+    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
+    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
 
     auto entry = fs.resolve(path);
-    m.set_result(entry ? 0 : err::NOENT);
+    const int rc = entry ? 0 : err::NOENT;
+    m.set_result(rc);
 }
 
 // recvmsg — scatter-gather socket receive (needed by node HTTP)
@@ -4564,6 +4934,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::exit, sys_exit);
     machine.install_syscall_handler(nr::exit_group, sys_exit_group);
     machine.install_syscall_handler(nr::openat, sys_openat);
+    machine.install_syscall_handler(nr::openat2, sys_openat2);
     machine.install_syscall_handler(nr::close, sys_close);
     machine.install_syscall_handler(nr::read, sys_read);
     machine.install_syscall_handler(nr::write, sys_write);

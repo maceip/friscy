@@ -192,7 +192,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response" "_friscy_drain_process_events" "_friscy_get_last_fault_kind" "_friscy_get_last_fault_pc" "_friscy_get_last_fault_data" "_friscy_clear_last_fault")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
@@ -234,6 +234,7 @@ if(EMSCRIPTEN)
     # Only js_opfs_io, js_net_proxy, js_dns_resolve are async (on JSPI_IMPORTS).
     # js_compute_offload and js_gettime_ms are synchronous — no JSPI overhead.
     list(APPEND FRISCY_LINK_FLAGS
+        --pre-js ${CMAKE_CURRENT_SOURCE_DIR}/emscripten-pre.js
         --js-library ${CMAKE_CURRENT_SOURCE_DIR}/library_vectorheart.js
         -sJSPI=1                        # WebAssembly JS Promise Integration
         -sJSPI_IMPORTS=['js_opfs_io','js_net_proxy','js_dns_resolve']

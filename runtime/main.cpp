@@ -71,6 +71,15 @@ static Machine* g_machine = nullptr;
 static std::vector<uint8_t> g_last_checkpoint_export;
 #endif
 
+enum : uint32_t {
+    FRISCY_FAULT_NONE = 0,
+    FRISCY_FAULT_MACHINE_EXCEPTION = 1,
+    FRISCY_FAULT_EBREAK = 2,
+};
+static uint32_t g_last_fault_kind = FRISCY_FAULT_NONE;
+static uint32_t g_last_fault_pc = 0;
+static uint32_t g_last_fault_data = 0;
+
 extern "C" {
 // Returns 1 if machine is stopped waiting for stdin, 0 otherwise.
 // Uses g_waiting_for_stdin flag (set by syscall handlers) to distinguish
@@ -79,12 +88,28 @@ EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
     return (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch) ? 1 : 0;
 }
 
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_fault_kind() {
+    return g_last_fault_kind;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_fault_pc() {
+    return g_last_fault_pc;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_fault_data() {
+    return g_last_fault_data;
+}
+EMSCRIPTEN_KEEPALIVE void friscy_clear_last_fault() {
+    g_last_fault_kind = FRISCY_FAULT_NONE;
+    g_last_fault_pc = 0;
+    g_last_fault_data = 0;
+}
+
 // Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
 // Handles page protection faults by making the faulting page writable and
 // retrying. This acts as a simple page fault handler for pages at the
 // boundary between read-only code and writable data segments.
 EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     if (!g_machine) return 0;
+    friscy_clear_last_fault();
     syscalls::g_waiting_for_stdin = false;
     syscalls::g_waiting_for_host_fetch = false;
     static constexpr uint64_t YIELD_CHUNK = 2'000'000;
@@ -115,12 +140,20 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
         } catch (const riscv::MachineException& e) {
             std::cerr << "[trace] resume-machine-exception-catch\n";
             uint64_t fault_addr = e.data();
+            g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
+            g_last_fault_pc = (uint32_t)g_machine->cpu.pc();
+            g_last_fault_data = (uint32_t)fault_addr;
             std::cerr << "[resume] MachineException: " << e.what()
                       << " data=0x" << std::hex << fault_addr
                       << " pc=0x" << g_machine->cpu.pc() << std::dec << "\n";
             // EBREAK from abort()/__stack_chk_fail: skip by returning from
             // the current function (set PC = RA). Common after fork child cleanup.
             if (std::string(e.what()).find("EBREAK") != std::string::npos) {
+                g_last_fault_kind = FRISCY_FAULT_EBREAK;
+                if (friscy_stopped()) {
+                    std::cerr << "[resume] EBREAK after stop: treating as completed run\n";
+                    return 0;
+                }
                 uint64_t ra = g_machine->cpu.reg(1);
                 std::cerr << "[resume] EBREAK: branch-entered, PC=0x"
                           << std::hex << g_machine->cpu.pc()
@@ -140,6 +173,9 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 attr.write = true;
                 attr.exec = true;
                 g_machine->memory.set_page_attr(page, 4096, attr);
+                g_last_fault_kind = FRISCY_FAULT_NONE;
+                g_last_fault_pc = 0;
+                g_last_fault_data = 0;
                 continue;  // retry
             }
             // Give up — report to terminal
@@ -192,6 +228,11 @@ EMSCRIPTEN_KEEPALIVE int friscy_get_fetch_request_len() {
 EMSCRIPTEN_KEEPALIVE void friscy_set_fetch_response(const char* data, int len) {
     syscalls::g_host_fetch_response.assign(data, len);
     syscalls::g_host_fetch_response_ready = true;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_drain_process_events(uint32_t out_ptr, uint32_t max_events) {
+    auto* out = reinterpret_cast<syscalls::ProcessEvent*>((uintptr_t)out_ptr);
+    return syscalls::g_process_model.drain_events(out, max_events);
 }
 }
 #endif
@@ -975,6 +1016,9 @@ int main(int argc, char** argv) {
         machine.setup_native_heap(HEAP_SYSCALLS_BASE, heap_area, 64ULL << 20);
         syscalls::g_exec_ctx.heap_start = heap_area;
         syscalls::g_exec_ctx.heap_size = 64ULL << 20;
+        syscalls::g_exec_ctx.brk_base = machine.memory.heap_address();
+        syscalls::g_exec_ctx.brk_current = syscalls::g_exec_ctx.brk_base;
+        syscalls::g_exec_ctx.brk_overridden = false;
         std::cout << "[friscy] Heap area: 0x" << std::hex << heap_area << std::dec
                   << " (" << (64ULL << 20) / (1024*1024) << "MB)\n";
         machine.setup_native_memory(MEMORY_SYSCALLS_BASE);
@@ -1390,6 +1434,9 @@ int main(int argc, char** argv) {
                 std::cerr << "[trace] inner-machine-exception-catch\n";
                 uint64_t fault_addr = e.data();
                 uint64_t crash_pc = machine.cpu.pc();
+                g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
+                g_last_fault_pc = (uint32_t)crash_pc;
+                g_last_fault_data = (uint32_t)fault_addr;
                 std::cerr << "[friscy] MachineException: " << e.what()
                           << " data=0x" << std::hex << fault_addr
                           << " pc=0x" << crash_pc << std::dec
@@ -1406,6 +1453,11 @@ int main(int argc, char** argv) {
                 // the current function (set PC = RA). This is safe in single-threaded
                 // emulation where futex force-unlock may trigger false positives.
                 if (std::string(e.what()).find("EBREAK") != std::string::npos) {
+                    g_last_fault_kind = FRISCY_FAULT_EBREAK;
+                    if (machine.stopped()) {
+                        std::cerr << "[friscy] EBREAK after stop: treating as graceful completion\n";
+                        break;
+                    }
                     uint64_t ra = machine.cpu.reg(1);  // x1 = return address
                     std::cerr << "[friscy] EBREAK (abort): branch-entered, PC=0x"
                               << std::hex << machine.cpu.pc()
@@ -1424,6 +1476,9 @@ int main(int argc, char** argv) {
                     attr.write = true;
                     attr.exec = true;
                     machine.memory.set_page_attr(page, 4096, attr);
+                    g_last_fault_kind = FRISCY_FAULT_NONE;
+                    g_last_fault_pc = 0;
+                    g_last_fault_data = 0;
                     continue;
                 }
 #ifdef __EMSCRIPTEN__

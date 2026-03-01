@@ -65,12 +65,6 @@ static std::vector<uint8_t> load_from_vfs(const std::string& path);
 static void setup_virtual_files();
 
 // Global machine pointer for JS interop (stdin resume loop)
-#ifdef __EMSCRIPTEN__
-static Machine* g_machine = nullptr;
-#ifdef __EMSCRIPTEN__
-static std::vector<uint8_t> g_last_checkpoint_export;
-#endif
-
 enum : uint32_t {
     FRISCY_FAULT_NONE = 0,
     FRISCY_FAULT_MACHINE_EXCEPTION = 1,
@@ -79,6 +73,12 @@ enum : uint32_t {
 static uint32_t g_last_fault_kind = FRISCY_FAULT_NONE;
 static uint32_t g_last_fault_pc = 0;
 static uint32_t g_last_fault_data = 0;
+
+#ifdef __EMSCRIPTEN__
+static Machine* g_machine = nullptr;
+#ifdef __EMSCRIPTEN__
+static std::vector<uint8_t> g_last_checkpoint_export;
+#endif
 
 extern "C" {
 // Returns 1 if machine is stopped waiting for stdin, 0 otherwise.

@@ -427,3 +427,32 @@
 - Added host-fetch URL redaction in worker logs to prevent API key leakage:
   - `docs_site/worker.js`
   - `friscy-bundle/worker.js`
+
+## 2026-03-02T17:43:38Z Gemini Bash/Fork contract reset
+- Added canonical runbook draft for gemini-only path.
+- Scope narrowed to one path: browser boot -> bash version gate -> prompt gate -> checkpoint resume rerun.
+- This entry is superseded by the unified runbook entry below.
+## 2026-03-02T17:44:56Z Unified CLI runbook contract
+- Added single contract runbook: docs/BASH_EXEC_CLI_RUNBOOK.md
+- Deprecated per-app runbook in favor of one source of truth.
+- Contract covers bash+fork/exec+checkpoint for claude/gemini/codex.
+
+## 2026-03-02T20:26:00Z Codex minimal ladder recovery (fresh + checkpoint resume)
+- Scope: unblock Codex gates `bash -lc 'codex --version'`, marker prompt command, checkpoint export, resume, rerun.
+- Found root causes:
+  - `docs_site/codex-version-post.ckpt` incompatible with current runtime: `checkpoint: unsupported version 3`.
+  - `requestLiveCheckpointExport()` in `docs_site/claude-demo.html` used worker postMessage path that can deadlock while worker is blocked in `Atomics.wait` in resume loop.
+  - Live checkpoint export returned empty payload due double-copy memory pressure in `friscy_save_live_checkpoint`.
+- Fixes applied:
+  - `docs_site/claude-demo.html`: switched live export trigger to SAB command (`CMD_EXPORT_CHECKPOINT=9`) and worker event wait.
+  - `runtime/main.cpp`: changed `friscy_save_live_checkpoint` to return pointer to persistent static buffer (`g_live_checkpoint_export`) instead of allocating a second large copy.
+  - `docs_site/worker.js` and `friscy-bundle/worker.js`: avoid freeing live-checkpoint pointer when provider is `_friscy_save_live_checkpoint`.
+  - Rebuilt wasm (`build-wasm/friscy.{js,wasm}`) and copied updated artifacts into `docs_site/` and `friscy-bundle/`.
+  - Added focused harnesses: `tools/codex_ladder_minimal.mjs`, `tools/codex_resume_probe.cjs`.
+- Evidence:
+  - Live export probe succeeded: `tmp-diag.ckpt` uploaded (`86659196` bytes).
+  - Minimal ladder run succeeded end-to-end:
+    - fresh version gate: PASS (`codex fast-path`)
+    - prompt marker gate: PASS (`MARK_CODEX_OK`)
+    - checkpoint export: PASS (`docs_site/codex-min-post-marker.ckpt`, `86921404` bytes)
+    - resume + rerun version gate: PASS (`codex fast-path`)

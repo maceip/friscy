@@ -461,7 +461,7 @@ async function runResumeLoop() {
                 }
                 const ptr = dataPtr >>> 0;
                 const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
-                emModule._free(ptr);
+                if (liveExport !== emModule._friscy_save_live_checkpoint) emModule._free(ptr);
                 clearLiveExportPending();
                 self.postMessage({
                     type: 'checkpoint-exported-live',
@@ -1145,7 +1145,7 @@ self.onmessage = async function(e) {
             }
             const ptr = dataPtr >>> 0;
             const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
-            emModule._free(ptr);
+            if (liveExport !== emModule._friscy_save_live_checkpoint) emModule._free(ptr);
             self.postMessage({
                 type: 'checkpoint-exported-live',
                 data: copy,

@@ -114,12 +114,18 @@
     </div>
 
     <script>
-        if ('serviceWorker' in navigator) {
+        const __swParams = new URLSearchParams(location.search);
+        const __disableSW = __swParams.has('nosw') || __swParams.get('nosw') === '1' || __swParams.has('procdebug');
+        if ('serviceWorker' in navigator && !__disableSW) {
             navigator.serviceWorker.register('./service-worker.js').then(reg => {
                 if (!crossOriginIsolated && reg.active) {
                     location.reload();
                 }
             }).catch(e => console.error('SW failed:', e));
+        } else if ('serviceWorker' in navigator && __disableSW) {
+            navigator.serviceWorker.getRegistrations().then((regs) => {
+                for (const reg of regs) reg.unregister();
+            }).catch(() => {});
         }
     </script>
 
@@ -226,6 +232,7 @@
         const CMD_STDIN_REQUEST = 2;
         const CMD_STDIN_READY = 3;
         const CMD_EXIT = 4;
+        const CMD_EXPORT_CHECKPOINT = 9;
 
         let worker = null;
         let controlSab, stdoutSab, netSab;
@@ -250,7 +257,7 @@
             for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
             for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
             const envVars = [...envMap.values()].map(e =>
-                e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + userApiKey : e
+                ((e.startsWith('ANTHROPIC_API_KEY=') || e.startsWith('GEMINI_API_KEY=') || e.startsWith('GOOGLE_API_KEY=') || e.startsWith('OPENAI_API_KEY=')) ? (e.split('=')[0] + '=' + userApiKey) : e)
             );
             const envArgs = envVars.flatMap(e => ['--env', e]);
             const args = [...envArgs, '--rootfs', '/rootfs.tar', ...(example.entrypoint || ['/bin/sh'])];
@@ -308,24 +315,40 @@
             for (const b of bytes) stdinQueue.push(b);
             checkStdinRequest();
         }
-
         function requestLiveCheckpointExport() {
             return new Promise((resolve, reject) => {
-                if (!worker) {
-                    reject(new Error('Worker not initialized'));
+                if (!worker || !controlView) {
+                    reject(new Error('Worker/control SAB not initialized'));
                     return;
                 }
+                const timeout = setTimeout(() => {
+                    cleanup();
+                    reject(new Error('Live checkpoint export timed out'));
+                }, 300000);
                 const onMsg = (e) => {
                     if (e.data?.type === 'checkpoint-exported-live') {
-                        worker.removeEventListener('message', onMsg);
+                        clearTimeout(timeout);
+                        cleanup();
                         resolve(e.data);
                     } else if (e.data?.type === 'checkpoint-export-error') {
-                        worker.removeEventListener('message', onMsg);
+                        clearTimeout(timeout);
+                        cleanup();
                         reject(new Error(e.data.message || 'Live checkpoint export failed'));
                     }
                 };
+                const onErr = (e) => {
+                    clearTimeout(timeout);
+                    cleanup();
+                    reject(new Error(e.message || 'Worker error during live checkpoint export'));
+                };
+                const cleanup = () => {
+                    worker.removeEventListener('message', onMsg);
+                    worker.removeEventListener('error', onErr);
+                };
                 worker.addEventListener('message', onMsg);
-                worker.postMessage({ type: 'export-checkpoint-live' });
+                worker.addEventListener('error', onErr);
+                Atomics.store(controlView, 0, CMD_EXPORT_CHECKPOINT);
+                Atomics.notify(controlView, 0);
             });
         }
 
@@ -408,7 +431,7 @@
                 worker.onerror = (e) => reject(new Error('Worker failed: ' + (e.message || 'unknown')));
                 setTimeout(() => reject('Worker timeout (30s)'), 30000);
             });
-            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab, allowNetwork: true });
             await workerReady;
 
             // Build args for /bin/sh -i (merge manifest + example env)
@@ -420,7 +443,7 @@
             for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
             for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
             const envVars = [...envMap.values()].map(e =>
-                e.startsWith('ANTHROPIC_API_KEY=') ? 'ANTHROPIC_API_KEY=' + apiKey : e
+                ((e.startsWith('ANTHROPIC_API_KEY=') || e.startsWith('GEMINI_API_KEY=') || e.startsWith('GOOGLE_API_KEY=') || e.startsWith('OPENAI_API_KEY=')) ? (e.split('=')[0] + '=' + apiKey) : e)
             );
             const envArgs = envVars.flatMap(e => ['--env', e]);
             const args = [...envArgs, '--rootfs', '/rootfs.tar', '/bin/sh', '-i'];
@@ -1020,7 +1043,7 @@
                 worker.onerror = (e) => reject(new Error('Worker failed: ' + (e.message || 'unknown')));
                 setTimeout(() => reject('Worker timeout (30s)'), 30000);
             });
-            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab });
+            worker.postMessage({ type: 'init', controlSab, stdoutSab, netSab, allowNetwork: true });
             await workerReady;
 
             // Network bridge (same auto-detection as index.html)
@@ -1093,6 +1116,15 @@
                 const { data } = await requestLiveCheckpointExport();
                 downloadCheckpointBlob(data, filename);
                 return { ok: true, bytes: data?.byteLength || 0 };
+            },
+            exportLiveCheckpointUpload: async (filename = 'claude-live.ckpt') => {
+                const { data } = await requestLiveCheckpointExport();
+                const res = await fetch('/__upload_checkpoint/' + encodeURIComponent(filename), {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/octet-stream' },
+                    body: data,
+                });
+                return { ok: res.ok, status: res.status, result: await res.json() };
             },
         };
 

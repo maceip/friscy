@@ -192,7 +192,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response" "_friscy_drain_process_events" "_friscy_get_last_fault_kind" "_friscy_get_last_fault_pc" "_friscy_get_last_fault_data" "_friscy_clear_last_fault")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response" "_friscy_drain_process_events" "_friscy_get_last_fault_kind" "_friscy_get_last_fault_pc" "_friscy_get_last_fault_data" "_friscy_clear_last_fault" "_friscy_stop_reason" "_friscy_notify_child_exit")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)

@@ -86,7 +86,7 @@ extern "C" {
 // Uses g_waiting_for_stdin flag (set by syscall handlers) to distinguish
 // stdin-wait from program exit (both call machine.stop()).
 EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
-    return (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch) ? 1 : 0;
+    return (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch || syscalls::g_waiting_for_child) ? 1 : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_fault_kind() {
@@ -121,6 +121,7 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 g_machine->resume<false>(YIELD_CHUNK);
                 if (syscalls::g_waiting_for_stdin) break;
                 if (syscalls::g_waiting_for_host_fetch) break;
+                if (syscalls::g_waiting_for_child) break;
                 if (syscalls::g_execve_restart) break;
                 if (!g_machine->instruction_limit_reached()) break;
                 // No yield needed — Worker thread doesn't block UI
@@ -234,6 +235,27 @@ EMSCRIPTEN_KEEPALIVE void friscy_set_fetch_response(const char* data, int len) {
 EMSCRIPTEN_KEEPALIVE uint32_t friscy_drain_process_events(uint32_t out_ptr, uint32_t max_events) {
     auto* out = reinterpret_cast<syscalls::ProcessEvent*>((uintptr_t)out_ptr);
     return syscalls::g_process_model.drain_events(out, max_events);
+}
+
+// Phase 2: stop-reason bitmask for worker.js yield dispatch
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_stop_reason() {
+    uint32_t mask = syscalls::STOP_REASON_NONE;
+    if (syscalls::g_waiting_for_stdin)      mask |= syscalls::STOP_REASON_STDIN;
+    if (syscalls::g_waiting_for_host_fetch) mask |= syscalls::STOP_REASON_HOST_FETCH;
+    if (syscalls::g_waiting_for_child)      mask |= syscalls::STOP_REASON_WAIT_CHILD;
+    return mask;
+}
+
+// Phase 2: host delivers child exit notification to unblock wait4
+EMSCRIPTEN_KEEPALIVE void friscy_notify_child_exit(int32_t pid, int32_t status) {
+    if (pid > 0) {
+        syscalls::g_process_model.mark_exited(pid, status);
+    }
+    // Clear wait-blocked flag: either matching pid or unconditional if pid==0
+    if (pid == 0 || syscalls::g_wait_blocked_pid == pid) {
+        syscalls::g_waiting_for_child = false;
+        syscalls::g_wait_blocked_pid = 0;
+    }
 }
 }
 #endif
@@ -1269,6 +1291,7 @@ int main(int argc, char** argv) {
                     machine.resume<false>(YIELD_CHUNK);
                     if (syscalls::g_waiting_for_stdin) break;
                     if (syscalls::g_waiting_for_host_fetch) break;
+                    if (syscalls::g_waiting_for_child) break;
                     if (syscalls::g_execve_restart) break;
                     if (!machine.instruction_limit_reached()) break;
                     // No yield needed — Worker thread doesn't block UI

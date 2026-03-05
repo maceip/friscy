@@ -52,6 +52,28 @@ inline std::string g_host_fetch_response;
 // The dispatch loop must re-enter simulate() with the new binary.
 inline bool g_execve_restart = false;
 
+// ============================================================================
+// Phase 2: wait/yield/resume for child processes
+// ============================================================================
+// When parent calls wait4() and child hasn't exited yet, the machine yields
+// back to the host JS (m.stop()) with g_waiting_for_child=true.  The host
+// detects this via friscy_stop_reason() bitmask and can either:
+//   a) let the vfork child run to completion then resume (single-worker), or
+//   b) (Phase 3) resume a child worker, wait for its Exit event, then resume.
+// When the child exits, host calls friscy_notify_child_exit(pid, status) which
+// populates g_child_exit_delivered, then resumes the machine.  The rewound
+// wait4 syscall re-executes and finds the child Exited → returns normally.
+inline bool g_waiting_for_child = false;
+inline pid_t g_wait_blocked_pid = 0;
+
+// Stop-reason bitmask — returned by friscy_stop_reason() export.
+// Worker.js inspects this to decide how to handle each yield.
+static constexpr uint32_t STOP_REASON_NONE       = 0;
+static constexpr uint32_t STOP_REASON_STDIN       = 1u << 0;
+static constexpr uint32_t STOP_REASON_HOST_FETCH  = 1u << 1;
+static constexpr uint32_t STOP_REASON_TIMESLICE   = 1u << 2;
+static constexpr uint32_t STOP_REASON_WAIT_CHILD  = 1u << 3;
+
 // Syscall tracing (disabled by default to reduce log noise)
 inline constexpr bool g_trace_syscalls = false;
 inline int g_trace_countdown = 800;
@@ -90,6 +112,7 @@ enum class ProcessEventKind : uint32_t {
     Spawn = 1,
     Exit = 2,
     WaitWakeup = 3,
+    WaitBlocked = 4,  // Phase 2: parent yielded on wait4, child still running
 };
 
 struct ProcessEvent {
@@ -146,7 +169,10 @@ struct ProcessModel {
 
     pid_t allocate_pid() {
         init();
-        if (count >= (int)MAX_PROCS) return -1;
+        if (count >= (int)MAX_PROCS) {
+            gc_reaped();
+            if (count >= (int)MAX_PROCS) return -1;
+        }
         return next_pid++;
     }
 
@@ -165,6 +191,27 @@ struct ProcessModel {
             }
         }
         return false;
+    }
+
+    // Find any waitable child of parent: exited first, then running.
+    // wait_pid: -1 = any child, >0 = specific pid.
+    ProcessInfo* find_waitable_child(pid_t ppid, pid_t wait_pid) {
+        init();
+        // First pass: exited children (prefer these for immediate reap)
+        for (int i = 0; i < count; i++) {
+            if (table[i].ppid == ppid && table[i].state == ProcessState::Exited) {
+                if (wait_pid <= 0 || table[i].pid == wait_pid)
+                    return &table[i];
+            }
+        }
+        // Second pass: running children (caller will block or WNOHANG)
+        for (int i = 0; i < count; i++) {
+            if (table[i].ppid == ppid && table[i].state == ProcessState::Running) {
+                if (wait_pid <= 0 || table[i].pid == wait_pid)
+                    return &table[i];
+            }
+        }
+        return nullptr;
     }
 
     pid_t spawn_child(pid_t ppid, pid_t pgid) {
@@ -238,6 +285,26 @@ struct ProcessModel {
 
     int pending_events() const {
         return event_count;
+    }
+
+    // Garbage-collect reaped process slots so the table doesn't fill up.
+    // Called from allocate_pid when the table is full.
+    void gc_reaped() {
+        int dst = 0;
+        for (int i = 0; i < count; i++) {
+            if (table[i].state != ProcessState::Reaped) {
+                if (dst != i) table[dst] = table[i];
+                dst++;
+            }
+        }
+        count = dst;
+    }
+
+    // Check whether a pid exists and is not Reaped (for kill() validation).
+    bool pid_exists(pid_t pid) {
+        init();
+        auto* p = find(pid);
+        return p && p->state != ProcessState::Reaped;
     }
 };
 
@@ -522,6 +589,7 @@ namespace nr {
     constexpr int pread64       = 67;
     constexpr int pwrite64      = 68;
     constexpr int sendfile      = 71;
+    constexpr int pselect6      = 72;
     constexpr int ppoll         = 73;
     constexpr int readlinkat    = 78;
     constexpr int newfstatat    = 79;
@@ -898,14 +966,9 @@ static void sys_clone(Machine& m) {
             return;
         }
 
-        g_fork.parent_pid = parent_pid;
-        g_fork.parent_pgid = parent_pgid;
-        g_fork.child_pid = child_pid;
-        g_fork.child_pgid = child_pid;
-        g_fork.exit_status = 0;
-        g_fork.child_reaped = false;
-        g_fork.in_child = false;
-
+        // SIGCHLD fast-path: register in process table only.
+        // Do NOT touch g_fork — this is a fake instantly-dead child
+        // (e.g. Node child_process compatibility), not a real vfork.
         g_process_model.push_event(ProcessEventKind::Spawn, child_pid, parent_pid, child_pid, 0);
         g_process_model.mark_exited(child_pid, 0);
         g_process_model.push_event(ProcessEventKind::Exit, child_pid, parent_pid, child_pid, 0);
@@ -1299,57 +1362,69 @@ static void sys_clone3(Machine& m) {
     m.set_result(0);
 }
 
-// wait4 — return status of the cooperatively-forked child.
-// Phase 0/1: parent is resumed only after child exit, so this path does not
-// block yet; true wait/wakeup is implemented in later phases.
+// wait4 — Phase 2: yield-to-host when child is still running.
+//
+// Behavior matches Linux semantics:
+//   - WNOHANG + child running → return 0
+//   - child exited → write wstatus, reap, return child pid
+//   - no children → return -ECHILD
+//   - child running (blocking) → rewind PC, yield to host via m.stop()
+//
+// The host JS resume loop sees STOP_REASON_WAIT_CHILD and either:
+//   a) runs the vfork child to completion then resumes, or
+//   b) (Phase 3) waits for Exit event from child worker then resumes.
+// On resume the ecall re-executes, finds the child Exited, and returns.
 static void sys_wait4(Machine& m) {
+    const auto wait_pid = m.template sysarg<int>(0);
     const auto options = m.template sysarg<int>(2);
-    auto* child = g_process_model.find(g_fork.child_pid);
     constexpr int WAIT4_WNOHANG = 1;
-    static int wait4_dbg = 0;
-    if (++wait4_dbg <= 200) {
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[wait4] pid_arg=%d tracked_child=%d opts=0x%x child_state=%d reaped=%d\n",
-                m.template sysarg<int>(0), g_fork.child_pid, options,
-                child ? (int)child->state : -1, (int)g_fork.child_reaped);
-    }
-    // After the first reap, return ECHILD (no more children).
-    // This prevents infinite loops in shells that call waitpid
-    // until all children are reaped.
-    if (g_fork.child_reaped || g_fork.child_pid == 0) {
+    const pid_t parent = g_process_model.current_pid;
+
+    // Search process table for a waitable child.
+    auto* child = g_process_model.find_waitable_child(parent, wait_pid);
+    if (!child) {
         m.set_result(-10);  // -ECHILD
         return;
     }
-    child = g_process_model.find(g_fork.child_pid);
-    if (!child || child->state == ProcessState::Reaped) {
-        g_fork.child_reaped = true;
-        m.set_result(-10);  // -ECHILD
-        return;
-    }
+
+    // Child still running.
     if (child->state == ProcessState::Running) {
         if (options & WAIT4_WNOHANG) {
             m.set_result(0);
             return;
         }
-        m.set_result(-11);  // -EAGAIN (temporary until phase2 waiter wakeup)
+        // Phase 2: yield to host instead of returning bogus -EAGAIN.
+        // Rewind PC past the ecall so it re-executes on resume.
+        g_waiting_for_child = true;
+        g_wait_blocked_pid = child->pid;
+        g_process_model.push_event(
+            ProcessEventKind::WaitBlocked,
+            child->pid, parent,
+            child->pgid, 0);
+        m.cpu.increment_pc(-4);  // rewind past ecall
+        m.stop();
         return;
     }
 
+    // Child exited — reap it.
+    pid_t reaped_pid = child->pid;
+    int32_t exit_status = child->exit_status;
     auto wstatus_addr = m.sysarg(1);
     if (wstatus_addr != 0) {
-        // Encode in wait status format: WEXITSTATUS = (status & 0xff) << 8
-        int32_t wstatus = (child->exit_status & 0xff) << 8;
+        int32_t wstatus = (exit_status & 0xff) << 8;
         m.memory.template write<int32_t>(wstatus_addr, wstatus);
     }
     g_process_model.push_event(
         ProcessEventKind::WaitWakeup,
-        g_fork.child_pid,
-        g_fork.parent_pid,
-        g_fork.child_pgid,
-        child->exit_status);
-    g_process_model.mark_reaped(g_fork.child_pid, child->exit_status);
-    g_fork.exit_status = child->exit_status;
-    g_fork.child_reaped = true;
-    m.set_result(g_fork.child_pid);
+        reaped_pid, parent,
+        child->pgid, exit_status);
+    g_process_model.mark_reaped(reaped_pid, exit_status);
+    // Update g_fork if this was the vfork child
+    if (g_fork.child_pid == reaped_pid) {
+        g_fork.exit_status = exit_status;
+        g_fork.child_reaped = true;
+    }
+    m.set_result(reaped_pid);
 }
 
 // Helper: resolve a VFS path through symlinks (up to 10 levels).
@@ -2045,7 +2120,6 @@ static void sys_read(Machine& m) {
 
     if (fd == 0) {
 #ifdef __EMSCRIPTEN__
-        fprintf(stderr, "[sys_read] fd=0 count=%zu pc=0x%lx\n", (size_t)count, (long)m.cpu.pc());
         // Try non-blocking read from JavaScript stdin buffer
         auto view = m.memory.memview(buf_addr, count);
         int bytes_read = EM_ASM_INT({
@@ -3798,6 +3872,127 @@ static void sys_sysinfo(Machine& m) {
     m.set_result(0);
 }
 
+// pselect6 - synchronous I/O multiplexing (select-style with fd_set bitmasks)
+// Bash uses this to wait for stdin input before reading.
+// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
+static void sys_pselect6(Machine& m) {
+    int nfds = m.template sysarg<int>(0);
+    auto readfds_addr = m.sysarg(1);
+    auto writefds_addr = m.sysarg(2);
+    // arg3: exceptfds (ignored), arg4: timeout, arg5: sigmask (ignored)
+    auto timeout_addr = m.sysarg(4);
+
+    if (nfds <= 0) {
+        m.set_result(0);
+        return;
+    }
+    if (nfds > 1024) nfds = 1024;
+
+    // Read timeout: NULL = block forever, {0,0} = return immediately
+    bool has_timeout = (timeout_addr != 0);
+    bool zero_timeout = false;
+    if (has_timeout) {
+        int64_t tv_sec = m.memory.template read<int64_t>(timeout_addr);
+        int64_t tv_nsec = m.memory.template read<int64_t>(timeout_addr + 8);
+        zero_timeout = (tv_sec == 0 && tv_nsec == 0);
+    }
+
+    // Helper to check if fd is set in an fd_set bitmask (128 bytes = 1024 bits)
+    auto fd_isset = [&](uint64_t fdset_addr, int fd) -> bool {
+        if (fdset_addr == 0 || fd < 0 || fd >= nfds) return false;
+        int word_idx = fd / 64;
+        int bit_idx = fd % 64;
+        uint64_t word = m.memory.template read<uint64_t>(fdset_addr + word_idx * 8);
+        return (word >> bit_idx) & 1;
+    };
+    auto fd_set_bit = [&](uint64_t fdset_addr, int fd) {
+        if (fdset_addr == 0 || fd < 0) return;
+        int word_idx = fd / 64;
+        int bit_idx = fd % 64;
+        uint64_t word = m.memory.template read<uint64_t>(fdset_addr + word_idx * 8);
+        word |= (1ULL << bit_idx);
+        m.memory.template write<uint64_t>(fdset_addr + word_idx * 8, word);
+    };
+    auto fd_zero = [&](uint64_t fdset_addr) {
+        if (fdset_addr == 0) return;
+        int words = (nfds + 63) / 64;
+        for (int i = 0; i < words; i++)
+            m.memory.template write<uint64_t>(fdset_addr + i * 8, 0ULL);
+    };
+
+    int ready = 0;
+    bool needs_stdin = false;
+    // Track which fds are ready (read) or writable — max 64 fds tracked
+    uint64_t ready_read = 0, ready_write = 0;
+
+    // Check each fd in the read/write sets
+    for (int fd = 0; fd < nfds && fd < 64; fd++) {
+        bool in_read = fd_isset(readfds_addr, fd);
+        bool in_write = fd_isset(writefds_addr, fd);
+        if (!in_read && !in_write) continue;
+
+        // Redirect tty fds to stdin for read checks
+        int check_fd = fd;
+        if (fd > 2 && g_tty_fds.count(fd) && in_read) {
+            check_fd = 0;
+        }
+
+        if (check_fd == 0 && in_read) {
+#ifdef __EMSCRIPTEN__
+            int has_data = EM_ASM_INT({
+                return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
+                       (Module._stdinEOF ? -1 : 0);
+            });
+            if (has_data != 0) {
+                ready_read |= (1ULL << fd);
+                ready++;
+            } else {
+                needs_stdin = true;
+            }
+#else
+            struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+            int ret = ::poll(&pfd, 1, 0);
+            if (ret > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+                ready_read |= (1ULL << fd);
+                ready++;
+            } else {
+                needs_stdin = true;
+            }
+#endif
+        } else if ((fd == 1 || fd == 2) && in_write) {
+            ready_write |= (1ULL << fd);
+            ready++;
+        } else if (fd >= 0 && in_read) {
+            auto& fs = get_fs(m);
+            if (fs.is_open(fd)) {
+                ready_read |= (1ULL << fd);
+                ready++;
+            }
+        }
+    }
+
+    // If we need stdin and aren't polling (zero_timeout), block BEFORE
+    // modifying the fd_sets. This preserves guest memory so the ecall
+    // can re-execute correctly after resume.
+    if (needs_stdin && ready == 0 && !zero_timeout) {
+        // Block waiting for stdin — rewind PC and stop machine
+        g_waiting_for_stdin = true;
+        m.cpu.increment_pc(-4);
+        m.stop();
+        return;
+    }
+
+    // Zero out fd_sets, then set only the ready bits
+    fd_zero(readfds_addr);
+    fd_zero(writefds_addr);
+    for (int fd = 0; fd < nfds && fd < 64; fd++) {
+        if (ready_read & (1ULL << fd)) fd_set_bit(readfds_addr, fd);
+        if (ready_write & (1ULL << fd)) fd_set_bit(writefds_addr, fd);
+    }
+
+    m.set_result(ready);
+}
+
 // ppoll - poll file descriptors for events
 // Ash uses this to check if stdin has data before reading.
 static void sys_ppoll(Machine& m) {
@@ -3828,8 +4023,13 @@ static void sys_ppoll(Machine& m) {
         int32_t fd = m.memory.template read<int32_t>(entry_addr);
         int16_t events = m.memory.template read<int16_t>(entry_addr + 4);
         int16_t revents = 0;
+        // Redirect tty fds to stdin for POLLIN checks
+        int poll_fd = fd;
+        if (fd > 2 && g_tty_fds.count(fd) && (events & 0x0001)) {
+            poll_fd = 0;  // treat tty fd poll as stdin poll
+        }
 
-        if (fd == 0 && (events & 0x0001 /*POLLIN*/)) {
+        if (poll_fd == 0 && (events & 0x0001 /*POLLIN*/)) {
 #ifdef __EMSCRIPTEN__
             int has_data = EM_ASM_INT({
                 return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
@@ -4839,17 +5039,18 @@ static void sys_getgroups(Machine& m) {
 static void sys_kill(Machine& m) {
     int pid = m.template sysarg<int>(0);
     int sig = m.template sysarg<int>(1);
-    // Sending signal to self or pid 0/1 (our only process)
-    if (pid <= 1 || pid == 100) {
-        if (sig == 0) {
-            // sig 0 = check if process exists
-            m.set_result(0);
-        } else {
-            // Accept silently — we don't deliver signals
-            m.set_result(0);
-        }
+    // pid 0 = current process group, pid -1 = all, negative = pgid
+    // For our single-machine model: treat 0, -1, and self as "this process".
+    if (pid <= 0 || pid == g_process_model.current_pid) {
+        // sig 0 = existence check; others accepted silently (no signal delivery yet)
+        m.set_result(0);
+        return;
+    }
+    // Look up the pid in the process table.
+    if (g_process_model.pid_exists(pid)) {
+        m.set_result(0);  // process exists; signal accepted (not delivered)
     } else {
-        m.set_result(-3);  // -ESRCH (no such process)
+        m.set_result(-3);  // -ESRCH
     }
 }
 
@@ -5217,6 +5418,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::dup3, sys_dup3);
     machine.install_syscall_handler(nr::pipe2, sys_pipe2);
     machine.install_syscall_handler(nr::readv, sys_readv);
+    machine.install_syscall_handler(nr::pselect6, sys_pselect6);
     machine.install_syscall_handler(nr::ppoll, sys_ppoll);
     machine.install_syscall_handler(nr::sendfile, sys_sendfile);
     machine.install_syscall_handler(nr::pread64, sys_pread64);

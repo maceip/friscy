@@ -906,17 +906,8 @@ inline void sys_getpeername(Machine& m) {
     m.set_result(err::NOSYS);
 }
 
-// syscall 72: pselect6 (for socket readiness checking)
-inline void sys_pselect6(Machine& m) {
-    // Stub - return immediately with no ready descriptors
-    m.set_result(0);
-}
-
-// syscall 73: ppoll (for socket readiness checking)
-inline void sys_ppoll(Machine& m) {
-    // Stub - return immediately with no ready descriptors
-    m.set_result(0);
-}
+// Note: pselect6 (72) and ppoll (73) are handled in syscalls.hpp
+// with proper stdin blocking and fd readiness checks.
 
 // Install all network syscall handlers
 inline void install_network_syscalls(Machine& machine) {
@@ -934,9 +925,9 @@ inline void install_network_syscalls(Machine& machine) {
     machine.install_syscall_handler(208, sys_setsockopt);
     machine.install_syscall_handler(209, sys_getsockopt);
     machine.install_syscall_handler(210, sys_shutdown);
-    machine.install_syscall_handler(72, sys_pselect6);
-    // Note: ppoll (73) is NOT installed here — it's handled by
-    // syscalls::sys_ppoll which has proper timeout/revents handling.
+    // Note: pselect6 (72) and ppoll (73) are NOT installed here — they're
+    // handled by syscalls::sys_pselect6/sys_ppoll which have proper
+    // stdin blocking, timeout, and revents handling.
 }
 
 }  // namespace net

@@ -68,12 +68,14 @@ const CMD_EXPORT_VFS = 8;
 const PROCESS_EVENT_KIND_SPAWN = 1;
 const PROCESS_EVENT_KIND_EXIT = 2;
 const PROCESS_EVENT_KIND_WAIT_WAKEUP = 3;
+const PROCESS_EVENT_KIND_WAIT_BLOCKED = 4;
 const PROCESS_EVENT_RECORD_DWORDS = 5;
 
 const STOP_REASON_NONE = 0;
 const STOP_REASON_STDIN = 1 << 0;
 const STOP_REASON_HOST_FETCH = 1 << 1;
 const STOP_REASON_TIMESLICE = 1 << 2;
+const STOP_REASON_WAIT_CHILD = 1 << 3;
 const FRISCY_FAULT_NONE = 0;
 const FRISCY_FAULT_MACHINE_EXCEPTION = 1;
 const FRISCY_FAULT_EBREAK = 2;
@@ -400,6 +402,8 @@ function drainProcessEvents() {
                 return 'exit';
             case PROCESS_EVENT_KIND_WAIT_WAKEUP:
                 return 'wait_wakeup';
+            case PROCESS_EVENT_KIND_WAIT_BLOCKED:
+                return 'wait_blocked';
             default:
                 return 'unknown';
             }
@@ -421,6 +425,7 @@ function drainProcessEvents() {
             }
             events.push(event);
         }
+        self._lastProcessEvents = events;
         self.postMessage({ type: 'process-events', events });
     } catch (e) {
         console.warn('[worker] Failed to drain process events:', e.message);
@@ -455,6 +460,7 @@ async function runResumeLoop() {
         stopStdin: 0,
         stopHostFetch: 0,
         stopTimeslice: 0,
+        stopWaitChild: 0,
         timesliceResumeAttempts: 0,
         jitDispatches: 0,
         jitFallbacks: 0,
@@ -511,6 +517,7 @@ async function runResumeLoop() {
         if (rawStopReason & STOP_REASON_STDIN) telemetry.stopStdin++;
         if (rawStopReason & STOP_REASON_HOST_FETCH) telemetry.stopHostFetch++;
         if (rawStopReason & STOP_REASON_TIMESLICE) telemetry.stopTimeslice++;
+        if (rawStopReason & STOP_REASON_WAIT_CHILD) telemetry.stopWaitChild++;
         const stopReason = timesliceResumeEnabled
             ? rawStopReason
             : (rawStopReason & ~STOP_REASON_TIMESLICE);
@@ -646,6 +653,40 @@ async function runResumeLoop() {
                 emModule.HEAPU8.set(errBytes, ptr);
                 friscy_set_fetch_response(ptr, errBytes.length);
                 emModule._free(ptr);
+            }
+        }
+
+        // Phase 2: wait-for-child yield — the parent called wait4() and the
+        // child is still Running. In our single-worker vfork model the child
+        // already ran to completion before the parent resumed, so by the time
+        // we see STOP_REASON_WAIT_CHILD the child should already be exited in
+        // the process table. Drain events, then notify the C++ side so the
+        // rewound wait4 ecall re-executes and finds the Exited child.
+        if (stopReason & STOP_REASON_WAIT_CHILD) {
+            drainProcessEvents();
+            const friscy_notify_child_exit = emModule._friscy_notify_child_exit;
+            if (typeof friscy_notify_child_exit === 'function') {
+                // Extract blocked pid from WaitBlocked event, then find its
+                // exit status from the Exit event in the same drain batch.
+                let blockedPid = 0;
+                let exitStatus = 0;
+                if (self._lastProcessEvents) {
+                    for (const ev of self._lastProcessEvents) {
+                        if (ev.kind === PROCESS_EVENT_KIND_WAIT_BLOCKED) {
+                            blockedPid = ev.pid;
+                        }
+                        if (ev.kind === PROCESS_EVENT_KIND_EXIT && ev.pid === blockedPid) {
+                            exitStatus = ev.status;
+                        }
+                    }
+                }
+                if (blockedPid > 0) {
+                    friscy_notify_child_exit(blockedPid, exitStatus);
+                } else {
+                    // Fallback: clear wait state unconditionally
+                    friscy_notify_child_exit(0, 0);
+                }
+                console.log(`[worker] wait-child: unblocked pid=${blockedPid} status=${exitStatus}`);
             }
         }
 
@@ -1029,6 +1070,15 @@ self.onmessage = async function(e) {
                 const diag = JSON.stringify(cls.diagnostics);
                 console.warn(`[worker] callMain threw after graceful completion, suppressing error: ${diag}`);
                 drainProcessEvents();
+                // If the machine is stopped waiting for input, enter the
+                // resume loop instead of exiting. Child process exits
+                // (e.g. bash sourcing .bashrc) trigger graceful=true but
+                // the parent shell still needs to continue.
+                if (cls.diagnostics.stopped) {
+                    console.log('[worker] Machine stopped after graceful throw — entering resume loop');
+                    await runResumeLoop();
+                    drainProcessEvents();
+                }
                 maybePostJitStats(true);
                 signalExit(0);
                 return;

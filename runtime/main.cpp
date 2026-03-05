@@ -78,6 +78,7 @@ static uint32_t g_last_fault_data = 0;
 static Machine* g_machine = nullptr;
 #ifdef __EMSCRIPTEN__
 static std::vector<uint8_t> g_last_checkpoint_export;
+static std::vector<uint8_t> g_live_checkpoint_export;
 #endif
 
 extern "C" {
@@ -602,27 +603,21 @@ extern "C" uint8_t* friscy_export_checkpoint(uint32_t* out_size) {
     if (out_size) *out_size = static_cast<uint32_t>(g_last_checkpoint_export.size());
     return buf;
 }
-
 // Live checkpoint export — snapshots current machine state immediately.
-// Caller must Module._free() the returned pointer.
+// Returns a pointer into a persistent static buffer to avoid a second large
+// malloc copy under wasm memory pressure.
 extern "C" uint8_t* friscy_save_live_checkpoint(uint32_t* out_size) {
     if (!g_machine) {
         if (out_size) *out_size = 0;
         return nullptr;
     }
-    auto data = checkpoint::save_checkpoint(*g_machine);
-    if (data.empty()) {
+    g_live_checkpoint_export = checkpoint::save_checkpoint(*g_machine);
+    if (g_live_checkpoint_export.empty()) {
         if (out_size) *out_size = 0;
         return nullptr;
     }
-    uint8_t* buf = static_cast<uint8_t*>(malloc(data.size()));
-    if (!buf) {
-        if (out_size) *out_size = 0;
-        return nullptr;
-    }
-    memcpy(buf, data.data(), data.size());
-    if (out_size) *out_size = static_cast<uint32_t>(data.size());
-    return buf;
+    if (out_size) *out_size = static_cast<uint32_t>(g_live_checkpoint_export.size());
+    return g_live_checkpoint_export.data();
 }
 #endif
 

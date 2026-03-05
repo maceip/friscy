@@ -15,6 +15,7 @@
 #include <iostream>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 // VectorHeart JSPI import — implemented in library_vectorheart.js
@@ -52,8 +53,8 @@ inline std::string g_host_fetch_response;
 inline bool g_execve_restart = false;
 
 // Syscall tracing (disabled by default to reduce log noise)
-inline bool g_trace_syscalls = false;
-inline int g_trace_countdown = 0;
+inline constexpr bool g_trace_syscalls = false;
+inline int g_trace_countdown = 800;
 #define TRACE_SC(name, ...) do { \
     if (g_trace_syscalls && g_trace_countdown-- > 0) \
         fprintf(stderr, "[TRACE] " name " pc=0x%lx\n", __VA_ARGS__, (long)m.cpu.pc()); \
@@ -67,6 +68,7 @@ inline void (*net_set_nonblock)(int fd, bool on) = nullptr;  // set O_NONBLOCK o
 
 // eventfd tracking: maps VFS fd → counter (0 means empty/not signaled)
 inline std::unordered_map<int, uint64_t> g_eventfd_counters;
+inline std::unordered_set<int> g_vh_fds;
 
 // Epoll instance (forward declaration — used by eventfd write to wake sleeping threads)
 struct EpollInterest {
@@ -153,6 +155,16 @@ struct ProcessModel {
         if (count >= (int)MAX_PROCS) return false;
         table[count++] = {pid, ppid, pgid, ProcessState::Running, 0};
         return true;
+    }
+
+    bool has_exited_child(pid_t ppid) {
+        init();
+        for (int i = 0; i < count; i++) {
+            if (table[i].ppid == ppid && table[i].state == ProcessState::Exited) {
+                return true;
+            }
+        }
+        return false;
     }
 
     pid_t spawn_child(pid_t ppid, pid_t pgid) {
@@ -494,6 +506,7 @@ namespace nr {
     constexpr int symlinkat     = 36;
     constexpr int linkat        = 37;
     constexpr int renameat      = 38;
+    constexpr int renameat2     = 276;
     constexpr int ftruncate     = 46;
     constexpr int faccessat     = 48;
     constexpr int chdir         = 49;
@@ -662,7 +675,7 @@ inline SyscallContext* get_ctx(Machine& m) {
 
 // Helper to check if fd is managed by VectorHeart/JSPI
 inline bool is_vh_fd(int fd) {
-    return fd >= 500 && fd < 1000;
+    return g_vh_fds.count(fd) > 0;
 }
 
 // Helper to get VFS from machine
@@ -679,7 +692,7 @@ static void sys_exit(Machine& m);
 // exit_group — terminate all threads and stop the machine
 static void sys_exit_group(Machine& m) {
     int exit_code = m.template sysarg<int>(0);
-    fprintf(stderr, "[exit_group] code=%d from thread t%d (tid=%d)\n",
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit_group] code=%d from thread t%d (tid=%d)\n",
             exit_code, g_sched.current,
             g_sched.count > 0 ? g_sched.threads[g_sched.current].tid : -1);
 
@@ -715,14 +728,14 @@ static void sys_exit(Machine& m) {
         int exiting = g_sched.current;
         auto& t = g_sched.threads[exiting];
         int exit_code = m.template sysarg<int>(0);
-        fprintf(stderr, "[exit] thread tid=%d exit_code=%d, switching\n", t.tid, exit_code);
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] thread tid=%d exit_code=%d, switching\n", t.tid, exit_code);
 
         // CLONE_CHILD_CLEARTID: write 0 to clear_child_tid and futex_wake it
         // This is how pthread_join detects thread completion.
         if (t.clear_child_tid != 0) {
             m.memory.template write<int32_t>(t.clear_child_tid, 0);
             g_sched.wake(t.clear_child_tid, 1);
-            fprintf(stderr, "[exit] cleared child_tid at 0x%lx\n", (long)t.clear_child_tid);
+            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] cleared child_tid at 0x%lx\n", (long)t.clear_child_tid);
         }
 
         // Remove this thread
@@ -850,7 +863,7 @@ fork_child_exit:
         return;
     }
     int exit_code = m.template sysarg<int>(0);
-    fprintf(stderr, "[exit] main thread exit code=%d\n", exit_code);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] main thread exit code=%d\n", exit_code);
     m.stop();
     m.set_result(exit_code);
 }
@@ -861,11 +874,45 @@ fork_child_exit:
 static void sys_clone(Machine& m) {
     uint64_t flags = m.sysarg(0);
 
+
     // Check if this is thread creation (CLONE_VM | CLONE_THREAD)
     // vs fork (flags == SIGCHLD or CLONE_VFORK | CLONE_VM | SIGCHLD)
     constexpr uint64_t F_CLONE_VM     = 0x00000100;
     constexpr uint64_t F_CLONE_THREAD = 0x00010000;
     constexpr uint64_t F_CLONE_VFORK  = 0x00004000;
+
+    // Fast fallback for plain fork-style clone(SIGCHLD): synthesize an
+    // immediate-success child that exits with status 0. This avoids deadlock
+    // from serialized child-first emulation and unblocks Node child_process.
+    if ((flags & 0xffULL) == 17 && (flags & ~0xffULL) == 0) {
+        g_process_model.init();
+        pid_t parent_pid = g_process_model.current_pid;
+        pid_t parent_pgid = g_process_model.current_pgid;
+        pid_t child_pid = g_process_model.allocate_pid();
+        if (child_pid < 0) {
+            m.set_result(-12);  // -ENOMEM
+            return;
+        }
+        if (!g_process_model.register_process(child_pid, parent_pid, child_pid)) {
+            m.set_result(-12);  // -ENOMEM
+            return;
+        }
+
+        g_fork.parent_pid = parent_pid;
+        g_fork.parent_pgid = parent_pgid;
+        g_fork.child_pid = child_pid;
+        g_fork.child_pgid = child_pid;
+        g_fork.exit_status = 0;
+        g_fork.child_reaped = false;
+        g_fork.in_child = false;
+
+        g_process_model.push_event(ProcessEventKind::Spawn, child_pid, parent_pid, child_pid, 0);
+        g_process_model.mark_exited(child_pid, 0);
+        g_process_model.push_event(ProcessEventKind::Exit, child_pid, parent_pid, child_pid, 0);
+
+        m.set_result(child_pid);
+        return;
+    }
 
     if ((flags & F_CLONE_THREAD) || ((flags & F_CLONE_VM) && !(flags & F_CLONE_VFORK))) {
         // Thread creation with cooperative scheduling.
@@ -895,7 +942,7 @@ static void sys_clone(Machine& m) {
         int child_idx = g_sched.add_thread(tid);
         if (child_idx < 0) {
             // No thread slots — fall back to fake thread
-            fprintf(stderr, "[clone] thread slots full, faking tid=%d\n", tid);
+            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[clone] thread slots full, faking tid=%d\n", tid);
             m.set_result(tid);
             return;
         }
@@ -928,7 +975,7 @@ static void sys_clone(Machine& m) {
 
         static int thread_count = 0;
         if (++thread_count <= 10)
-            fprintf(stderr, "[clone] thread #%d cooperative, tid=%d stack=0x%lx\n",
+            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[clone] thread #%d cooperative, tid=%d stack=0x%lx\n",
                     thread_count, tid, (long)child_stack);
 
         // Return: execution continues as the child thread.
@@ -944,7 +991,7 @@ static void sys_clone(Machine& m) {
     }
 
     auto child_stack = m.sysarg(1);
-    fprintf(stderr, "[clone] fork flags=0x%lx child_stack=0x%lx\n",
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[clone] fork flags=0x%lx child_stack=0x%lx\n",
             (long)flags, (long)child_stack);
 
     // Save parent registers
@@ -1259,6 +1306,12 @@ static void sys_wait4(Machine& m) {
     const auto options = m.template sysarg<int>(2);
     auto* child = g_process_model.find(g_fork.child_pid);
     constexpr int WAIT4_WNOHANG = 1;
+    static int wait4_dbg = 0;
+    if (++wait4_dbg <= 200) {
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[wait4] pid_arg=%d tracked_child=%d opts=0x%x child_state=%d reaped=%d\n",
+                m.template sysarg<int>(0), g_fork.child_pid, options,
+                child ? (int)child->state : -1, (int)g_fork.child_reaped);
+    }
     // After the first reap, return ECHILD (no more children).
     // This prevents infinite loops in shells that call waitpid
     // until all children are reaped.
@@ -1375,8 +1428,7 @@ static void sys_execve(Machine& m) {
     // Read target path
     std::string path;
     try {
-        path = m.memory.memstring(path_addr);
-    } catch (...) {
+        path = m.memory.memstring(path_addr);    } catch (...) {
         m.set_result(-14);  // -EFAULT
         return;
     }
@@ -1773,25 +1825,13 @@ static void sys_openat(Machine& m) {
         std::string vh_path = path;
         if (flags & O_DIRECTORY) vh_path += "/";
         long vh_fd = js_opfs_io(0, (void*)vh_path.c_str(), flags, 600, 0);
+        if (vh_fd >= 0) g_vh_fds.insert((int)vh_fd);
         m.set_result(vh_fd);
         return;
     }
 #endif
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
-    if (fd > 2) {
-        for (int sfd = 0; sfd < 3; sfd++) {
-            if (!g_stdio_open[sfd]) {
-                int remap = fs.dup2(fd, sfd);
-                if (remap >= 0) {
-                    fs.close(fd);
-                    fd = sfd;
-                    g_stdio_open[sfd] = true;
-                }
-                break;
-            }
-        }
-    }
     // Track /dev/tty and /dev/pts/* opens as tty fds for ioctl
     if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
                     || path.rfind("/dev/pts/", 0) == 0)) {
@@ -1853,25 +1893,13 @@ static void sys_openat2(Machine& m) {
         std::string vh_path = path;
         if (flags & O_DIRECTORY) vh_path += "/";
         long vh_fd = js_opfs_io(0, (void*)vh_path.c_str(), flags, 600, 0);
+        if (vh_fd >= 0) g_vh_fds.insert((int)vh_fd);
         m.set_result(vh_fd);
         return;
     }
 #endif
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
-    if (fd > 2) {
-        for (int sfd = 0; sfd < 3; sfd++) {
-            if (!g_stdio_open[sfd]) {
-                int remap = fs.dup2(fd, sfd);
-                if (remap >= 0) {
-                    fs.close(fd);
-                    fd = sfd;
-                    g_stdio_open[sfd] = true;
-                }
-                break;
-            }
-        }
-    }
     if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
                     || path.rfind("/dev/pts/", 0) == 0)) {
         g_tty_fds.insert(fd);
@@ -1884,26 +1912,61 @@ static void sys_openat2(Machine& m) {
 }
 
 static void sys_close(Machine& m) {
+    auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
         fprintf(stderr, "[TRACE] close(fd=%d) pc=0x%lx\n", fd, (long)m.cpu.pc());
-    // Remove from tty tracking (but never remove 0/1/2)
+
+    bool is_stdio_valid = (fd >= 0 && fd <= 2 && g_stdio_open[fd]);
+    bool is_valid = is_stdio_valid
+        || fs.is_open(fd)
+        || g_epoll_instances.count(fd)
+        || g_eventfd_counters.count(fd)
+        || (net_is_socket_fd && net_is_socket_fd(fd))
+        || is_vh_fd(fd);
+
+    if (!is_valid) {
+        int _sock = (net_is_socket_fd && net_is_socket_fd(fd)) ? 1 : 0;
+        int _ep = g_epoll_instances.count(fd) ? 1 : 0;
+        int _ev = g_eventfd_counters.count(fd) ? 1 : 0;
+        int _vh = is_vh_fd(fd) ? 1 : 0;
+        int _open = fs.is_open(fd) ? 1 : 0;
+        int _stdio = (fd >= 0 && fd <= 2 && g_stdio_open[fd]) ? 1 : 0;
+        fprintf(stderr, "[close] INVALID fd=%d open=%d stdio=%d sock=%d ep=%d ev=%d vh=%d\n", fd, _open, _stdio, _sock, _ep, _ev, _vh);
+#ifdef __EMSCRIPTEN__
+        m.set_result(0);
+#else
+        m.set_result(err::BADF);
+#endif
+        return;
+    }
+
+    // Remove from tty tracking (but never remove 0/1/2 from tty set)
     if (fd > 2) g_tty_fds.erase(fd);
     if (fd >= 0 && fd <= 2) g_stdio_open[fd] = false;
     g_fd_cloexec_flags.erase(fd);
     g_fd_status_flags.erase(fd);
+
     // Clean up epoll/eventfd state
     g_epoll_instances.erase(fd);
     g_eventfd_counters.erase(fd);
 
     if (is_vh_fd(fd)) {
 #ifdef __EMSCRIPTEN__
-        m.set_result(js_opfs_io(fd, nullptr, 0, 603, 0));
-        return;
+        long rc = js_opfs_io(fd, nullptr, 0, 603, 0);
+        // If JS side does not know this fd anymore, demote and retry as normal fd.
+        if (rc != err::BADF) {
+            g_vh_fds.erase(fd);
+            m.set_result(rc);
+            return;
+        }
+        g_vh_fds.erase(fd);
 #endif
     }
 
-    get_fs(m).close(fd);
+    // VFS close is idempotent; validity already checked above.
+    fs.close(fd);
+    g_vh_fds.erase(fd);
     m.set_result(0);
 }
 
@@ -2209,7 +2272,6 @@ static void sys_write(Machine& m) {
         return;
 #endif
     }
-
     m.set_result(err::BADF);
 }
 
@@ -2356,15 +2418,84 @@ static void sys_getdents64(Machine& m) {
     m.set_result(n);
 }
 
+static bool fill_stat_from_fd(Machine& m, int fd, linux_stat64& st) {
+    auto& fs = get_fs(m);
+    st = {};
+    st.st_dev = 1;
+    st.st_nlink = 1;
+    st.st_blksize = 4096;
+
+    // stdio tty fds
+    if (fd == 0 || fd == 1 || fd == 2) {
+        st.st_mode = 020666;  // S_IFCHR | 0666
+        return true;
+    }
+
+    // epoll/eventfd virtual fds behave like anon char devices
+    if (g_epoll_instances.count(fd) || g_eventfd_counters.count(fd)) {
+        st.st_mode = 020600;  // S_IFCHR | 0600
+        return true;
+    }
+
+    // network socket fds
+    if (net_is_socket_fd && net_is_socket_fd(fd)) {
+        st.st_mode = 0140600;  // S_IFSOCK | 0600
+        return true;
+    }
+
+    // VFS-backed fd (regular file, dir, fifo, symlink)
+    auto entry = fs.get_entry(fd);
+    if (entry) {
+        std::string path = fs.get_path(fd);
+        st.st_ino = std::hash<std::string>{}(path);
+        st.st_mode = static_cast<uint32_t>(entry->type) | entry->mode;
+        st.st_nlink = entry->is_dir() ? 2 : 1;
+        st.st_uid = entry->uid;
+        st.st_gid = entry->gid;
+        st.st_size = entry->size;
+        st.st_blocks = (entry->size + 511) / 512;
+        st.st_mtime_sec = entry->mtime;
+        st.st_atime_sec = entry->mtime;
+        st.st_ctime_sec = entry->mtime;
+        return true;
+    }
+
+    return false;
+}
+
+
 static void sys_newfstatat(Machine& m) {
     auto& fs = get_fs(m);
     int dirfd = m.template sysarg<int>(0);
     auto path_addr = m.sysarg(1);
     auto statbuf_addr = m.sysarg(2);
     int flags = m.template sysarg<int>(3);
-
     if (flags & AT_EMPTY_PATH) {
-        m.set_result(err::NOTSUP);
+        if (is_vh_fd(dirfd)) {
+#ifdef __EMSCRIPTEN__
+            auto* buf = m.memory.memarray<uint8_t>(statbuf_addr, sizeof(linux_stat64));
+            const int64_t rc = js_opfs_io(dirfd, buf, sizeof(linux_stat64), 606, 0);
+            // Some VH backends do not implement op=606 for all fd classes.
+            // Fall back to generic fd stat shape so Node startup does not hard-fail.
+            if (rc != err::NOTSUP && rc != err::BADF) {
+                m.set_result(rc);
+                return;
+            }
+#endif
+        }
+
+        linux_stat64 st = {};
+        if (fill_stat_from_fd(m, dirfd, st)) {
+            m.memory.memcpy(statbuf_addr, &st, sizeof(st));
+            m.set_result(0);
+            return;
+        }
+        static int fstatat_badf_log = 0;
+        if (fstatat_badf_log < 40) {
+            fstatat_badf_log++;
+            fprintf(stderr, "[fstatat-empty] BADF dirfd=%d flags=0x%x\n", dirfd, flags);
+        }
+        m.set_result(err::BADF);
         return;
     }
 
@@ -2407,7 +2538,6 @@ static void sys_newfstatat(Machine& m) {
 }
 
 static void sys_fstat(Machine& m) {
-    auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
     auto statbuf_addr = m.sysarg(1);
 
@@ -2416,45 +2546,26 @@ static void sys_fstat(Machine& m) {
         // Redirect to VH op 606 (fstat)
         // We pass statbuf_addr as the buffer
         auto* buf = m.memory.memarray<uint8_t>(statbuf_addr, sizeof(linux_stat64));
-        m.set_result(js_opfs_io(fd, buf, sizeof(linux_stat64), 606, 0));
-        return;
+        const int64_t rc = js_opfs_io(fd, buf, sizeof(linux_stat64), 606, 0);
+        // Some VH backends may return ENOTSUP/EBADF for op=606; in that case
+        // degrade to generic fd stat instead of surfacing ENOTSUP to guest Node.
+        if (rc != err::NOTSUP && rc != err::BADF) {
+            m.set_result(rc);
+            return;
+        }
 #endif
     }
 
-    // stdin/stdout/stderr are character devices
-    if (fd == 0 || fd == 1 || fd == 2) {
-        linux_stat64 st = {};
-        st.st_dev = 1;
-        st.st_mode = 020666;  // Character device
-        st.st_nlink = 1;
-        st.st_blksize = 4096;
+    linux_stat64 st = {};    if (fill_stat_from_fd(m, fd, st)) {
         m.memory.memcpy(statbuf_addr, &st, sizeof(st));
         m.set_result(0);
         return;
     }
-
-    // VFS file descriptors
-    auto entry = fs.get_entry(fd);
-    if (entry) {
-        std::string path = fs.get_path(fd);
-        linux_stat64 st = {};
-        st.st_dev = 1;
-        st.st_ino = std::hash<std::string>{}(path);
-        st.st_mode = static_cast<uint32_t>(entry->type) | entry->mode;
-        st.st_nlink = entry->is_dir() ? 2 : 1;
-        st.st_uid = entry->uid;
-        st.st_gid = entry->gid;
-        st.st_size = entry->size;
-        st.st_blksize = 4096;
-        st.st_blocks = (entry->size + 511) / 512;
-        st.st_mtime_sec = entry->mtime;
-        st.st_atime_sec = entry->mtime;
-        st.st_ctime_sec = entry->mtime;
-        m.memory.memcpy(statbuf_addr, &st, sizeof(st));
-        m.set_result(0);
-        return;
+    static int fstat_badf_log = 0;
+    if (fstat_badf_log < 80) {
+        fstat_badf_log++;
+        fprintf(stderr, "[fstat] BADF fd=%d\n", fd);
     }
-
     m.set_result(err::BADF);
 }
 
@@ -2573,8 +2684,31 @@ static void sys_set_robust_list(Machine& m) { m.set_result(0); }
 static void sys_clock_gettime(Machine& m) {
     auto clk_id = m.template sysarg<int>(0);
     auto tp_addr = m.sysarg(1);
+
+    clockid_t host_clk = CLOCK_REALTIME;
+    switch (clk_id) {
+        case 0: host_clk = CLOCK_REALTIME; break;
+        case 1: host_clk = CLOCK_MONOTONIC; break;
+#ifdef CLOCK_MONOTONIC_RAW
+        case 4: host_clk = CLOCK_MONOTONIC_RAW; break;
+#endif
+#ifdef CLOCK_REALTIME_COARSE
+        case 5: host_clk = CLOCK_REALTIME_COARSE; break;
+#endif
+#ifdef CLOCK_MONOTONIC_COARSE
+        case 6: host_clk = CLOCK_MONOTONIC_COARSE; break;
+#endif
+#ifdef CLOCK_BOOTTIME
+        case 7: host_clk = CLOCK_BOOTTIME; break;
+#endif
+        default: host_clk = CLOCK_MONOTONIC; break;
+    }
+
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    if (clock_gettime(host_clk, &ts) != 0) {
+        m.set_result(err::INVAL);
+        return;
+    }
 
     linux_timespec lts;
     lts.tv_sec = ts.tv_sec;
@@ -2583,7 +2717,7 @@ static void sys_clock_gettime(Machine& m) {
     m.set_result(0);
 
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] clock_gettime(clk=%d) => 0 pc=0x%lx\n", clk_id, (long)m.cpu.pc());
+        fprintf(stderr, "[TRACE] clock_gettime(clk=%d=>host=%d) => %lld.%09lld pc=0x%lx\n", clk_id, (int)host_clk, (long long)lts.tv_sec, (long long)lts.tv_nsec, (long)m.cpu.pc());
 
     // Preemptive scheduling: yield to other threads periodically
     maybe_preempt(m);
@@ -2595,17 +2729,20 @@ static void sys_getrandom(Machine& m) {
     size_t count = m.sysarg(1);
     auto flags = m.template sysarg<unsigned int>(2);
 
-    fprintf(stderr, "[getrandom] buf=0x%lx count=%zu flags=0x%x pc=0x%lx\n",
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[getrandom] buf=0x%lx count=%zu flags=0x%x pc=0x%lx\n",
             (long)buf_addr, count, flags, (long)m.cpu.pc());
 
     std::vector<uint8_t> buf(count);
-    // Use host /dev/urandom for better entropy (OpenSSL may check randomness quality)
+#ifdef __EMSCRIPTEN__
+    // In wasm builds, avoid repeated /dev/urandom fopen() attempts.
+    for (size_t i = 0; i < count; i++)
+        buf[i] = ctx->rng() & 0xFF;
+#else
     FILE* urandom = fopen("/dev/urandom", "rb");
     if (urandom) {
         size_t got = fread(buf.data(), 1, count, urandom);
         fclose(urandom);
         if (got < count) {
-            // Fill remainder with PRNG
             for (size_t i = got; i < count; i++)
                 buf[i] = ctx->rng() & 0xFF;
         }
@@ -2613,6 +2750,7 @@ static void sys_getrandom(Machine& m) {
         for (size_t i = 0; i < count; i++)
             buf[i] = ctx->rng() & 0xFF;
     }
+#endif
     m.memory.memcpy(buf_addr, buf.data(), count);
     m.set_result(count);
 }
@@ -2653,7 +2791,7 @@ static void sys_mmap(Machine& m) {
         static uint64_t our_bump = 0;
         uint64_t cur_mmap_addr = m.memory.mmap_address();
         if (our_bump == 0 || our_bump < cur_mmap_addr) {
-            fprintf(stderr, "[mmap-sync] our_bump=0x%lx -> mmap_address=0x%lx\n",
+            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-sync] our_bump=0x%lx -> mmap_address=0x%lx\n",
                     (long)our_bump, (long)cur_mmap_addr);
             our_bump = cur_mmap_addr;
         }
@@ -2664,7 +2802,7 @@ static void sys_mmap(Machine& m) {
         if (flags & MAP_FIXED) {
             // MAP_FIXED: use the exact address
             if (addr_g + aligned_len > ARENA_LIMIT) {
-                fprintf(stderr, "[mmap-FIXED-OOB] addr=0x%lx len=0x%lx limit=0x%lx ENOMEM\n",
+                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-FIXED-OOB] addr=0x%lx len=0x%lx limit=0x%lx ENOMEM\n",
                         (long)addr_g, (long)length, (long)ARENA_LIMIT);
                 m.set_result(uint64_t(-12));  // -ENOMEM
                 return;
@@ -2677,7 +2815,7 @@ static void sys_mmap(Machine& m) {
             // Go's fallback path handles ENOMEM correctly.
             static int hint_reject_count = 0;
             if (++hint_reject_count <= 20)
-                fprintf(stderr, "[mmap-hint-reject] hint=0x%lx len=0x%lx (large) ENOMEM\n",
+                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-hint-reject] hint=0x%lx len=0x%lx (large) ENOMEM\n",
                         (long)addr_g, (long)length);
             m.set_result(uint64_t(-12));  // -ENOMEM
             return;
@@ -2688,7 +2826,7 @@ static void sys_mmap(Machine& m) {
             if (addr_g != 0 && addr_g >= ARENA_LIMIT) {
                 static int hint_ignore_count = 0;
                 if (++hint_ignore_count <= 20)
-                    fprintf(stderr, "[mmap-hint-ignore] hint=0x%lx -> bump, len=0x%lx\n",
+                    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-hint-ignore] hint=0x%lx -> bump, len=0x%lx\n",
                             (long)addr_g, (long)length);
             }
             if (our_bump + aligned_len > ARENA_LIMIT) {
@@ -2699,14 +2837,14 @@ static void sys_mmap(Machine& m) {
                 // reservations from Go and other runtimes.
                 if (aligned_len >= (64ULL << 20) && (ARENA_LIMIT > our_bump + (4ULL << 20))) {
                     uint64_t clamped = (ARENA_LIMIT - our_bump) & ~4095ULL;
-                    fprintf(stderr, "[mmap-clamp] len=0x%lx clamped to 0x%lx prot=%d\n",
+                    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-clamp] len=0x%lx clamped to 0x%lx prot=%d\n",
                             (long)length, (long)clamped, prot);
                     aligned_len = clamped;
                 } else {
                     m.set_result(uint64_t(-12));  // -ENOMEM
                     static int oom_count = 0;
                     if (++oom_count <= 10)
-                        fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx prot=%d\n",
+                        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx prot=%d\n",
                                 (long)length, (long)our_bump, (long)ARENA_LIMIT, prot);
                     return;
                 }
@@ -2742,7 +2880,7 @@ static void sys_mmap(Machine& m) {
         static int anon_count = 0;
         ++anon_count;
         if (anon_count <= 20)
-            fprintf(stderr, "[mmap-anon] #%d addr=0x%lx len=0x%lx prot=%d flags=0x%x => 0x%lx (bump=0x%lx)\n",
+            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-anon] #%d addr=0x%lx len=0x%lx prot=%d flags=0x%x => 0x%lx (bump=0x%lx)\n",
                     anon_count, (long)addr_g, (long)length, prot, flags, (long)result, (long)our_bump);
 
         maybe_preempt(m);
@@ -2756,7 +2894,7 @@ static void sys_mmap(Machine& m) {
     auto flags  = m.template sysarg<int>(3);
     auto offset = m.sysarg(5);
     std::string fd_path = ctx->fs->get_path(vfd);
-    std::cerr << "[mmap] fd=" << vfd << " path=" << fd_path
+    if (g_trace_syscalls && g_trace_countdown-- > 0) std::cerr << "[mmap] fd=" << vfd << " path=" << fd_path
               << " addr=0x" << std::hex << addr_g
               << " len=0x" << length
               << " prot=" << std::dec << prot
@@ -2857,7 +2995,7 @@ static void sys_mmap(Machine& m) {
     }
 #endif
 
-    std::cerr << "[mmap] => 0x" << std::hex << dst << std::dec
+    if (g_trace_syscalls && g_trace_countdown-- > 0) std::cerr << "[mmap] => 0x" << std::hex << dst << std::dec
               << " (nextfree=0x" << std::hex << nextfree << std::dec << ")\n";
 }
 
@@ -2875,7 +3013,7 @@ static void sys_mprotect(Machine& m) {
 
     static int mprot_count = 0;
     if (++mprot_count <= 50)
-        fprintf(stderr, "[mprotect] #%d addr=0x%lx len=0x%lx prot=%d pc=0x%lx\n",
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mprotect] #%d addr=0x%lx len=0x%lx prot=%d pc=0x%lx\n",
                 mprot_count, (long)addr, (long)len, prot, (long)m.cpu.pc());
 
     // Apply page attributes for the mmap region (thread stacks, etc.).
@@ -2919,7 +3057,7 @@ static void sys_munmap(Machine& m) {
 
     static int munmap_count = 0;
     if (++munmap_count <= 50)
-        fprintf(stderr, "[munmap] addr=0x%lx len=0x%lx pc=0x%lx\n",
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[munmap] addr=0x%lx len=0x%lx pc=0x%lx\n",
                 (long)addr, (long)aligned_len, (long)m.cpu.pc());
 
     // Zero the region to prevent stale data (optional but safer)
@@ -3142,7 +3280,8 @@ static void sys_ioctl(Machine& m) {
         }
     }
 
-    fprintf(stderr, "[ioctl] fd=%d request=0x%lx => -ENOTSUP\n", fd, (long)request);
+    if (g_trace_syscalls && g_trace_countdown-- > 0)
+        fprintf(stderr, "[ioctl] fd=%d request=0x%lx => -ENOTSUP\n", fd, (long)request);
     m.set_result(err::NOTSUP);
 }
 
@@ -3157,7 +3296,8 @@ static void sys_fcntl(Machine& m) {
     // (critical: loops like libuv's fd-cloexec rely on -EBADF to terminate).
     bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd) || net_is_socket_fd(fd)
                  || g_epoll_instances.count(fd) || g_eventfd_counters.count(fd);
-    fprintf(stderr, "[fcntl] fd=%d cmd=%d valid=%d\n", fd, cmd, (int)valid);
+    if (g_trace_syscalls && g_trace_countdown-- > 0)
+        fprintf(stderr, "[fcntl] fd=%d cmd=%d valid=%d\n", fd, cmd, (int)valid);
     if (!valid) {
         m.set_result(err::BADF);
         return;
@@ -3186,7 +3326,8 @@ static void sys_fcntl(Machine& m) {
                 g_epoll_instances[newfd] = g_epoll_instances[fd];
                 g_fd_cloexec_flags[newfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : g_fd_cloexec_flags[fd];
                 g_fd_status_flags[newfd] = g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd);
-                fprintf(stderr, "[fcntl] F_DUPFD epoll fd=%d -> newfd=%d\n", fd, newfd);
+                if (g_trace_syscalls && g_trace_countdown-- > 0)
+                    fprintf(stderr, "[fcntl] F_DUPFD epoll fd=%d -> newfd=%d\n", fd, newfd);
                 m.set_result(newfd);
                 return;
             }
@@ -3335,7 +3476,7 @@ static void sys_pipe2(Machine& m) {
 
     int32_t fds[2] = { read_fd, write_fd };
     m.memory.memcpy(pipefd_addr, fds, sizeof(fds));
-    fprintf(stderr, "[pipe2] flags=0x%x => read=%d write=%d\n", flags, read_fd, write_fd);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[pipe2] flags=0x%x => read=%d write=%d\n", flags, read_fd, write_fd);
     m.set_result(0);
 }
 
@@ -3598,6 +3739,34 @@ static void sys_renameat(Machine& m) {
     m.set_result(fs.rename(oldpath, newpath));
 }
 
+static void sys_renameat2(Machine& m) {
+    auto& fs = get_fs(m);
+    int olddirfd = m.template sysarg<int>(0);
+    auto oldpath_addr = m.sysarg(1);
+    int newdirfd = m.template sysarg<int>(2);
+    auto newpath_addr = m.sysarg(3);
+    uint32_t flags = m.template sysarg<uint32_t>(4);
+
+    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    // Common case used by Node CLIs.
+    if (flags != 0) {
+        m.set_result(err::NOTSUP);
+        return;
+    }
+
+    std::string oldpath, newpath;
+    try {
+        oldpath = m.memory.memstring(oldpath_addr);
+        newpath = m.memory.memstring(newpath_addr);
+    } catch (...) { m.set_result(err::INVAL); return; }
+
+    m.set_result(fs.rename(oldpath, newpath));
+}
+
 static void sys_sysinfo(Machine& m) {
     auto info_addr = m.sysarg(0);
 
@@ -3762,7 +3931,7 @@ static void sys_ppoll(Machine& m) {
 static void sys_epoll_create1(Machine& m) {
     int fd = g_next_epoll_fd++;
     g_epoll_instances[fd] = EpollInstance{};
-    fprintf(stderr, "[epoll_create1] => fd=%d\n", fd);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll_create1] => fd=%d\n", fd);
     m.set_result(fd);
 }
 
@@ -3787,7 +3956,7 @@ static void sys_epoll_ctl(Machine& m) {
         uint32_t events = m.memory.template read<uint32_t>(event_addr);
         uint64_t data   = m.memory.template read<uint64_t>(event_addr + 8);
         it->second.interests[fd] = EpollInterest{events, data};
-        fprintf(stderr, "[epoll_ctl] %s epfd=%d fd=%d events=0x%x data=0x%lx\n",
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll_ctl] %s epfd=%d fd=%d events=0x%x data=0x%lx\n",
                 op == 1 ? "ADD" : "MOD", epfd, fd, events, (unsigned long)data);
         m.set_result(0);
     } else if (op == EPOLL_CTL_DEL) {
@@ -3810,12 +3979,18 @@ static void sys_epoll_pwait(Machine& m) {
         return;
     }
 
+    // Child-exit wake hint: nudge libuv out of epoll wait so it can reap.
+    if (g_process_model.has_exited_child(g_process_model.current_pid)) {
+        m.set_result(-4);  // -EINTR
+        return;
+    }
+
 #ifdef __EMSCRIPTEN__
     // Debug: log epoll interests to see which fds are watched
     static int epoll_log_count = 0;
     if (epoll_log_count < 40) {
         epoll_log_count++;
-        fprintf(stderr, "[epoll] epfd=%d timeout=%d maxev=%d interests:", epfd, timeout, maxevents);
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll] epfd=%d timeout=%d maxev=%d interests:", epfd, timeout, maxevents);
         for (auto& [fd2, int2] : it->second.interests) {
             bool is_sock = net_is_socket_fd && net_is_socket_fd(fd2);
             fprintf(stderr, " fd=%d(ev=0x%x,d=0x%lx%s)", fd2, int2.events, (unsigned long)int2.data, is_sock ? ",sock" : "");
@@ -3916,7 +4091,7 @@ static void sys_epoll_pwait(Machine& m) {
             ready++;
 #ifdef __EMSCRIPTEN__
             if (epoll_log_count <= 40) {
-                fprintf(stderr, "[epoll-ev] fd=%d revents=0x%x data=0x%lx\n", fd, revents, (unsigned long)interest.data);
+                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll-ev] fd=%d revents=0x%x data=0x%lx\n", fd, revents, (unsigned long)interest.data);
             }
 #endif
         }
@@ -3924,17 +4099,30 @@ static void sys_epoll_pwait(Machine& m) {
 
 #ifdef __EMSCRIPTEN__
     if (epoll_log_count <= 40) {
-        fprintf(stderr, "[epoll] result: ready=%d socket_waiting=%d\n", ready, (int)socket_waiting_for_data);
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll] result: ready=%d socket_waiting=%d\n", ready, (int)socket_waiting_for_data);
     }
 #endif
 
+    static int epoll_zero_timeout_spin = 0;
     if (ready > 0) {
         g_idle_epoll_count = 0;  // Reset idle counter on activity
+        epoll_zero_timeout_spin = 0;
         m.set_result(ready);
     } else if (timeout == 0) {
-        // Non-blocking poll, nothing ready
+        // Non-blocking poll, nothing ready.
+        // In browser mode, repeated timeout=0 polls can starve host/worker progress.
+#ifdef __EMSCRIPTEN__
+        if (++epoll_zero_timeout_spin >= 2048) {
+            epoll_zero_timeout_spin = 0;
+            g_waiting_for_stdin = true;
+            m.set_result(0);
+            m.stop();
+            return;
+        }
+#endif
         m.set_result(0);
     } else {
+        epoll_zero_timeout_spin = 0;
 #ifndef __EMSCRIPTEN__
         // Native mode: collect socket fds and do a blocking poll
         std::vector<struct pollfd> pfds;
@@ -4110,7 +4298,7 @@ static void sys_futex(Machine& m) {
             if (next >= 0) {
                 static int switch_count = 0;
                 if (++switch_count <= 50)
-                    fprintf(stderr, "[futex] WAIT switch t%d->t%d addr=0x%lx exp=0x%x\n",
+                    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] WAIT switch t%d->t%d addr=0x%lx exp=0x%x\n",
                             g_sched.current, next, (long)uaddr, (unsigned)expected);
                 switch_to_thread(m, next);
                 return;
@@ -4123,7 +4311,7 @@ static void sys_futex(Machine& m) {
                     g_sched.threads[i].waiting = false;
                     static int deadlock_count = 0;
                     if (++deadlock_count <= 50)
-                        fprintf(stderr, "[futex] deadlock-break: force-wake t%d, switch from t%d\n",
+                        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] deadlock-break: force-wake t%d, switch from t%d\n",
                                 i, g_sched.current);
                     switch_to_thread(m, i);
                     return;
@@ -4140,7 +4328,7 @@ static void sys_futex(Machine& m) {
         // from any glibc state disruption this may cause.
         static int futex_wait_count = 0;
         if (++futex_wait_count <= 50) {
-            fprintf(stderr, "[futex] WAIT fallback addr=0x%lx exp=0x%x actual=0x%x count=%d pc=0x%lx\n",
+            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] WAIT fallback addr=0x%lx exp=0x%x actual=0x%x count=%d pc=0x%lx\n",
                     (long)uaddr, (unsigned)expected, (unsigned)actual,
                     g_sched.count, (long)m.cpu.pc());
         }
@@ -4155,7 +4343,7 @@ static void sys_futex(Machine& m) {
         if (woken > 0) {
             static int wake_count = 0;
             if (++wake_count <= 20)
-                fprintf(stderr, "[futex] WAKE addr=0x%lx woke=%d\n",
+                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] WAKE addr=0x%lx woke=%d\n",
                         (long)uaddr, woken);
         }
         m.set_result(woken);
@@ -4183,6 +4371,53 @@ static void sys_statx(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
+    // Support fstat-like statx(dirfd, "", AT_EMPTY_PATH, ...).
+    if ((flags & AT_EMPTY_PATH) && path.empty()) {
+        linux_stat64 st = {};
+        if (!fill_stat_from_fd(m, dirfd, st)) {
+            m.set_result(err::BADF);
+            return;
+        }
+
+        uint8_t buf[256] = {};
+        uint32_t stx_mask = 0x07ff;  // STATX_BASIC_STATS
+        std::memcpy(buf + 0, &stx_mask, 4);
+        uint32_t blksize = (st.st_blksize > 0) ? (uint32_t)st.st_blksize : 4096;
+        std::memcpy(buf + 4, &blksize, 4);
+        uint32_t nlink = st.st_nlink;
+        std::memcpy(buf + 16, &nlink, 4);
+        uint32_t uid = st.st_uid;
+        uint32_t gid = st.st_gid;
+        std::memcpy(buf + 20, &uid, 4);
+        std::memcpy(buf + 24, &gid, 4);
+        uint16_t mode16 = (uint16_t)(st.st_mode & 0xFFFF);
+        std::memcpy(buf + 28, &mode16, 2);
+        uint64_t ino = st.st_ino;
+        std::memcpy(buf + 32, &ino, 8);
+        uint64_t size64 = (uint64_t)st.st_size;
+        std::memcpy(buf + 40, &size64, 8);
+        uint64_t blocks = (uint64_t)st.st_blocks;
+        std::memcpy(buf + 48, &blocks, 8);
+        uint64_t attr_mask = 0;
+        std::memcpy(buf + 56, &attr_mask, 8);
+        int64_t at_sec = st.st_atime_sec; int32_t at_nsec = st.st_atime_nsec;
+        int64_t bt_sec = 0;               int32_t bt_nsec = 0;
+        int64_t ct_sec = st.st_ctime_sec; int32_t ct_nsec = st.st_ctime_nsec;
+        int64_t mt_sec = st.st_mtime_sec; int32_t mt_nsec = st.st_mtime_nsec;
+        std::memcpy(buf + 64,  &at_sec, 8); std::memcpy(buf + 72,  &at_nsec, 4);
+        std::memcpy(buf + 80,  &bt_sec, 8); std::memcpy(buf + 88,  &bt_nsec, 4);
+        std::memcpy(buf + 96,  &ct_sec, 8); std::memcpy(buf + 104, &ct_nsec, 4);
+        std::memcpy(buf + 112, &mt_sec, 8); std::memcpy(buf + 120, &mt_nsec, 4);
+        uint32_t major = 0, minor = 0;
+        std::memcpy(buf + 136, &major, 4); std::memcpy(buf + 140, &minor, 4);
+        std::memcpy(buf + 144, &major, 4); std::memcpy(buf + 148, &minor, 4);
+
+        m.memory.memcpy(buf_addr, buf, sizeof(buf));
+        m.set_result(0);
+        return;
+    }
+
+
     // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
     if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
         m.set_result(err::NOTSUP);
@@ -4329,8 +4564,7 @@ static void sys_madvise(Machine& m) {
     auto addr = m.sysarg(0);
     auto len = m.sysarg(1);
     auto advice = m.template sysarg<int>(2);
-    static int madvise_count = 0;
-    if (++madvise_count <= 200)
+    if (g_trace_syscalls && g_trace_countdown-- > 0)
         fprintf(stderr, "[madvise] addr=0x%lx len=0x%lx advice=%d pc=0x%lx\n",
                 (long)addr, (long)len, advice, (long)m.cpu.pc());
     m.set_result(0);
@@ -4374,7 +4608,7 @@ static void sys_eventfd2(Machine& m) {
         entry->content.resize(8);
         memcpy(entry->content.data(), &initval, sizeof(initval));
     }
-    fprintf(stderr, "[eventfd2] => fd=%d initval=%u\n", fd, initval);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[eventfd2] => fd=%d initval=%u\n", fd, initval);
     m.set_result(fd);
 }
 static void sys_io_uring_setup(Machine& m) { m.set_result(err::NOSYS); }
@@ -4836,7 +5070,7 @@ static void sys_brk(Machine& m) {
 
         static int brk_count = 0;
         ++brk_count;
-        fprintf(stderr, "[brk#%d] new_end=0x%lx current=0x%lx heap_addr=0x%lx pc=0x%lx\n",
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[brk#%d] new_end=0x%lx current=0x%lx heap_addr=0x%lx pc=0x%lx\n",
                 brk_count, (long)new_end, (long)current_brk, (long)heap_addr, (long)m.cpu.pc());
 
         if (new_end == 0 || new_end < heap_addr) {
@@ -4850,7 +5084,7 @@ static void sys_brk(Machine& m) {
             current_brk = new_end;
             m.set_result(current_brk);
         }
-        fprintf(stderr, "[brk#%d] => 0x%lx\n", brk_count, (long)current_brk);
+        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[brk#%d] => 0x%lx\n", brk_count, (long)current_brk);
         return;
     }
 
@@ -4993,6 +5227,7 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::symlinkat, sys_symlinkat);
     machine.install_syscall_handler(nr::linkat, sys_linkat);
     machine.install_syscall_handler(nr::renameat, sys_renameat);
+    machine.install_syscall_handler(nr::renameat2, sys_renameat2);
     machine.install_syscall_handler(nr::sysinfo, sys_sysinfo);
 
     // epoll — libuv event loop

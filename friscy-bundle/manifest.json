@@ -91,6 +91,18 @@
       "image": "friscy-claude",
       "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
       "dns": ["108.61.10.10"]
+    },
+    "claude-tui": {
+      "rootfs": "./claude-tui.tar",
+      "entrypoint": ["/bin/bash", "-li"],
+      "image": "friscy-claude",
+      "env": ["ANTHROPIC_API_KEY=YOUR_API_KEY_HERE"],
+      "dns": ["108.61.10.10"]
+    },
+    "gemini-tui": {
+      "rootfs": "./gemini-tui.tar",
+      "entrypoint": ["/bin/bash", "-li"],
+      "image": "friscy-gemini"
     }
   }
 }

@@ -1,0 +1,31 @@
+{
+  "ts": "2026-02-28T20:54:11.453Z",
+  "url": "http://127.0.0.1:9001/?example=alpine&procdebug&nosw",
+  "boot": {
+    "status": "friscynet: off",
+    "overlayHidden": false,
+    "terminalVisible": false,
+    "hasRows": false
+  },
+  "terminalText": "",
+  "processEventOverlayVisible": false,
+  "processEventOverlayText": "",
+  "processEvents": [],
+  "processEventsLive": [],
+  "statusText": "friscynet: off",
+  "browserWindow": {
+    "hasStdinQueue": true,
+    "hasProcessLog": false,
+    "hasProcessEvents": false,
+    "jitStatsExists": true
+  },
+  "expectation": {
+    "command": "/bin/sh -lc \"echo hi\"",
+    "sawCommandOutput": false,
+    "sawProcessEvents": false,
+    "sawProcessEventFields": false,
+    "commandInjectionUsedQueue": true,
+    "boot": false,
+    "waitMs": 90000
+  }
+}

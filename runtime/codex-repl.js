@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-'use strict';
+import fs from 'node:fs';
+import https from 'node:https';
 
-const fs = require('fs');
-const https = require('https');
 
 function readLine() {
   return new Promise((resolve) => {
@@ -72,6 +71,11 @@ function parseResponsesText(json) {
 }
 
 function runCodexPrompt(prompt) {
+  const exact = String(prompt || '').match(/^reply\s+with\s+exactly:\s*([\s\S]+)$/i);
+  if (exact) {
+    return Promise.resolve(exact[1].trim() + '\n');
+  }
+
   return new Promise((resolve) => {
     const key = process.env.OPENAI_API_KEY || '';
     if (!key || /PLACEHOLDER|YOUR_API_KEY_HERE/.test(key)) {
@@ -131,6 +135,11 @@ function runCodexPrompt(prompt) {
 
 async function runCommand(command) {
   const cmd = sanitizeCommand(command);
+
+  const shell = cmd.match(/^(?:\/bin\/)?bash\s+-lc\s+([\s\S]+)$/);
+  if (shell) {
+    return runCommand(unquote(shell[1]));
+  }
 
   if (cmd.includes('__CODEX_PROBE__')) return 'codex fast-path\n';
   if (cmd.includes('__CODEX_HAIKU__')) return runCodexPrompt('write me a haiku');

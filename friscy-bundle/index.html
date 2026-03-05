@@ -598,6 +598,7 @@
             <div style="position:absolute; bottom:8px; right:8px; z-index:20; display:flex; gap:0.5rem; background:rgba(13,17,23,0.8); backdrop-filter:blur(4px); padding:4px 8px; border-radius:6px; border:1px solid rgba(89,194,255,0.2);">
                 <button id="pause-btn" title="Pause/Resume Execoution" style="background:none; border:none; color:#e6e1cf; cursor:pointer; font-size:1.1rem; padding:0.2rem;">&#x23F8;</button>
                 <button id="snapshot-btn" title="Create Memory Checkpoint" style="background:none; border:none; color:#ff8f40; cursor:pointer; font-size:1.1rem; padding:0.2rem;">&#x1F4F8;</button>
+                <button id="export-events-btn" title="Export Process Event Proof" style="background:none; border:none; color:#95e6cb; cursor:pointer; font-size:1.1rem; padding:0.2rem;">🧾</button>
             </div>
             <div id="dual-terminal-container">
                 <div class="dual-pane primary">
@@ -632,7 +633,8 @@
 
     <!-- Service worker: caching + COOP/COEP for cross-origin isolation -->
     <script>
-        if ('serviceWorker' in navigator) {
+        const urlParams = new URLSearchParams(location.search);
+        if ('serviceWorker' in navigator && !urlParams.has('nosw')) {
             navigator.serviceWorker.register('./service-worker.js').then(reg => {
                 console.log('Service Worker registered:', reg);
                 // Reload when not yet isolated (first visit)

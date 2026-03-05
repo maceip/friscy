@@ -1,0 +1,6 @@
+Name: friscy
+Description: 
+URL: https://github.com/fwsGonzo/libriscv
+Version: 
+Cflags: -I/usr/include
+Libs: -L/usr/lib -lriscv

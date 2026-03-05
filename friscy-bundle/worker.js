@@ -1170,7 +1170,7 @@ self.onmessage = async function(e) {
             }
             const ptr = Number(dataPtr);
             const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
-            emModule._free(dataPtr);
+            if (liveExport !== emModule._friscy_save_live_checkpoint) emModule._free(dataPtr);
             self.postMessage({
                 type: 'checkpoint-exported-live',
                 data: copy,

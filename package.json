@@ -12,8 +12,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:bundle": "esbuild friscy-bundle/app.ts --bundle --format=iife --platform=browser --target=es2020 --outfile=friscy-bundle/dist/bundle.js",
     "build:swbn": "npm run build && node scripts/sign-bundle.js",
     "lint": "eslint .",
+    "proof:process": "npm run build:bundle && node tests/verify_process_proof.mjs",
+    "proof:process:shots": "npm run build:bundle && node tests/verify_process_proof.mjs",
     "preview": "vite preview",
     "test": "vitest run"
   },

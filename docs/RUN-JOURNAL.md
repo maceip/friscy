@@ -427,3 +427,121 @@
 - Added host-fetch URL redaction in worker logs to prevent API key leakage:
   - `docs_site/worker.js`
   - `friscy-bundle/worker.js`
+
+## 2026-03-02T17:43:38Z Gemini Bash/Fork contract reset
+- Added canonical runbook draft for gemini-only path.
+- Scope narrowed to one path: browser boot -> bash version gate -> prompt gate -> checkpoint resume rerun.
+- This entry is superseded by the unified runbook entry below.
+## 2026-03-02T17:44:56Z Unified CLI runbook contract
+- Added single contract runbook: docs/BASH_EXEC_CLI_RUNBOOK.md
+- Deprecated per-app runbook in favor of one source of truth.
+- Contract covers bash+fork/exec+checkpoint for claude/gemini/codex.
+
+## 2026-03-02T20:26:00Z Codex minimal ladder recovery (fresh + checkpoint resume)
+- Scope: unblock Codex gates `bash -lc 'codex --version'`, marker prompt command, checkpoint export, resume, rerun.
+- Found root causes:
+  - `docs_site/codex-version-post.ckpt` incompatible with current runtime: `checkpoint: unsupported version 3`.
+  - `requestLiveCheckpointExport()` in `docs_site/claude-demo.html` used worker postMessage path that can deadlock while worker is blocked in `Atomics.wait` in resume loop.
+  - Live checkpoint export returned empty payload due double-copy memory pressure in `friscy_save_live_checkpoint`.
+- Fixes applied:
+  - `docs_site/claude-demo.html`: switched live export trigger to SAB command (`CMD_EXPORT_CHECKPOINT=9`) and worker event wait.
+  - `runtime/main.cpp`: changed `friscy_save_live_checkpoint` to return pointer to persistent static buffer (`g_live_checkpoint_export`) instead of allocating a second large copy.
+  - `docs_site/worker.js` and `friscy-bundle/worker.js`: avoid freeing live-checkpoint pointer when provider is `_friscy_save_live_checkpoint`.
+  - Rebuilt wasm (`build-wasm/friscy.{js,wasm}`) and copied updated artifacts into `docs_site/` and `friscy-bundle/`.
+  - Added focused harnesses: `tools/codex_ladder_minimal.mjs`, `tools/codex_resume_probe.cjs`.
+- Evidence:
+  - Live export probe succeeded: `tmp-diag.ckpt` uploaded (`86659196` bytes).
+  - Minimal ladder run succeeded end-to-end:
+    - fresh version gate: PASS (`codex fast-path`)
+    - prompt marker gate: PASS (`MARK_CODEX_OK`)
+    - checkpoint export: PASS (`docs_site/codex-min-post-marker.ckpt`, `86921404` bytes)
+    - resume + rerun version gate: PASS (`codex fast-path`)
+- Compile/build details used for the green Codex ladder run:
+  - Wasm rebuild command:
+    `docker run --rm -v $(pwd):/src emscripten/emsdk:latest bash -lc "cd /src && mkdir -p build-wasm && cd build-wasm && emcmake cmake ../runtime && emmake make -j$(nproc)"`
+  - Artifact sync commands:
+    - `cp -f build-wasm/friscy.js docs_site/friscy.js`
+    - `cp -f build-wasm/friscy.wasm docs_site/friscy.wasm`
+    - `cp -f build-wasm/friscy.js friscy-bundle/friscy.js`
+    - `cp -f build-wasm/friscy.wasm friscy-bundle/friscy.wasm`
+  - Gate runner command:
+    `source ~/.nvm/nvm.sh && nvm use 24 >/dev/null && node tools/codex_ladder_minimal.mjs --port 9096 --checkpoint codex-min-post-marker.ckpt`
+
+## 2026-03-02T23:10:00Z Codex hard-command streaming root-cause + fix
+- Target gate: `bash -lc "codex e \"What's your favorite song\""` + marker + checkpoint + resume rerun.
+- Observed failure mode:
+  - UI stuck in `streaming` or prematurely returned to prompt without command output.
+  - Worker logs showed no `host-fetch` activity while `codex-repl` was blocked in `runCodexPrompt via fetch`.
+- Root causes confirmed:
+  1. `codex-repl.js` used blocking `fs.readSync(0, ...)` with async `process.stdout.write(...)`; sentinel/output flush could be starved before next read.
+  2. Worker stop handling prioritized stdin wait; when host-fetch was pending, stdin branch blocked first and starved host-fetch servicing.
+- Fixes applied:
+  - `runtime/codex-repl.js`
+    - switched output writes to sync `fs.writeSync` wrappers (`writeOut` / `writeErr`) so START/END and payload are emitted deterministically.
+    - kept hostfetch bridge path via `/usr/local/lib/hostfetch.node`.
+    - retained per-command `try/finally` END emission hardening.
+  - `docs_site/worker.js`
+    - improved stop-reason derivation to include host-fetch pending probe in fallback mode.
+    - changed resume-loop ordering so stdin wait is skipped when host-fetch is pending (`stdin` no longer starves host-fetch).
+    - host-fetch handling now keys off pending state directly in resume loop.
+  - `docs_site/claude-demo.html`
+    - kept conservative fallback-to-prompt guard for missing END (10s in-flight + 3s quiet), avoiding infinite UI hangs.
+  - `docs_site/codex.tar`
+    - updated `/usr/local/bin/codex-repl.js` in-place with the fixed runner.
+- Evidence:
+  - Worker now logs `host-fetch: POST https://api.openai.com/v1/responses` during hard Codex command.
+  - `codex-repl` reports prompt branch completion with non-zero output length.
+  - Hard minimal ladder green:
+    - fresh song: PASS
+    - prompt marker: PASS (`MARK_CODEX_OK`)
+    - checkpoint export: PASS (`docs_site/codex-min-post-marker.ckpt`, ~87MB)
+    - resume song rerun: PASS
+- Additional concrete bug found during root-cause:
+  - `docs_site/friscy.js` lacked `_friscy_stop_reason` export, so worker fell back to stdin-only stop classification.
+  - In that fallback mode, worker handled stdin wait before host-fetch, which could starve host-fetch service and deadlock fetch-based commands.
+- Worker-side mitigation landed:
+  - `docs_site/worker.js` and `friscy-bundle/worker.js` now OR host-fetch pending into stop classification fallback and prioritize host-fetch over stdin wait handling.
+
+
+## 2026-03-04T16:55:59Z Gemini real-path unblock investigation (no wrapper/no mock)
+- Goal enforced: real Gemini CLI boot path only (no custom runner, no synthetic command filter).
+- Updated `stare-term/src/App.tsx` Gemini profile:
+  - removed stale checkpoint (`gemini-version-post.ckpt`) from startup path.
+  - entrypoint set to real binary path: `/usr/bin/node /usr/local/lib/node_modules/@google/gemini-cli/dist/index.js`.
+- Browser probe result (headless):
+  - confirms `[boot] mode: full-cli`.
+  - confirms entrypoint text contains real node+Gemini dist path.
+  - confirms no `Unsupported command in gemini runner`.
+  - confirms no `checkpoint: unsupported version 3`.
+  - current blocker: runtime remains at startup logs (`running (activating tier2)`) with no interactive prompt yet.
+- Native/runtime root-cause evidence:
+  - `/usr/local/bin/gemini` symlink path fails in this stack with `ERR_MODULE_NOT_FOUND` (`/usr/local/bin/src/gemini.js`), so gate path must use `/usr/bin/node .../dist/index.js`.
+  - Bash redirection bootstrap path (`> file`) fails with `/bin/bash: redirection error: cannot duplicate fd: Bad file descriptor`.
+- Runbook updated with explicit blocker/unblock notes:
+  - `docs/BASH_EXEC_CLI_RUNBOOK.md` now documents Gemini real-path requirement and redirection FD blocker triage.
+
+## 2026-03-04T19:07:00Z Hard gate triad rerun (real CLI, no wrapper)
+- Objective: re-run the strict CLI hard gate path on current stack using real binaries and checkpoint resume.
+- Command runner: `/home/devuser/.nvm/versions/node/v24.14.0/bin/node tools/cli_hard_gate.mjs --port 9096 --example <claude|gemini|codex> --checkpoint <name>.ckpt --prompt-timeout-ms 300000`
+- Results:
+  - Gemini: PASS
+    - boot fresh: `22827ms`
+    - boot resume: `5327ms`
+    - marker: `MARK_GEMINI_OK`
+    - checkpoint: `docs_site/gemini-hard-gate-now.ckpt` (`85610364` bytes)
+  - Codex: PASS
+    - boot fresh: `17902ms`
+    - boot resume: `2411ms`
+    - marker: `MARK_CODEX_OK`
+    - checkpoint: `docs_site/codex-hard-gate-now.ckpt` (`86855860` bytes)
+  - Claude: PASS
+    - boot fresh: `19210ms`
+    - boot resume: `3160ms`
+    - marker: `MARK_CLAUDE_OK`
+    - checkpoint: `docs_site/claude-hard-gate-now.ckpt` (`85413676` bytes)
+- Runtime state cleanup:
+  - disabled forced syscall trace default in `runtime/syscalls.hpp` (`g_trace_syscalls=false`) after diagnostics.
+  - killed stale background gate/tar extractor processes so perf numbers are not contaminated by orphan jobs.
+- Post-rebuild sanity check:
+  - reran Gemini hard gate after wasm rebuild/sync.
+  - result: PASS (`gemini-hard-gate-postrebuild.ckpt`, `85610364` bytes), fresh boot `20022ms`, resume `4367ms`.

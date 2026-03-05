@@ -1,0 +1,31 @@
+{
+  "ts": "2026-02-28T23:01:04.860Z",
+  "url": "http://127.0.0.1:19726/?example=alpine&procdebug&nosw&cmd=echo%20hi",
+  "boot": {
+    "status": "Error: startup failed",
+    "overlayHidden": false,
+    "terminalVisible": false,
+    "hasRows": false
+  },
+  "terminalText": "",
+  "processEventOverlayVisible": false,
+  "processEventOverlayText": "",
+  "processEvents": [],
+  "processEventsLive": [],
+  "statusText": "Error: startup failed",
+  "browserWindow": {
+    "hasStdinQueue": true,
+    "hasProcessLog": true,
+    "hasProcessEvents": true,
+    "jitStatsExists": true
+  },
+  "expectation": {
+    "command": "/bin/sh -lc \"echo hi\"",
+    "sawCommandOutput": false,
+    "sawProcessEvents": false,
+    "sawProcessEventFields": false,
+    "commandInjectionUsedQueue": true,
+    "boot": false,
+    "waitMs": 15000
+  }
+}

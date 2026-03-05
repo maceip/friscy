@@ -1,0 +1,31 @@
+{
+  "ts": "2026-02-28T21:21:53.108Z",
+  "url": "http://127.0.0.1:9000/?example=alpine&procdebug&nosw",
+  "boot": {
+    "status": "",
+    "overlayHidden": true,
+    "terminalVisible": true,
+    "hasRows": false
+  },
+  "terminalText": "",
+  "processEventOverlayVisible": false,
+  "processEventOverlayText": "",
+  "processEvents": [],
+  "processEventsLive": [],
+  "statusText": "",
+  "browserWindow": {
+    "hasStdinQueue": false,
+    "hasProcessLog": false,
+    "hasProcessEvents": false,
+    "jitStatsExists": false
+  },
+  "expectation": {
+    "command": "/bin/sh -lc \"echo hi\"",
+    "sawCommandOutput": false,
+    "sawProcessEvents": false,
+    "sawProcessEventFields": false,
+    "commandInjectionUsedQueue": false,
+    "boot": false,
+    "waitMs": 90000
+  }
+}

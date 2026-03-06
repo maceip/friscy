@@ -741,7 +741,29 @@ async function runResumeLoop() {
             console.log(`[worker] resume #${resumeCount}`);
         }
         if (rawStopReason & STOP_REASON_TIMESLICE) telemetry.timesliceResumeAttempts++;
-        const stillStopped = await friscy_resume();
+        let stillStopped;
+        // Protection faults from stale execute segments may escape WASM
+        // exception handling (tail-call dispatch prevents C++ catch from
+        // firing). Retry with segment eviction up to 8 times.
+        let faultRetries = 0;
+        while (true) {
+            try {
+                stillStopped = await friscy_resume();
+                break;
+            } catch (resumeErr) {
+                console.error('[worker] friscy_resume threw:', resumeErr?.message || resumeErr);
+                if (faultRetries++ >= 8) {
+                    flushTelemetry('too_many_faults');
+                    return;
+                }
+                if (typeof emModule._friscy_recover_fault === 'function') {
+                    try { emModule._friscy_recover_fault(); } catch (_) {}
+                    continue;
+                }
+                flushTelemetry('resume_exception');
+                return;
+            }
+        }
         maybePostJitStats();
         if (!stillStopped) {
             flushTelemetry('finished_after_resume');
@@ -1065,6 +1087,24 @@ self.onmessage = async function(e) {
         } catch (e) {
             const errMsg = e?.message || String(e);
             const errStack = e?.stack ? `\n${e.stack}` : '';
+
+            // Protection faults may escape C++ try/catch in WASM tail-call mode.
+            // Try to recover by evicting stale execute segments before classifying.
+            const isProtectionFault = typeof errMsg === 'string' &&
+                (errMsg.includes('Protection fault') || errMsg.includes('MachineException'));
+            if (isProtectionFault && typeof emModule._friscy_recover_fault === 'function') {
+                const recovered = emModule._friscy_recover_fault();
+                if (recovered) {
+                    console.log('[worker] recovered from escaped fault in callMain, entering resume loop');
+                    drainProcessEvents();
+                    await runResumeLoop();
+                    drainProcessEvents();
+                    maybePostJitStats(true);
+                    signalExit(0);
+                    return;
+                }
+            }
+
             const cls = classifyRunFailure(e);
             if (cls.graceful) {
                 const diag = JSON.stringify(cls.diagnostics);

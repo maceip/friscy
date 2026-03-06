@@ -106,6 +106,24 @@ EMSCRIPTEN_KEEPALIVE void friscy_clear_last_fault() {
     g_last_fault_data = 0;
 }
 
+// Called from JS when a protection fault escapes C++ try/catch (WASM tail-call
+// dispatch can prevent catch from firing). Evicts stale execute segments and
+// fixes page permissions at the current PC so the next resume succeeds.
+EMSCRIPTEN_KEEPALIVE int friscy_recover_fault() {
+    if (!g_machine) return 0;
+    g_machine->memory.evict_execute_segments();
+    uint64_t pc = g_machine->cpu.pc();
+    if (pc != 0) {
+        riscv::PageAttributes attr;
+        attr.read = true;
+        attr.write = true;
+        attr.exec = true;
+        g_machine->memory.set_page_attr(pc & ~0xFFFULL, 4096, attr);
+    }
+    friscy_clear_last_fault();
+    return 1; // recoverable
+}
+
 // Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
 // Handles page protection faults by making the faulting page writable and
 // retrying. This acts as a simple page fault handler for pages at the
@@ -127,18 +145,15 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 if (syscalls::g_execve_restart) break;
                 if (syscalls::g_fork_child_exited) break;
                 if (!g_machine->instruction_limit_reached()) break;
-                // No yield needed — Worker thread doesn't block UI
             }
-            // Handle fork child exit: restore parent state outside simulate()
             if (syscalls::g_fork_child_exited) {
                 syscalls::fork_parent_restore(*g_machine);
                 retries = -1;
                 continue;
             }
-            // Handle execve: new binary loaded, restart execution
             if (syscalls::g_execve_restart) {
                 syscalls::g_execve_restart = false;
-                retries = -1;  // will be incremented to 0
+                retries = -1;
                 continue;
             }
             resume_log_count++;
@@ -149,7 +164,6 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             }
             return friscy_stopped();
         } catch (const riscv::MachineException& e) {
-            std::cerr << "[trace] resume-machine-exception-catch\n";
             uint64_t fault_addr = e.data();
             g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
             g_last_fault_pc = (uint32_t)g_machine->cpu.pc();
@@ -186,16 +200,27 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 g_machine->cpu.jump(ra);
                 continue;
             }
-            // If this looks like a page protection fault (data address != 0),
-            // make the page writable and retry.
-            if (fault_addr != 0 && retries < 7) {
-                constexpr uint64_t PAGE_MASK = ~0xFFFULL;
-                uint64_t page = fault_addr & PAGE_MASK;
-                riscv::PageAttributes attr;
-                attr.read = true;
-                attr.write = true;
-                attr.exec = true;
-                g_machine->memory.set_page_attr(page, 4096, attr);
+            // Protection fault: either data page or execution page.
+            // Evict stale execute segments to force re-scan, then fix page attrs.
+            if (retries < 7) {
+                g_machine->memory.evict_execute_segments();
+                if (fault_addr != 0) {
+                    constexpr uint64_t PAGE_MASK = ~0xFFFULL;
+                    uint64_t page = fault_addr & PAGE_MASK;
+                    riscv::PageAttributes attr;
+                    attr.read = true;
+                    attr.write = true;
+                    attr.exec = true;
+                    g_machine->memory.set_page_attr(page, 4096, attr);
+                } else {
+                    // Execution fault at current PC — fix the PC's page
+                    uint64_t pc = g_machine->cpu.pc();
+                    riscv::PageAttributes attr;
+                    attr.read = true;
+                    attr.write = true;
+                    attr.exec = true;
+                    g_machine->memory.set_page_attr(pc & ~0xFFFULL, 4096, attr);
+                }
                 g_last_fault_kind = FRISCY_FAULT_NONE;
                 g_last_fault_pc = 0;
                 g_last_fault_data = 0;
@@ -1492,7 +1517,6 @@ int main(int argc, char** argv) {
                           << "\n";
                 break;
             } catch (const riscv::MachineException& e) {
-                std::cerr << "[trace] inner-machine-exception-catch\n";
                 uint64_t fault_addr = e.data();
                 uint64_t crash_pc = machine.cpu.pc();
                 g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
@@ -1567,14 +1591,24 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
-                if (fault_addr != 0 && retries < 7) {
-                    constexpr uint64_t PAGE_MASK = ~0xFFFULL;
-                    uint64_t page = fault_addr & PAGE_MASK;
-                    riscv::PageAttributes attr;
-                    attr.read = true;
-                    attr.write = true;
-                    attr.exec = true;
-                    machine.memory.set_page_attr(page, 4096, attr);
+                if (retries < 7) {
+                    machine.memory.evict_execute_segments();
+                    if (fault_addr != 0) {
+                        constexpr uint64_t PAGE_MASK = ~0xFFFULL;
+                        uint64_t page = fault_addr & PAGE_MASK;
+                        riscv::PageAttributes attr;
+                        attr.read = true;
+                        attr.write = true;
+                        attr.exec = true;
+                        machine.memory.set_page_attr(page, 4096, attr);
+                    } else {
+                        uint64_t pc = machine.cpu.pc();
+                        riscv::PageAttributes attr;
+                        attr.read = true;
+                        attr.write = true;
+                        attr.exec = true;
+                        machine.memory.set_page_attr(pc & ~0xFFFULL, 4096, attr);
+                    }
                     g_last_fault_kind = FRISCY_FAULT_NONE;
                     g_last_fault_pc = 0;
                     g_last_fault_data = 0;
@@ -1634,7 +1668,6 @@ int main(int argc, char** argv) {
         return static_cast<int>(exit_code);
 
     } catch (const riscv::MachineException& e) {
-        std::cerr << "[trace] outer-machine-exception-catch\n";
         std::cerr << "\n[friscy] Machine exception: " << e.what();
         if (e.data() != 0) {
             std::cerr << " (data: 0x" << std::hex << e.data() << std::dec << ")";

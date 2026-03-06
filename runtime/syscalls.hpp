@@ -1903,6 +1903,29 @@ static void sys_execve(Machine& m) {
             std::cout << "[friscy] execve: jumping to 0x" << std::hex
                       << jump_target << std::dec << "\n";
 
+            // Mark the jump target page and surrounding code as executable.
+            // Without this, the CPU faults creating an execute segment for
+            // the new binary's entry point — and in WASM with tail-call
+            // dispatch, the exception can escape C++ catch blocks.
+            {
+                riscv::PageAttributes rwx;
+                rwx.read = true; rwx.write = true; rwx.exec = true;
+                // Entry point page
+                m.memory.set_page_attr(jump_target & ~0xFFFULL, 4096, rwx);
+                // Interpreter code range
+                if (interp_base > 0 && !g_exec_ctx.interp_binary.empty()) {
+                    auto [ilo, ihi] = elf::get_load_range(g_exec_ctx.interp_binary);
+                    m.memory.set_page_attr(interp_base, ihi - ilo, rwx);
+                }
+                // New binary code range
+                if (exec_base > 0) {
+                    auto [mlo, mhi] = elf::get_load_range(g_exec_ctx.exec_binary);
+                    if (mhi > mlo) {
+                        m.memory.set_page_attr(exec_base, mhi - mlo, rwx);
+                    }
+                }
+            }
+
             // CRITICAL: Stop the machine to break out of the threaded dispatch
             // loop cleanly. After evict_execute_segments(), the decoded instruction
             // cache is freed. If we just return from this handler, the dispatch

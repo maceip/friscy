@@ -123,6 +123,7 @@ namespace riscv
 		void      set_exit_address(address_t new_exit);
 		// The initial heap address (*not* the current heap maximum)
 		address_t heap_address() const noexcept { return this->m_heap_address; }
+		void set_heap_address(address_t addr) noexcept { this->m_heap_address = addr; }
 		// Simple memory mapping implementation
 		auto& mmap_cache() noexcept { return m_mmap_cache; }
 		address_t mmap_start() const noexcept { return this->m_heap_address + BRK_MAX; }

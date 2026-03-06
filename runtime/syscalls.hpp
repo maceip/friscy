@@ -147,6 +147,50 @@ struct EpollInstance {
 inline std::unordered_map<int, EpollInstance> g_epoll_instances;
 inline int g_next_epoll_fd = 2000;
 
+// Linux itimerspec layout (two timespec64s = 32 bytes)
+struct linux_itimerspec {
+    int64_t interval_sec;
+    int64_t interval_nsec;
+    int64_t value_sec;
+    int64_t value_nsec;
+};
+
+// timerfd tracking: maps VFS fd → expiration info
+struct TimerFdState {
+    uint64_t interval_ns;    // periodic interval (0 = one-shot)
+    uint64_t expire_ns;      // next expiration time (monotonic ns, 0 = disarmed)
+    uint64_t expirations;    // number of expirations since last read
+};
+inline std::unordered_map<int, TimerFdState> g_timerfd_states;
+
+// Helper: current monotonic time in nanoseconds
+inline uint64_t monotonic_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+// Helper: check and accumulate timerfd expirations
+inline void timerfd_tick(int fd) {
+    auto it = g_timerfd_states.find(fd);
+    if (it == g_timerfd_states.end()) return;
+    auto& st = it->second;
+    if (st.expire_ns == 0) return;  // disarmed
+    uint64_t now = monotonic_ns();
+    if (now >= st.expire_ns) {
+        if (st.interval_ns > 0) {
+            // Count how many intervals have elapsed
+            uint64_t elapsed = now - st.expire_ns;
+            uint64_t n = 1 + elapsed / st.interval_ns;
+            st.expirations += n;
+            st.expire_ns += n * st.interval_ns;
+        } else {
+            st.expirations++;
+            st.expire_ns = 0;  // one-shot: disarm
+        }
+    }
+}
+
 // Process model scaffolding for transition to host-orchestrated process semantics.
 // Phase 0/1 goals:
 // - explicit pid/ppid/pgid fields
@@ -416,6 +460,7 @@ struct ForkState {
     vfs::VirtualFS::FdSnapshot fd_snapshot;
     std::unordered_map<int, int> saved_cloexec_flags;
     std::unordered_map<int, int> saved_status_flags;
+    std::set<int> saved_tty_fds;
     // Thread scheduler snapshot: saved as raw bytes to avoid ordering
     // dependency on ThreadScheduler definition. execve in fork child
     // resets g_sched; must restore parent's thread state on child exit.
@@ -721,6 +766,31 @@ namespace nr {
     constexpr int io_uring_setup = 425;
     constexpr int clone3        = 435;
     constexpr int faccessat2    = 439;
+    constexpr int timerfd_create = 85;
+    constexpr int timerfd_settime = 86;
+    constexpr int timerfd_gettime = 87;
+    constexpr int timer_create   = 107;
+    constexpr int timer_gettime  = 108;
+    constexpr int timer_getoverrun = 109;
+    constexpr int timer_settime  = 110;
+    constexpr int timer_delete   = 111;
+    constexpr int rt_sigsuspend  = 133;
+    constexpr int sendto         = 206;
+    constexpr int recvfrom       = 207;
+    constexpr int sendmmsg       = 269;
+    constexpr int io_uring_enter = 426;
+    constexpr int statfs         = 43;
+    constexpr int fstatfs        = 44;
+    constexpr int getxattr       = 8;
+    constexpr int lgetxattr      = 9;
+    constexpr int fgetxattr      = 10;
+    constexpr int listxattr      = 11;
+    constexpr int llistxattr     = 12;
+    constexpr int flistxattr     = 13;
+    constexpr int setfsuid       = 151;
+    constexpr int setfsgid       = 152;
+    constexpr int getsockopt     = 209;
+    constexpr int riscv_hwprobe  = 258;
 }
 
 // Linux stat64 structure for RISC-V 64
@@ -980,6 +1050,7 @@ inline void fork_parent_restore(Machine& m) {
     get_fs(m).restore_fds(g_fork().fd_snapshot);
     g_fd_cloexec_flags = std::move(g_fork().saved_cloexec_flags);
     g_fd_status_flags = std::move(g_fork().saved_status_flags);
+    g_tty_fds = std::move(g_fork().saved_tty_fds);
 
     // Restore cooperative thread scheduler state
     std::memcpy(&g_sched, g_fork().saved_sched, sizeof(g_sched));
@@ -1010,6 +1081,21 @@ inline void fork_parent_restore(Machine& m) {
 }
 
 namespace handlers {
+
+// Signal mask and action state — needed early by sys_execve
+inline uint64_t g_signal_mask[2] = {0, 0};
+inline uint8_t g_sigactions[64][40] = {};
+
+// POSIX timer state — needed early by sys_execve
+struct PosixTimerState {
+    int clockid;
+    int signo;
+    uint64_t interval_ns;
+    uint64_t expire_ns;
+    uint64_t overruns;
+};
+inline std::unordered_map<int, PosixTimerState> g_posix_timers;
+inline int g_next_timer_id = 1;
 
 // clone — cooperative vfork emulation for single-process emulator.
 // Saves parent state, returns 0 (child context). When child calls
@@ -1226,6 +1312,7 @@ static void sys_clone(Machine& m) {
     g_fork().fd_snapshot = get_fs(m).snapshot_fds();
     g_fork().saved_cloexec_flags = g_fd_cloexec_flags;
     g_fork().saved_status_flags = g_fd_status_flags;
+    g_fork().saved_tty_fds = g_tty_fds;
 
     // Save cooperative thread scheduler state. The fork child's execve
     // resets g_sched, and we need to restore the parent's thread state
@@ -1413,6 +1500,7 @@ static void sys_clone3(Machine& m) {
     g_fork().fd_snapshot = get_fs(m).snapshot_fds();
     g_fork().saved_cloexec_flags = g_fd_cloexec_flags;
     g_fork().saved_status_flags = g_fd_status_flags;
+    g_fork().saved_tty_fds = g_tty_fds;
     static_assert(sizeof(ForkState::saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork().saved_sched, &g_sched, sizeof(g_sched));
     g_fork().saved_mmap_address = m.memory.mmap_address();
@@ -1699,11 +1787,16 @@ static void sys_execve(Machine& m) {
             }
 
             // CRITICAL: Reset cooperative thread scheduler before execve.
-            // The old binary's threads have stale register/stack state that
-            // must not survive into the new binary. If we don't reset,
-            // load_elf_segments may crash when libriscv internals interact
-            // with stale thread state (e.g. decoder cache entries).
-            g_sched.init(g_sched.threads[g_sched.current].tid);
+            // Reset cooperative thread scheduler to match fresh Machine state.
+            // In a direct run, g_sched.count=0, so set_tid_address returns 1
+            // and the first clone initializes the scheduler. Match this behavior
+            // after execve for identical thread ID semantics.
+            for (int i = 0; i < MAX_VTHREADS; i++) {
+                g_sched.threads[i].active = false;
+                g_sched.threads[i].waiting = false;
+            }
+            g_sched.count = 0;
+            g_sched.current = 0;
 
             // CRITICAL: Evict all stale decoder/execute segments from the old
             // binary BEFORE loading new code. set_page_attr does NOT invalidate
@@ -1711,6 +1804,8 @@ static void sys_execve(Machine& m) {
             // decoded instructions → "Execution space protection fault" and
             // "Max execute segments reached".
             m.memory.evict_execute_segments();
+            // Clear mmap free-list cache — stale entries from parent process
+            m.memory.mmap_cache() = {};
 
             // In arena mode, skip set_page_attr for old/new ranges.
             // Arena reads/writes bypass page attributes entirely, so these
@@ -1740,6 +1835,17 @@ static void sys_execve(Machine& m) {
             // Extract all ELF info BEFORE loading (load_elf_segments may cause
             // stack corruption with LTO inlining when called in fork context)
             auto [rw_lo, rw_hi] = elf::get_writable_range(new_binary);
+
+            // NUCLEAR ZERO: After fork+exec, the arena has stale data from the
+            // parent process (bash) everywhere. The parent's interpreter BSS,
+            // stack, heap/mmap data all persist. V8's abseil mutexes detect
+            // stale non-zero values and abort. Zero the ENTIRE arena to simulate
+            // a fresh process address space, just like a real execve would give.
+            if constexpr (riscv::encompassing_Nbit_arena > 0) {
+                auto* arena = (uint8_t*)m.memory.memory_arena_ptr();
+                size_t arena_size = m.memory.memory_arena_size();
+                std::memset(arena, 0, arena_size);
+            }
 
             // Load new main binary segments
             if (exec_info.type == elf::ET_DYN) {
@@ -1823,19 +1929,20 @@ static void sys_execve(Machine& m) {
             // 1. Setting brk to start after the new binary's BSS
             // 2. Ensuring mmap_address is above brk + BRK_MAX
             {
-                // Find the highest address used by new binary + interpreter
-                uint64_t max_end = load_end;  // end of new binary's segments
-                if (exec_info.is_dynamic) {
-                    auto [ilo, ihi] = elf::get_load_range(g_exec_ctx.interp_binary);
-                    uint64_t interp_end = interp_base + (ihi - ilo);
-                    if (interp_end > max_end) max_end = interp_end;
-                }
-
-                // Page-align the new brk base
-                uint64_t new_brk_base = (max_end + 4095) & ~4095ULL;
+                // Use ONLY the main binary's end for brk_base, matching
+                // libriscv's Machine constructor behavior. The interpreter is
+                // loaded separately and doesn't affect the brk region.
+                // This ensures brk(0) returns the same value in both direct
+                // and fork+exec paths.
+                uint64_t new_brk_base = (load_end + 4095) & ~4095ULL;
                 g_exec_ctx.brk_base = new_brk_base;
                 g_exec_ctx.brk_current = new_brk_base;
                 g_exec_ctx.brk_overridden = true;
+
+                // CRITICAL: Update libriscv's m_heap_address so that
+                // mmap_start() = heap_address + BRK_MAX reflects the NEW
+                // binary's layout, matching the Machine constructor behavior.
+                m.memory.set_heap_address(new_brk_base);
 
                 // Make brk area writable (16MB)
                 constexpr uint64_t BRK_MAX = 16ULL << 20;
@@ -1843,38 +1950,65 @@ static void sys_execve(Machine& m) {
                 rw.read = true; rw.write = true;
                 m.memory.set_page_attr(new_brk_base, BRK_MAX, rw);
 
-                // Ensure mmap bump pointer is above brk area
-                uint64_t new_mmap_start = new_brk_base + BRK_MAX;
-                if (m.memory.mmap_address() < new_mmap_start) {
-                    m.memory.mmap_address() = new_mmap_start;
+                // Replicate the initial setup from main.cpp:
+                // 1. mmap_address = heap_address + BRK_MAX (from constructor)
+                // 2. Advance past interpreter (from main.cpp line 1094)
+                // 3. Allocate 64MB heap (from main.cpp line 1124)
+                uint64_t new_mmap_addr = new_brk_base + BRK_MAX;
+
+                // Advance past interpreter if present
+                if (exec_info.is_dynamic && !g_exec_ctx.interp_binary.empty()) {
+                    auto [ilo, ihi] = elf::get_load_range(g_exec_ctx.interp_binary);
+                    uint64_t interp_end_page = (interp_base + ihi + 0xFFF) & ~0xFFFULL;
+                    if (new_mmap_addr < interp_end_page) {
+                        new_mmap_addr = interp_end_page;
+                    }
                 }
 
+                // Allocate 64MB heap space (matching main.cpp mmap_allocate(64MB))
+                new_mmap_addr = (new_mmap_addr + 4095) & ~4095ULL;
+                new_mmap_addr += 64ULL << 20;  // 64MB heap
+
+                m.memory.mmap_address() = new_mmap_addr;
+                g_mmap_bump = new_mmap_addr;
             }
 
-            // Relocate stack above the brk area so it doesn't get clobbered
-            // by malloc/brk. The brk area is [new_brk_base, new_brk_base+BRK_MAX].
-            // The mmap bump pointer is above that. Place stack above mmap start.
-            constexpr uint64_t STACK_SIZE = 0x20000;  // 128KB
-            uint64_t mmap_top = m.memory.mmap_address();
-            uint64_t new_stack_top = mmap_top + STACK_SIZE;
-            // Make sure stack fits in arena
-            if constexpr (riscv::encompassing_Nbit_arena > 0) {
-                constexpr uint64_t ARENA = 1ULL << riscv::encompassing_Nbit_arena;
-                if (new_stack_top >= ARENA) {
-                    // Fall back to just below interpreter
-                    new_stack_top = interp_base - 0x1000;
-                }
-            }
+            // Place stack in the same location as the Machine constructor:
+            // between brk+BRK_MAX and the interpreter. This matches the
+            // direct run's layout where mmap_allocate(1MB) returns
+            // heap_address + BRK_MAX = brk_base + BRK_MAX.
+            constexpr uint64_t STACK_SIZE = 1ULL << 20;  // 1MB (matching Machine default)
+            uint64_t stack_base = g_exec_ctx.brk_base + (16ULL << 20); // brk + BRK_MAX
+            uint64_t new_stack_top = stack_base + STACK_SIZE;
             {
                 riscv::PageAttributes rw;
                 rw.read = true; rw.write = true;
-                m.memory.set_page_attr(new_stack_top - STACK_SIZE, STACK_SIZE, rw);
-            }
-            // Advance mmap past the stack so future mmap doesn't overlap
-            if (m.memory.mmap_address() < new_stack_top + 0x1000) {
-                m.memory.mmap_address() = new_stack_top + 0x1000;
+                m.memory.set_page_attr(stack_base, STACK_SIZE, rw);
             }
             g_exec_ctx.original_stack_top = new_stack_top;
+
+            // POSIX execve semantics: reset signal dispositions and close CLOEXEC fds
+            g_signal_mask[0] = 0;
+            g_signal_mask[1] = 0;
+            std::memset(g_sigactions, 0, sizeof(g_sigactions));
+            // Close FD_CLOEXEC file descriptors
+            {
+                std::vector<int> to_close;
+                for (auto& [cfd, cflags] : g_fd_cloexec_flags) {
+                    if (cflags & 1) to_close.push_back(cfd);
+                }
+                for (int cfd : to_close) {
+                    fs.close(cfd);
+                    g_fd_cloexec_flags.erase(cfd);
+                    g_fd_status_flags.erase(cfd);
+                    g_tty_fds.erase(cfd);
+                    g_eventfd_counters.erase(cfd);
+                    g_timerfd_states.erase(cfd);
+                    g_epoll_instances.erase(cfd);
+                }
+            }
+            // Reset POSIX timers
+            g_posix_timers.clear();
 
             // Set up fresh stack
             uint64_t sp = dynlink::setup_dynamic_stack(
@@ -1894,14 +2028,21 @@ static void sys_execve(Machine& m) {
                 } catch (...) {}
             }
 
-            // Clear registers and jump
+            // Clear all registers (integer, FP, FCSR) — POSIX execve starts clean
             for (int i = 1; i < 32; i++) m.cpu.reg(i) = 0;
+            for (int i = 0; i < 32; i++) m.cpu.registers().getfl(i).i64 = 0;
+            m.cpu.registers().fcsr() = {};
             m.cpu.reg(riscv::REG_SP) = sp;
             uint64_t jump_target = exec_info.is_dynamic ? interp_entry : exec_info.entry_point;
             m.cpu.jump(jump_target);
 
             std::cout << "[friscy] execve: jumping to 0x" << std::hex
                       << jump_target << std::dec << "\n";
+
+            // Enable syscall tracing for new binary startup debugging
+            if (new_binary.size() > 10000000) {  // large binary like node
+                riscv::g_execve_trace_remaining_init = 200;
+            }
 
             // Mark the jump target page and surrounding code as executable.
             // Without this, the CPU faults creating an execute segment for
@@ -1957,8 +2098,13 @@ static void sys_execve(Machine& m) {
     // the dynamic linker. Without this, the interpreter finds the parent's
     // stale malloc metadata and lock state, causing allocator crashes.
 
-    // Reset cooperative thread scheduler (child has its own thread state)
-    g_sched.init(g_sched.threads[g_sched.current].tid);
+    // Reset cooperative thread scheduler to match fresh Machine state
+    for (int i = 0; i < MAX_VTHREADS; i++) {
+        g_sched.threads[i].active = false;
+        g_sched.threads[i].waiting = false;
+    }
+    g_sched.count = 0;
+    g_sched.current = 0;
 
     // Evict stale decoder caches — segment data will be reloaded
     m.memory.evict_execute_segments();
@@ -2133,6 +2279,7 @@ static void sys_close(Machine& m) {
         || fs.is_open(fd)
         || g_epoll_instances.count(fd)
         || g_eventfd_counters.count(fd)
+        || g_timerfd_states.count(fd)
         || (net_is_socket_fd && net_is_socket_fd(fd))
         || is_vh_fd(fd);
 
@@ -2158,9 +2305,10 @@ static void sys_close(Machine& m) {
     g_fd_cloexec_flags.erase(fd);
     g_fd_status_flags.erase(fd);
 
-    // Clean up epoll/eventfd state
+    // Clean up epoll/eventfd/timerfd state
     g_epoll_instances.erase(fd);
     g_eventfd_counters.erase(fd);
+    g_timerfd_states.erase(fd);
 
     if (is_vh_fd(fd)) {
 #ifdef __EMSCRIPTEN__
@@ -2216,6 +2364,28 @@ static void sys_read(Machine& m) {
         }
         // Reset file offset for next write
         fs2.lseek(fd, 0, 0);  // SEEK_SET
+        m.memory.template write<uint64_t>(buf_addr, val);
+        m.set_result(8);
+        return;
+    }
+
+    // timerfd: return 8-byte expiration count
+    if (fd > 2 && g_timerfd_states.count(fd)) {
+        if (count < 8) {
+            m.set_result(-22);  // -EINVAL
+            return;
+        }
+        timerfd_tick(fd);
+        auto& st = g_timerfd_states[fd];
+        if (st.expirations == 0) {
+            m.set_result(-11);  // -EAGAIN
+            return;
+        }
+        uint64_t val = st.expirations;
+        st.expirations = 0;
+        // Clear Fifo content so epoll sees empty
+        auto entry = fs.get_entry(fd);
+        if (entry) { entry->content.clear(); entry->size = 0; }
         m.memory.template write<uint64_t>(buf_addr, val);
         m.set_result(8);
         return;
@@ -3323,16 +3493,82 @@ static void sys_munmap(Machine& m) {
     m.set_result(0);
 }
 
+// g_signal_mask and g_sigactions defined at top of namespace handlers block
+
 static void sys_sigaction(Machine& m) {
-    if (g_trace_syscalls && g_trace_countdown-- > 0) {
-        auto signum = m.template sysarg<int>(0);
-        fprintf(stderr, "[TRACE] sigaction(sig=%d) => 0 pc=0x%lx\n", signum, (long)m.cpu.pc());
+    int signum = m.template sysarg<int>(0);
+    auto act_addr = m.sysarg(1);    // new action (or 0)
+    auto oldact_addr = m.sysarg(2); // old action output (or 0)
+    auto sigsetsize = m.sysarg(3);  // size of sigset_t in the mask field
+
+    TRACE_SC("sigaction(sig=%d, act=0x%lx, oldact=0x%lx, setsize=%lu)",
+             signum, (long)act_addr, (long)oldact_addr, (long)sigsetsize);
+
+    if (signum < 1 || signum > 64) {
+        m.set_result(err::INVAL);
+        return;
     }
+
+    // Write old action if requested
+    if (oldact_addr != 0) {
+        m.memory.memcpy(oldact_addr, g_sigactions[signum - 1], 40);
+    }
+
+    // Store new action if provided
+    if (act_addr != 0) {
+        m.memory.memcpy_out(g_sigactions[signum - 1], act_addr, 40);
+    }
+
     m.set_result(0);
 }
+
 static void sys_sigprocmask(Machine& m) {
-    if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] sigprocmask() => 0 pc=0x%lx\n", (long)m.cpu.pc());
+    int how = m.template sysarg<int>(0);
+    auto set_addr = m.sysarg(1);     // new mask (or 0)
+    auto oldset_addr = m.sysarg(2);  // old mask output (or 0)
+    auto sigsetsize = m.sysarg(3);   // typically 8
+
+    TRACE_SC("sigprocmask(how=%d, set=0x%lx, oldset=0x%lx, size=%lu)",
+             how, (long)set_addr, (long)oldset_addr, (long)sigsetsize);
+
+    // Write old mask if requested
+    if (oldset_addr != 0) {
+        if (sigsetsize >= 16) {
+            m.memory.template write<uint64_t>(oldset_addr, g_signal_mask[0]);
+            m.memory.template write<uint64_t>(oldset_addr + 8, g_signal_mask[1]);
+        } else if (sigsetsize >= 8) {
+            m.memory.template write<uint64_t>(oldset_addr, g_signal_mask[0]);
+        }
+    }
+
+    // Apply new mask if provided
+    if (set_addr != 0) {
+        uint64_t new_mask[2] = {0, 0};
+        if (sigsetsize >= 16) {
+            new_mask[0] = m.memory.template read<uint64_t>(set_addr);
+            new_mask[1] = m.memory.template read<uint64_t>(set_addr + 8);
+        } else if (sigsetsize >= 8) {
+            new_mask[0] = m.memory.template read<uint64_t>(set_addr);
+        }
+
+        constexpr int SIG_BLOCK = 0;
+        constexpr int SIG_UNBLOCK = 1;
+        constexpr int SIG_SETMASK = 2;
+        switch (how) {
+            case SIG_BLOCK:
+                g_signal_mask[0] |= new_mask[0];
+                g_signal_mask[1] |= new_mask[1];
+                break;
+            case SIG_UNBLOCK:
+                g_signal_mask[0] &= ~new_mask[0];
+                g_signal_mask[1] &= ~new_mask[1];
+                break;
+            case SIG_SETMASK:
+                g_signal_mask[0] = new_mask[0];
+                g_signal_mask[1] = new_mask[1];
+                break;
+        }
+    }
     m.set_result(0);
 }
 static void sys_prlimit64(Machine& m) {
@@ -4323,6 +4559,16 @@ static void sys_ppoll(Machine& m) {
                 }
             }
 #endif
+            // timerfd: only POLLIN when expired
+            if (g_timerfd_states.count(fd)) {
+                timerfd_tick(fd);
+                if (g_timerfd_states[fd].expirations > 0) {
+                    revents |= (events & 0x0001); // POLLIN
+                    if (revents) ready++;
+                }
+                m.memory.template write<int16_t>(entry_addr + 6, revents);
+                continue;
+            }
             // VFS file descriptors are always ready
             revents |= (events & 0x0001); // POLLIN if requested
             if (revents) ready++;
@@ -4487,6 +4733,11 @@ static void sys_epoll_pwait(Machine& m) {
                 if (interest.events & 0x01) revents |= 0x01;
                 if (interest.events & 0x04) revents |= 0x04;
             }
+        } else if (g_timerfd_states.count(fd)) {
+            // timerfd: check if expired
+            timerfd_tick(fd);
+            if ((interest.events & 0x01) && g_timerfd_states[fd].expirations > 0)
+                revents |= 0x01;
         }
 #ifdef __EMSCRIPTEN__
         else if (net_is_socket_fd && net_is_socket_fd(fd)) {
@@ -5061,6 +5312,117 @@ static void sys_eventfd2(Machine& m) {
     if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[eventfd2] => fd=%d initval=%u\n", fd, initval);
     m.set_result(fd);
 }
+// timerfd_create(clockid, flags) → fd
+static void sys_timerfd_create(Machine& m) {
+    int clockid = m.template sysarg<int>(0);
+    int flags = m.template sysarg<int>(1);
+    (void)clockid; (void)flags;
+    auto& fs = get_fs(m);
+    auto entry = std::make_shared<vfs::Entry>();
+    entry->type = vfs::FileType::Fifo;
+    entry->mode = 0600;
+    entry->size = 0;
+    int fd = fs.open_pipe(entry, 0);
+    g_timerfd_states[fd] = {0, 0, 0};
+    TRACE_SC("timerfd_create(clockid=%d, flags=0x%x) => fd=%d", clockid, flags, fd);
+    m.set_result(fd);
+}
+
+// linux_itimerspec defined near top of file (see TimerFdState section)
+
+// timerfd_settime(fd, flags, new_value, old_value) → 0 or -errno
+static void sys_timerfd_settime(Machine& m) {
+    int fd = m.template sysarg<int>(0);
+    int flags = m.template sysarg<int>(1);
+    auto new_addr = m.sysarg(2);
+    auto old_addr = m.sysarg(3);
+
+    auto it = g_timerfd_states.find(fd);
+    if (it == g_timerfd_states.end()) {
+        m.set_result(err::BADF);
+        return;
+    }
+    auto& st = it->second;
+
+    // Return old value if requested
+    if (old_addr != 0) {
+        linux_itimerspec old_val = {};
+        old_val.interval_sec = st.interval_ns / 1000000000ULL;
+        old_val.interval_nsec = st.interval_ns % 1000000000ULL;
+        if (st.expire_ns > 0) {
+            uint64_t now = monotonic_ns();
+            int64_t remaining = (int64_t)(st.expire_ns - now);
+            if (remaining < 0) remaining = 0;
+            old_val.value_sec = remaining / 1000000000LL;
+            old_val.value_nsec = remaining % 1000000000LL;
+        }
+        m.memory.memcpy(old_addr, &old_val, sizeof(old_val));
+    }
+
+    // Read new value
+    linux_itimerspec spec = {};
+    m.memory.memcpy_out(&spec, new_addr, sizeof(spec));
+
+    st.interval_ns = (uint64_t)spec.interval_sec * 1000000000ULL + (uint64_t)spec.interval_nsec;
+    st.expirations = 0;
+
+    uint64_t value_ns = (uint64_t)spec.value_sec * 1000000000ULL + (uint64_t)spec.value_nsec;
+    if (value_ns == 0) {
+        st.expire_ns = 0;  // disarm
+    } else {
+        constexpr int TFD_TIMER_ABSTIME = 1;
+        if (flags & TFD_TIMER_ABSTIME) {
+            st.expire_ns = value_ns;
+        } else {
+            st.expire_ns = monotonic_ns() + value_ns;
+        }
+    }
+
+    // If timer already expired, mark it readable for epoll/poll
+    timerfd_tick(fd);
+    if (st.expirations > 0) {
+        auto entry = get_fs(m).get_entry(fd);
+        if (entry) {
+            entry->content.resize(8);
+            uint64_t exp = st.expirations;
+            memcpy(entry->content.data(), &exp, 8);
+            entry->size = 8;
+        }
+    }
+
+    TRACE_SC("timerfd_settime(fd=%d, flags=%d, val=%ld.%09ld, interval=%ld.%09ld)",
+             fd, flags, (long)spec.value_sec, (long)spec.value_nsec,
+             (long)spec.interval_sec, (long)spec.interval_nsec);
+    m.set_result(0);
+}
+
+// timerfd_gettime(fd, curr_value) → 0 or -errno
+static void sys_timerfd_gettime(Machine& m) {
+    int fd = m.template sysarg<int>(0);
+    auto addr = m.sysarg(1);
+
+    auto it = g_timerfd_states.find(fd);
+    if (it == g_timerfd_states.end()) {
+        m.set_result(err::BADF);
+        return;
+    }
+    auto& st = it->second;
+    timerfd_tick(fd);
+
+    linux_itimerspec val = {};
+    val.interval_sec = st.interval_ns / 1000000000ULL;
+    val.interval_nsec = st.interval_ns % 1000000000ULL;
+    if (st.expire_ns > 0) {
+        uint64_t now = monotonic_ns();
+        int64_t remaining = (int64_t)(st.expire_ns - now);
+        if (remaining < 0) remaining = 0;
+        val.value_sec = remaining / 1000000000LL;
+        val.value_nsec = remaining % 1000000000LL;
+    }
+    m.memory.memcpy(addr, &val, sizeof(val));
+    m.set_result(0);
+}
+
 static void sys_io_uring_setup(Machine& m) { m.set_result(err::NOSYS); }
 static void sys_capget(Machine& m) { m.set_result(-1); }  // -EPERM
 
@@ -5325,7 +5687,14 @@ static void sys_tkill(Machine& m) {
         if (!dumped) {
             dumped = true;
             fprintf(stderr, "[ABORT] tkill(SIGABRT) received. Node.js or guest app is aborting.\n");
-            fprintf(stderr, "[ABORT] Note: Syscall ring buffer is not enabled in this libriscv build.\n");
+            // Dump syscall ring buffer
+            fprintf(stderr, "[ABORT] ring_idx=%d, Last 32 syscalls:\n", riscv::g_syscall_ring_idx);
+            for (int j = 0; j < 32; j++) {
+                int idx = (riscv::g_syscall_ring_idx - 32 + j + 1024) % 32;
+                auto& e = riscv::g_syscall_ring[idx];
+                fprintf(stderr, "  [%d] idx=%d sys#%zu a0=0x%lx a1=0x%lx ret=%ld pc=0x%lx\n",
+                        j, idx, e.sysnum, (long)e.a0, (long)e.a1, (long)e.a2, (long)e.result, (long)e.pc);
+            }
         }
         fprintf(stderr, "[ABORT] tkill(SIGABRT)! PC=0x%lx RA=0x%lx SP=0x%lx\n",
                 (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2));
@@ -5502,8 +5871,6 @@ static void sys_sendmsg(Machine& m) {
     m.set_result(total);
 }
 
-}  // namespace handlers
-
 // Custom brk handler: after execve, libriscv's m_heap_address is stale
 // (points into the old binary's address range). This handler uses
 // g_exec_ctx.brk_base/brk_current which are updated by execve to point
@@ -5552,12 +5919,7 @@ static void sys_brk(Machine& m) {
     m.set_result(new_end);
 }
 
-// Syscall stubs discovered from QEMU strace of Node.js
-namespace nr {
-    // getsockname (204) is handled by network.hpp — do NOT re-register here
-    constexpr int getsockopt     = 209;
-    constexpr int riscv_hwprobe  = 258;
-}
+// getsockopt, riscv_hwprobe nr constants are in the outer nr namespace (line ~667)
 
 static void sys_getsockopt(Machine& m) {
     m.set_result(-88);  // -ENOTSOCK
@@ -5565,6 +5927,286 @@ static void sys_getsockopt(Machine& m) {
 
 static void sys_riscv_hwprobe(Machine& m) {
     m.set_result(-38);  // -ENOSYS — musl handles the fallback gracefully
+}
+
+// ============================================================================
+// Round 4: Node.js / Claude Code — discovered via strace of node doing
+// fetch + crypto + file I/O + child_process + timers
+// ============================================================================
+
+// io_uring_enter(fd, to_submit, min_complete, flags, ...) — Node.js probes
+// for io_uring support; returning ENOSYS makes it fall back to epoll.
+static void sys_io_uring_enter(Machine& m) {
+    m.set_result(err::NOSYS);
+}
+
+// lgetxattr / fgetxattr / listxattr / llistxattr / flistxattr
+// Extended attributes — not supported in our VFS. Return ENOTSUP so callers
+// (Node.js fs.stat, Python os.listxattr) use fallback paths.
+static void sys_lgetxattr(Machine& m)  { m.set_result(-95); } // -ENOTSUP
+static void sys_fgetxattr(Machine& m)  { m.set_result(-95); }
+static void sys_getxattr(Machine& m)   { m.set_result(-95); }
+static void sys_listxattr(Machine& m)  { m.set_result(-95); }
+static void sys_llistxattr(Machine& m) { m.set_result(-95); }
+static void sys_flistxattr(Machine& m) { m.set_result(-95); }
+
+// statfs / fstatfs — filesystem statistics
+// Return plausible values for a tmpfs-like filesystem.
+struct linux_statfs64 {
+    int64_t f_type;       // filesystem type (TMPFS_MAGIC = 0x01021994)
+    int64_t f_bsize;      // block size
+    int64_t f_blocks;     // total blocks
+    int64_t f_bfree;      // free blocks
+    int64_t f_bavail;     // available blocks (non-root)
+    int64_t f_files;      // total inodes
+    int64_t f_ffree;      // free inodes
+    int64_t f_fsid[2];    // filesystem ID
+    int64_t f_namelen;    // max filename length
+    int64_t f_frsize;     // fragment size
+    int64_t f_flags;      // mount flags
+    int64_t f_spare[4];   // padding
+};
+
+static void sys_statfs(Machine& m) {
+    auto path_addr = m.sysarg(0);
+    auto buf_addr = m.sysarg(1);
+    (void)path_addr;
+    linux_statfs64 st = {};
+    st.f_type = 0x01021994;  // TMPFS_MAGIC
+    st.f_bsize = 4096;
+    st.f_blocks = 262144;    // 1GB in 4K blocks
+    st.f_bfree = 131072;     // 512MB free
+    st.f_bavail = 131072;
+    st.f_files = 65536;
+    st.f_ffree = 32768;
+    st.f_namelen = 255;
+    st.f_frsize = 4096;
+    m.memory.memcpy(buf_addr, &st, sizeof(st));
+    m.set_result(0);
+}
+
+static void sys_fstatfs(Machine& m) {
+    int fd = m.template sysarg<int>(0);
+    auto buf_addr = m.sysarg(1);
+    (void)fd;
+    linux_statfs64 st = {};
+    st.f_type = 0x01021994;
+    st.f_bsize = 4096;
+    st.f_blocks = 262144;
+    st.f_bfree = 131072;
+    st.f_bavail = 131072;
+    st.f_files = 65536;
+    st.f_ffree = 32768;
+    st.f_namelen = 255;
+    st.f_frsize = 4096;
+    m.memory.memcpy(buf_addr, &st, sizeof(st));
+    m.set_result(0);
+}
+
+// POSIX timers: timer_create / timer_settime / timer_gettime / timer_delete
+// Node.js uses these for profiling and CPU time limits. We implement them as
+// PosixTimerState, g_posix_timers, g_next_timer_id defined at top of namespace handlers block
+
+// timer_create(clockid, sevp, timerid_ptr)
+static void sys_timer_create(Machine& m) {
+    int clockid = m.template sysarg<int>(0);
+    auto sevp_addr = m.sysarg(1);
+    auto tid_addr = m.sysarg(2);
+
+    int timer_id = g_next_timer_id++;
+    PosixTimerState st = {};
+    st.clockid = clockid;
+    st.signo = 14; // default SIGALRM
+
+    // Read sigevent if provided (sevp != NULL)
+    if (sevp_addr != 0) {
+        // struct sigevent layout on riscv64:
+        // int sigev_value (8 bytes union), int sigev_signo (4), int sigev_notify (4), ...
+        // We just need sigev_signo and sigev_notify
+        int32_t sigev_signo = m.memory.template read<int32_t>(sevp_addr + 8);
+        int32_t sigev_notify = m.memory.template read<int32_t>(sevp_addr + 12);
+        if (sigev_notify == 0 /* SIGEV_SIGNAL */) {
+            st.signo = sigev_signo;
+        }
+        // SIGEV_NONE (1) = don't deliver signal, just track
+        // SIGEV_THREAD (2) = not supported, but still create the timer
+    }
+
+    g_posix_timers[timer_id] = st;
+    m.memory.template write<int32_t>(tid_addr, timer_id);
+    TRACE_SC("timer_create(clockid=%d) => timer_id=%d", clockid, timer_id);
+    m.set_result(0);
+}
+
+// timer_settime(timerid, flags, new_value, old_value)
+static void sys_timer_settime(Machine& m) {
+    int timer_id = m.template sysarg<int>(0);
+    int flags = m.template sysarg<int>(1);
+    auto new_addr = m.sysarg(2);
+    auto old_addr = m.sysarg(3);
+
+    auto it = g_posix_timers.find(timer_id);
+    if (it == g_posix_timers.end()) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    auto& st = it->second;
+
+    // Return old value
+    if (old_addr != 0) {
+        linux_itimerspec old_val = {};
+        old_val.interval_sec = st.interval_ns / 1000000000ULL;
+        old_val.interval_nsec = st.interval_ns % 1000000000ULL;
+        if (st.expire_ns > 0) {
+            uint64_t now = monotonic_ns();
+            int64_t rem = (int64_t)(st.expire_ns - now);
+            if (rem < 0) rem = 0;
+            old_val.value_sec = rem / 1000000000LL;
+            old_val.value_nsec = rem % 1000000000LL;
+        }
+        m.memory.memcpy(old_addr, &old_val, sizeof(old_val));
+    }
+
+    linux_itimerspec spec = {};
+    m.memory.memcpy_out(&spec, new_addr, sizeof(spec));
+
+    st.interval_ns = (uint64_t)spec.interval_sec * 1000000000ULL + (uint64_t)spec.interval_nsec;
+    st.overruns = 0;
+
+    uint64_t value_ns = (uint64_t)spec.value_sec * 1000000000ULL + (uint64_t)spec.value_nsec;
+    if (value_ns == 0) {
+        st.expire_ns = 0;  // disarm
+    } else if (flags & 1 /* TIMER_ABSTIME */) {
+        st.expire_ns = value_ns;
+    } else {
+        st.expire_ns = monotonic_ns() + value_ns;
+    }
+
+    TRACE_SC("timer_settime(id=%d, flags=%d, val=%ld.%09ld, interval=%ld.%09ld)",
+             timer_id, flags, (long)spec.value_sec, (long)spec.value_nsec,
+             (long)spec.interval_sec, (long)spec.interval_nsec);
+    m.set_result(0);
+}
+
+// timer_gettime(timerid, curr_value)
+static void sys_timer_gettime(Machine& m) {
+    int timer_id = m.template sysarg<int>(0);
+    auto addr = m.sysarg(1);
+    auto it = g_posix_timers.find(timer_id);
+    if (it == g_posix_timers.end()) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    auto& st = it->second;
+    linux_itimerspec val = {};
+    val.interval_sec = st.interval_ns / 1000000000ULL;
+    val.interval_nsec = st.interval_ns % 1000000000ULL;
+    if (st.expire_ns > 0) {
+        uint64_t now = monotonic_ns();
+        int64_t rem = (int64_t)(st.expire_ns - now);
+        if (rem < 0) rem = 0;
+        val.value_sec = rem / 1000000000LL;
+        val.value_nsec = rem % 1000000000LL;
+    }
+    m.memory.memcpy(addr, &val, sizeof(val));
+    m.set_result(0);
+}
+
+// timer_getoverrun(timerid)
+static void sys_timer_getoverrun(Machine& m) {
+    int timer_id = m.template sysarg<int>(0);
+    auto it = g_posix_timers.find(timer_id);
+    if (it == g_posix_timers.end()) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    m.set_result((int64_t)it->second.overruns);
+}
+
+// timer_delete(timerid)
+static void sys_timer_delete(Machine& m) {
+    int timer_id = m.template sysarg<int>(0);
+    auto it = g_posix_timers.find(timer_id);
+    if (it == g_posix_timers.end()) {
+        m.set_result(err::INVAL);
+        return;
+    }
+    g_posix_timers.erase(it);
+    m.set_result(0);
+}
+
+// setfsuid / setfsgid — set filesystem UID/GID. We run as root, accept silently.
+static void sys_setfsuid(Machine& m) { m.set_result(0); }
+static void sys_setfsgid(Machine& m) { m.set_result(0); }
+
+// rt_sigsuspend(sigmask, sigsetsize) — atomically replace signal mask and
+// suspend until a signal is delivered. In our single-process emulation,
+// signals are not asynchronously delivered, so this would block forever.
+// Return -EINTR immediately (as if a signal was delivered) which is the
+// only valid return value for sigsuspend.
+static void sys_rt_sigsuspend(Machine& m) {
+    m.set_result(-4);  // -EINTR
+}
+
+// sendmmsg(sockfd, msgvec, vlen, flags) — send multiple messages.
+// Node.js DNS resolver uses this for parallel DNS queries.
+static void sys_sendmmsg(Machine& m) {
+    int sockfd = m.template sysarg<int>(0);
+    auto msgvec_addr = m.sysarg(1);
+    unsigned int vlen = m.template sysarg<unsigned int>(2);
+    int flags = m.template sysarg<int>(3);
+
+#ifndef __EMSCRIPTEN__
+    // Native: use real sendmmsg if it's a real socket
+    if (net_is_socket_fd && net_is_socket_fd(sockfd) && net_get_native_fd) {
+        int native_fd = net_get_native_fd(sockfd);
+        if (native_fd >= 0) {
+            // For simplicity, send messages one at a time via sendto
+            unsigned int sent = 0;
+            for (unsigned int i = 0; i < vlen; i++) {
+                // struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; }
+                // msghdr on riscv64: name(8) namelen(4) pad(4) iov(8) iovlen(8) control(8) controllen(8) flags(4)
+                uint64_t mmsg_addr = msgvec_addr + i * 64; // sizeof(mmsghdr) on riscv64
+                auto iov_addr = m.memory.template read<uint64_t>(mmsg_addr + 16);
+                auto iovlen = m.memory.template read<uint64_t>(mmsg_addr + 24);
+                auto name_addr = m.memory.template read<uint64_t>(mmsg_addr);
+                auto namelen = m.memory.template read<uint32_t>(mmsg_addr + 8);
+
+                // Gather iovec data
+                std::vector<uint8_t> buf;
+                for (uint64_t j = 0; j < iovlen && j < 16; j++) {
+                    auto base = m.memory.template read<uint64_t>(iov_addr + j * 16);
+                    auto len = m.memory.template read<uint64_t>(iov_addr + j * 16 + 8);
+                    if (len > 65536) len = 65536;
+                    size_t off = buf.size();
+                    buf.resize(off + len);
+                    m.memory.memcpy_out(buf.data() + off, base, len);
+                }
+
+                struct sockaddr_storage sa = {};
+                socklen_t sa_len = 0;
+                if (name_addr != 0 && namelen > 0 && namelen <= sizeof(sa)) {
+                    m.memory.memcpy_out(&sa, name_addr, namelen);
+                    sa_len = namelen;
+                }
+
+                ssize_t n = ::sendto(native_fd, buf.data(), buf.size(), flags,
+                                     sa_len > 0 ? (struct sockaddr*)&sa : nullptr, sa_len);
+                if (n < 0) {
+                    if (sent == 0) { m.set_result(-errno); return; }
+                    break;
+                }
+                // Write msg_len field
+                m.memory.template write<uint32_t>(mmsg_addr + 56, (uint32_t)n);
+                sent++;
+            }
+            m.set_result(sent);
+            return;
+        }
+    }
+#endif
+    // Emscripten / no native socket: not supported
+    m.set_result(err::NOSYS);
 }
 
 // Syscall 500: Host fetch hypercall
@@ -5599,6 +6241,8 @@ static void sys_host_fetch(Machine& m) {
     m.cpu.increment_pc(-4);  // Rewind to ecall for re-entry
     m.stop();
 }
+
+}  // namespace handlers
 
 // Install all syscall handlers
 inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
@@ -5696,6 +6340,9 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::prctl, sys_prctl);
     machine.install_syscall_handler(nr::mremap, sys_mremap);
     machine.install_syscall_handler(nr::eventfd2, sys_eventfd2);
+    machine.install_syscall_handler(nr::timerfd_create, sys_timerfd_create);
+    machine.install_syscall_handler(nr::timerfd_settime, sys_timerfd_settime);
+    machine.install_syscall_handler(nr::timerfd_gettime, sys_timerfd_gettime);
     machine.install_syscall_handler(nr::io_uring_setup, sys_io_uring_setup);
     machine.install_syscall_handler(nr::capget, sys_capget);
     machine.install_syscall_handler(nr::sched_getscheduler, sys_sched_getscheduler);
@@ -5736,6 +6383,26 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     // getsockname (204) is handled by network.hpp — installed via install_network_syscalls
     machine.install_syscall_handler(nr::getsockopt, sys_getsockopt);
     machine.install_syscall_handler(nr::riscv_hwprobe, sys_riscv_hwprobe);
+
+    // Round 4: Node.js / Claude Code syscalls
+    machine.install_syscall_handler(nr::io_uring_enter, sys_io_uring_enter);
+    machine.install_syscall_handler(nr::getxattr, sys_getxattr);
+    machine.install_syscall_handler(nr::lgetxattr, sys_lgetxattr);
+    machine.install_syscall_handler(nr::fgetxattr, sys_fgetxattr);
+    machine.install_syscall_handler(nr::listxattr, sys_listxattr);
+    machine.install_syscall_handler(nr::llistxattr, sys_llistxattr);
+    machine.install_syscall_handler(nr::flistxattr, sys_flistxattr);
+    machine.install_syscall_handler(nr::statfs, sys_statfs);
+    machine.install_syscall_handler(nr::fstatfs, sys_fstatfs);
+    machine.install_syscall_handler(nr::timer_create, sys_timer_create);
+    machine.install_syscall_handler(nr::timer_settime, sys_timer_settime);
+    machine.install_syscall_handler(nr::timer_gettime, sys_timer_gettime);
+    machine.install_syscall_handler(nr::timer_getoverrun, sys_timer_getoverrun);
+    machine.install_syscall_handler(nr::timer_delete, sys_timer_delete);
+    machine.install_syscall_handler(nr::rt_sigsuspend, sys_rt_sigsuspend);
+    machine.install_syscall_handler(nr::sendmmsg, sys_sendmmsg);
+    machine.install_syscall_handler(nr::setfsuid, sys_setfsuid);
+    machine.install_syscall_handler(nr::setfsgid, sys_setfsgid);
 
     // Custom hypercalls (500+)
     machine.install_syscall_handler(500, sys_host_fetch);

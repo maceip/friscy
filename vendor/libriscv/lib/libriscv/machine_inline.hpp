@@ -83,6 +83,7 @@ struct SyscallTrace {
 };
 inline SyscallTrace g_syscall_ring[32] = {};
 inline int g_syscall_ring_idx = 0;
+inline int g_execve_trace_remaining_init = 0;
 
 template <int W>
 inline void Machine<W>::system_call(size_t sysnum)
@@ -93,11 +94,6 @@ inline void Machine<W>::system_call(size_t sysnum)
 	entry.a1 = cpu.reg(REG_ARG0 + 1);
 	entry.a2 = cpu.reg(REG_ARG0 + 2);
 	entry.pc = cpu.pc();
-
-	// Periodic progress report
-	static size_t total_syscalls = 0;
-	if (++total_syscalls % 1000000 == 0)
-		fprintf(stderr, "[progress] %zuM syscalls, last=sys#%zu\n", total_syscalls / 1000000, sysnum);
 
 	if (LIKELY(sysnum < syscall_handlers.size())) {
 		auto& handler = Machine::syscall_handlers[RISCV_SPECSAFE(sysnum)];

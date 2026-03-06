@@ -769,6 +769,36 @@ public:
         return "";
     }
 
+    // Snapshot fd table state for fork save/restore.
+    // Clones all FileHandle/DirHandle entries so the child's close/dup2
+    // operations don't affect the saved state. shared_ptr<Entry> is shared
+    // so pipe buffer data written by the child persists after restore.
+    struct FdSnapshot {
+        int next_fd;
+        std::unordered_map<int, std::unique_ptr<FileHandle>> files;
+        std::unordered_map<int, std::unique_ptr<DirHandle>> dirs;
+    };
+
+    FdSnapshot snapshot_fds() {
+        FdSnapshot snap;
+        snap.next_fd = next_fd_;
+        for (const auto& [fd, fh] : open_files_) {
+            snap.files[fd] = std::make_unique<FileHandle>(fh->entry, fh->flags, fh->path);
+            snap.files[fd]->offset = fh->offset;
+        }
+        for (const auto& [fd, dh] : open_dirs_) {
+            snap.dirs[fd] = std::make_unique<DirHandle>(dh->entry, dh->path);
+            snap.dirs[fd]->index = dh->index;
+        }
+        return snap;
+    }
+
+    void restore_fds(FdSnapshot& snap) {
+        open_files_ = std::move(snap.files);
+        open_dirs_ = std::move(snap.dirs);
+        next_fd_ = snap.next_fd;
+    }
+
     // Serialize the VFS tree to a POSIX tar archive
     std::vector<uint8_t> save_tar() {
         std::vector<uint8_t> out;

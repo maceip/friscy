@@ -14,6 +14,7 @@
 #include <random>
 #include <iostream>
 #include <set>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #ifdef __EMSCRIPTEN__
@@ -73,9 +74,52 @@ static constexpr uint32_t STOP_REASON_STDIN       = 1u << 0;
 static constexpr uint32_t STOP_REASON_HOST_FETCH  = 1u << 1;
 static constexpr uint32_t STOP_REASON_TIMESLICE   = 1u << 2;
 static constexpr uint32_t STOP_REASON_WAIT_CHILD  = 1u << 3;
+static constexpr uint32_t STOP_REASON_FORK_RESTORE = 1u << 4;
+
+// Flag: fork child has exited, parent restore needed OUTSIDE simulate()
+// The restore can't happen inside simulate() because evicting execute segments
+// invalidates the decoder cache that simulate()'s local variables reference.
+inline bool g_fork_child_exited = false;
+
+// Global mmap bump pointer — must be file-scope so fork_parent_restore can
+// reset it. See sys_mmap for usage.
+inline uint64_t g_mmap_bump = 0;
+
+// Perform the actual fork parent restore. Must be called OUTSIDE simulate()
+// so that the next simulate() call starts with fresh decoder cache pointers.
+void fork_parent_restore(Machine& m);
+
+// Arena-aware memory copy helpers for fork save/restore.
+// In encompassing arena mode, guest reads/writes go directly to the arena
+// buffer, bypassing the page table. But Memory::memcpy/memcpy_out go through
+// the page table, which can silently fail if pages are CoW (reading/writing
+// to copied-out pages instead of the arena). These helpers access the arena
+// directly when available.
+inline void arena_memcpy_out(Machine& m, void* dst, uint64_t src, size_t len) {
+    if constexpr (riscv::encompassing_Nbit_arena > 0) {
+        auto* arena = (const uint8_t*)m.memory.memory_arena_ptr();
+        if (arena && src + len <= m.memory.memory_arena_size()) {
+            std::memcpy(dst, arena + src, len);
+            return;
+        }
+        fprintf(stderr, "[arena_memcpy_out] FALLBACK: src=0x%lx len=0x%lx arena_size=0x%lx\n",
+                (long)src, (long)len, (long)m.memory.memory_arena_size());
+    }
+    m.memory.memcpy_out(dst, src, len);
+}
+inline void arena_memcpy_in(Machine& m, uint64_t dst, const void* src, size_t len) {
+    if constexpr (riscv::encompassing_Nbit_arena > 0) {
+        auto* arena = (uint8_t*)m.memory.memory_arena_ptr();
+        if (arena && dst + len <= m.memory.memory_arena_size()) {
+            std::memcpy(arena + dst, src, len);
+            return;
+        }
+    }
+    m.memory.memcpy(dst, src, len);
+}
 
 // Syscall tracing (disabled by default to reduce log noise)
-inline constexpr bool g_trace_syscalls = false;
+inline bool g_trace_syscalls = false;
 inline int g_trace_countdown = 800;
 #define TRACE_SC(name, ...) do { \
     if (g_trace_syscalls && g_trace_countdown-- > 0) \
@@ -310,6 +354,29 @@ struct ProcessModel {
 
 inline ProcessModel g_process_model = {};
 
+// Execution context saved from initial load — used by execve to
+// reload binary segments and set up a fresh stack.
+struct ExecContext {
+    std::vector<uint8_t> exec_binary;    // Original main executable
+    std::vector<uint8_t> interp_binary;  // Original interpreter (ld-musl)
+    elf::ElfInfo exec_info;              // Adjusted ELF info (with PIE base)
+    uint64_t exec_base = 0;             // PIE base for main executable
+    uint64_t exec_rw_start = 0;         // First writable segment of main binary
+    uint64_t exec_rw_end = 0;           // End of writable segments of main binary
+    uint64_t interp_base = 0;           // Where interpreter was loaded
+    uint64_t interp_rw_start = 0;       // First writable segment of interpreter
+    uint64_t interp_rw_end = 0;         // End of writable segments of interpreter
+    uint64_t interp_entry = 0;          // Interpreter entry point
+    uint64_t original_stack_top = 0;    // Stack top from initial setup
+    uint64_t heap_start = 0;            // Start of brk heap area
+    uint64_t heap_size = 0;             // Size of brk heap area
+    uint64_t brk_base = 0;             // Current binary's break base (end of BSS, page-aligned)
+    uint64_t brk_current = 0;          // Current break pointer
+    bool brk_overridden = false;       // True after execve sets up new brk
+    std::vector<std::string> env;        // Environment variables
+    bool dynamic = false;                // Using dynamic linker?
+};
+
 // Transitional process state for the old in-VM fork path.
 // On clone()/clone3() (fork variant): save parent registers and return 0.
 // Child execution currently uses g_fork restoration semantics while process ids
@@ -343,17 +410,31 @@ struct ForkState {
     MemRegion interp_data;
     MemRegion stack_data;
     MemRegion mmap_data;     // guest mmap allocations (TLS, malloc)
-    // VFS fd snapshot: fds open before fork. On child exit, close any
-    // fds not in this set to undo child's dup2/pipe/open changes.
-    std::set<int> parent_open_fds;
+    // VFS fd table snapshot: full clone of open file/dir handles.
+    // Restored after child exits so child's close/dup2/open changes
+    // are undone while preserving pipe buffer data.
+    vfs::VirtualFS::FdSnapshot fd_snapshot;
+    std::unordered_map<int, int> saved_cloexec_flags;
+    std::unordered_map<int, int> saved_status_flags;
     // Thread scheduler snapshot: saved as raw bytes to avoid ordering
     // dependency on ThreadScheduler definition. execve in fork child
     // resets g_sched; must restore parent's thread state on child exit.
     alignas(16) uint8_t saved_sched[8192];  // enough for ThreadScheduler (~5KB)
     uint64_t saved_mmap_address = 0;
+    ExecContext saved_exec_ctx;
+    bool has_exec_ctx = false;
+    bool child_did_execve = false;
 };
-inline ForkState g_fork = {};
+inline std::vector<ForkState> g_fork_stack;
 inline pid_t g_next_pid = 100;
+
+// Access current fork state (top of stack)
+inline ForkState& g_fork() {
+    return g_fork_stack.back();
+}
+inline bool g_fork_active() {
+    return !g_fork_stack.empty();
+}
 
 // Terminal (tty) state — stored per-fd for stdin/stdout/stderr.
 // Makes isatty(0) return true, enables raw mode for interactive shells.
@@ -535,31 +616,7 @@ inline void maybe_preempt(Machine& m) {
     }
 }
 
-// Execution context saved from initial load — used by execve to
-// reload binary segments and set up a fresh stack.
-struct ExecContext {
-    std::vector<uint8_t> exec_binary;    // Original main executable
-    std::vector<uint8_t> interp_binary;  // Original interpreter (ld-musl)
-    elf::ElfInfo exec_info;              // Adjusted ELF info (with PIE base)
-    uint64_t exec_base = 0;             // PIE base for main executable
-    uint64_t exec_rw_start = 0;         // First writable segment of main binary
-    uint64_t exec_rw_end = 0;           // End of writable segments of main binary
-    uint64_t interp_base = 0;           // Where interpreter was loaded
-    uint64_t interp_rw_start = 0;       // First writable segment of interpreter
-    uint64_t interp_rw_end = 0;         // End of writable segments of interpreter
-    uint64_t interp_entry = 0;          // Interpreter entry point
-    uint64_t original_stack_top = 0;    // Stack top from initial setup
-    uint64_t heap_start = 0;            // Start of brk heap area
-    uint64_t heap_size = 0;             // Size of brk heap area
-    uint64_t brk_base = 0;             // Current binary's break base (end of BSS, page-aligned)
-    uint64_t brk_current = 0;          // Current break pointer
-    bool brk_overridden = false;       // True after execve sets up new brk
-    std::vector<std::string> env;        // Environment variables
-    bool dynamic = false;                // Using dynamic linker?
-};
 inline ExecContext g_exec_ctx;
-inline ExecContext g_fork_saved_exec_ctx;
-inline bool g_fork_has_exec_ctx = false;
 
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
@@ -766,7 +823,7 @@ static void sys_exit_group(Machine& m) {
 
     // If we're in a fork child, delegate to sys_exit which has the
     // parent restore logic (restores registers, memory, jumps back).
-    if (g_fork.in_child) {
+    if (g_fork_active()) {
         sys_exit(m);
         return;
     }
@@ -786,7 +843,7 @@ static void sys_exit(Machine& m) {
     // Fork child exit must be handled before cooperative thread teardown.
     // Otherwise a fork child running on a non-main scheduler slot can be
     // consumed by the thread-exit path, skipping process-model exit/wakeup.
-    if (g_fork.in_child) {
+    if (g_fork_active()) {
         goto fork_child_exit;
     }
 
@@ -821,25 +878,49 @@ static void sys_exit(Machine& m) {
         // No other threads — fall through to actual exit
     }
 
-    if (g_fork.in_child) {
+    if (g_fork_active()) {
 fork_child_exit:
-        // "Child" is exiting — restore parent state
-        g_fork.exit_status = m.template sysarg<int>(0);
+        // "Child" is exiting — record exit status and stop machine.
+        // The actual parent restore happens OUTSIDE simulate() via
+        // fork_parent_restore(), because evicting execute segments inside
+        // simulate() leaves its local decoder cache pointers dangling.
+        g_fork().exit_status = m.template sysarg<int>(0);
         g_process_model.push_event(
             ProcessEventKind::Exit,
-            g_fork.child_pid,
-            g_fork.parent_pid,
-            g_fork.child_pgid,
-            g_fork.exit_status);
-        g_process_model.mark_exited(g_fork.child_pid, g_fork.exit_status);
-        g_fork.in_child = false;
+            g_fork().child_pid,
+            g_fork().parent_pid,
+            g_fork().child_pgid,
+            g_fork().exit_status);
+        g_process_model.mark_exited(g_fork().child_pid, g_fork().exit_status);
+        g_fork_child_exited = true;
+        m.stop();
+        return;
+    }
+    int exit_code = m.template sysarg<int>(0);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] main thread exit code=%d\n", exit_code);
+    m.stop();
+    m.set_result(exit_code);
+}
 
-        // Child execve may have overwritten parent code pages at the same VA.
-        // Reload parent executable/interpreter text segments before data restore.
-        if (g_fork_has_exec_ctx) {
-            const auto& parent_ctx = g_fork_saved_exec_ctx;
-            try {
-                m.memory.evict_execute_segments();
+} // namespace handlers
+
+// Perform fork parent restore. Called OUTSIDE simulate() after the child
+// exits and the machine stops. This ensures the decoder cache is properly
+// invalidated — evicting execute segments inside simulate() leaves its
+// local decoder pointers dangling (use-after-free on decoder cache).
+inline void fork_parent_restore(Machine& m) {
+    g_fork_child_exited = false;
+    g_fork().in_child = false;
+
+    // Reload parent executable/interpreter text segments
+    if (g_fork().has_exec_ctx) {
+        const auto& parent_ctx = g_fork().saved_exec_ctx;
+        try {
+            m.memory.evict_execute_segments();
+            // Only reload text if the child did execve (loaded a different binary).
+            // For fork-without-exec (subshell), text is unchanged — skip to avoid
+            // re-zeroing BSS pages that the data restore will overwrite anyway.
+            if (g_fork().child_did_execve) {
                 if (!parent_ctx.exec_binary.empty()) {
                     uint64_t load_base = 0;
                     if (parent_ctx.exec_info.type == elf::ET_DYN) {
@@ -854,87 +935,81 @@ fork_child_exit:
                 if (!parent_ctx.interp_binary.empty() && parent_ctx.interp_base != 0) {
                     dynlink::load_elf_segments(m, parent_ctx.interp_binary, parent_ctx.interp_base);
                 }
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[fork] parent segment reload failed: %s\n", e.what());
             }
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[fork] parent segment reload failed: %s\n", e.what());
         }
-
-        // CRITICAL: Fix page permissions BEFORE restoring memory.
-        // The parent's initial RELRO made data pages read-only. If we
-        // try to memcpy to those pages first, the write triggers a
-        // protection fault that propagates out of resume(), leaving
-        // the state half-restored and causing the parent to crash.
-        auto fix_perms = [&](uint64_t addr, uint64_t size) {
-            if (addr > 0 && size > 0) {
-                riscv::PageAttributes attr;
-                attr.read = true;
-                attr.write = true;
-                attr.exec = true;
-                m.memory.set_page_attr(addr, size, attr);
-            }
-        };
-        // Fix regions using the exact parent snapshot spans.
-        fix_perms(g_fork.exec_data.addr, g_fork.exec_data.size);
-        fix_perms(g_fork.interp_data.addr, g_fork.interp_data.size);
-        fix_perms(g_fork.mmap_data.addr, g_fork.mmap_data.size);
-        fix_perms(g_fork.stack_data.addr, g_fork.stack_data.size);
-
-        // Now restore parent memory (data/BSS, interpreter, stack, mmap)
-        auto restore = [&](ForkState::MemRegion& r) {
-            if (!r.data.empty()) {
-                m.memory.memcpy(r.addr, r.data.data(), r.size);
-                r.data.clear();
-                r.data.shrink_to_fit();
-            }
-        };
-        restore(g_fork.exec_data);
-        restore(g_fork.interp_data);
-        restore(g_fork.stack_data);
-        restore(g_fork.mmap_data);
-
-        // Restore VFS fd state: close any fds the child opened/dup2'd
-        // that the parent didn't have. This undoes pipe redirections
-        // (e.g. dup2(pipe_fd, 1)) so parent's stdout goes to terminal.
-        {
-            auto& fs = get_fs(m);
-            auto current_fds = fs.get_open_fds();
-            for (int fd : current_fds) {
-                if (g_fork.parent_open_fds.count(fd) == 0) {
-                    fs.close(fd);
-                }
-            }
-            g_fork.parent_open_fds.clear();
-        }
-
-        // Restore cooperative thread scheduler state.
-        // The fork child's execve may have reset g_sched.
-        std::memcpy(&g_sched, g_fork.saved_sched, sizeof(g_sched));
-
-        // Restore parent memory layout metadata potentially mutated by child execve.
-        if (g_fork.saved_mmap_address > 0) {
-            m.memory.mmap_address() = g_fork.saved_mmap_address;
-        }
-        if (g_fork_has_exec_ctx) {
-            g_exec_ctx = g_fork_saved_exec_ctx;
-            g_fork_has_exec_ctx = false;
-        }
-
-        // Restore parent registers (x0-x31)
-        for (int i = 1; i < 32; i++) {  // Skip x0 (hardwired zero)
-            m.cpu.reg(i) = g_fork.regs[i];
-        }
-        g_process_model.set_current(g_fork.parent_pid);
-        // Resume parent at instruction after the clone ecall
-        m.cpu.jump(g_fork.pc);
-        // Parent sees child PID as clone() return value
-        m.set_result(g_fork.child_pid);
-        return;
     }
-    int exit_code = m.template sysarg<int>(0);
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] main thread exit code=%d\n", exit_code);
-    m.stop();
-    m.set_result(exit_code);
+
+    // Fix page permissions BEFORE restoring memory
+    auto fix_perms = [&](uint64_t addr, uint64_t size) {
+        if (addr > 0 && size > 0) {
+            riscv::PageAttributes attr;
+            attr.read = true;
+            attr.write = true;
+            attr.exec = true;
+            m.memory.set_page_attr(addr, size, attr);
+        }
+    };
+    fix_perms(g_fork().exec_data.addr, g_fork().exec_data.size);
+    fix_perms(g_fork().interp_data.addr, g_fork().interp_data.size);
+    fix_perms(g_fork().mmap_data.addr, g_fork().mmap_data.size);
+    fix_perms(g_fork().stack_data.addr, g_fork().stack_data.size);
+
+    // Restore parent memory using arena-aware copy (see arena_memcpy_in).
+    auto restore = [&](ForkState::MemRegion& r, const char* name) {
+        if (!r.data.empty()) {
+            arena_memcpy_in(m, r.addr, r.data.data(), r.size);
+            r.data.clear();
+            r.data.shrink_to_fit();
+        }
+    };
+    fprintf(stderr, "[fork-restore] exec=[0x%lx+0x%lx] interp=[0x%lx+0x%lx] "
+            "stack=[0x%lx+0x%lx] mmap=[0x%lx+0x%lx]\n",
+            (long)g_fork().exec_data.addr, (long)g_fork().exec_data.size,
+            (long)g_fork().interp_data.addr, (long)g_fork().interp_data.size,
+            (long)g_fork().stack_data.addr, (long)g_fork().stack_data.size,
+            (long)g_fork().mmap_data.addr, (long)g_fork().mmap_data.size);
+    restore(g_fork().exec_data, "exec");
+    restore(g_fork().interp_data, "interp");
+    restore(g_fork().stack_data, "stack");
+    restore(g_fork().mmap_data, "mmap");
+
+    // Restore VFS fd table from snapshot. This undoes the child's
+    // close/dup2/open while preserving pipe buffer data (shared_ptr<Entry>).
+    get_fs(m).restore_fds(g_fork().fd_snapshot);
+    g_fd_cloexec_flags = std::move(g_fork().saved_cloexec_flags);
+    g_fd_status_flags = std::move(g_fork().saved_status_flags);
+
+    // Restore cooperative thread scheduler state
+    std::memcpy(&g_sched, g_fork().saved_sched, sizeof(g_sched));
+
+    // Restore parent memory layout metadata
+    if (g_fork().saved_mmap_address > 0) {
+        m.memory.mmap_address() = g_fork().saved_mmap_address;
+        // Reset mmap bump pointer to match — child may have advanced it
+        g_mmap_bump = g_fork().saved_mmap_address;
+    }
+    // Clear stale mmap free-list entries from child's execution
+    m.memory.mmap_cache() = {};
+    if (g_fork().has_exec_ctx) {
+        g_exec_ctx = g_fork().saved_exec_ctx;
+        g_fork().has_exec_ctx = false;
+    }
+
+    // Restore parent registers
+    for (int i = 1; i < 32; i++) {
+        m.cpu.reg(i) = g_fork().regs[i];
+    }
+    g_process_model.set_current(g_fork().parent_pid);
+    m.cpu.jump(g_fork().pc);
+    m.set_result(g_fork().child_pid);
+
+    // Pop this fork frame — parent is now the active context
+    g_fork_stack.pop_back();
 }
+
+namespace handlers {
 
 // clone — cooperative vfork emulation for single-process emulator.
 // Saves parent state, returns 0 (child context). When child calls
@@ -949,33 +1024,9 @@ static void sys_clone(Machine& m) {
     constexpr uint64_t F_CLONE_THREAD = 0x00010000;
     constexpr uint64_t F_CLONE_VFORK  = 0x00004000;
 
-    // Fast fallback for plain fork-style clone(SIGCHLD): synthesize an
-    // immediate-success child that exits with status 0. This avoids deadlock
-    // from serialized child-first emulation and unblocks Node child_process.
-    if ((flags & 0xffULL) == 17 && (flags & ~0xffULL) == 0) {
-        g_process_model.init();
-        pid_t parent_pid = g_process_model.current_pid;
-        pid_t parent_pgid = g_process_model.current_pgid;
-        pid_t child_pid = g_process_model.allocate_pid();
-        if (child_pid < 0) {
-            m.set_result(-12);  // -ENOMEM
-            return;
-        }
-        if (!g_process_model.register_process(child_pid, parent_pid, child_pid)) {
-            m.set_result(-12);  // -ENOMEM
-            return;
-        }
-
-        // SIGCHLD fast-path: register in process table only.
-        // Do NOT touch g_fork — this is a fake instantly-dead child
-        // (e.g. Node child_process compatibility), not a real vfork.
-        g_process_model.push_event(ProcessEventKind::Spawn, child_pid, parent_pid, child_pid, 0);
-        g_process_model.mark_exited(child_pid, 0);
-        g_process_model.push_event(ProcessEventKind::Exit, child_pid, parent_pid, child_pid, 0);
-
-        m.set_result(child_pid);
-        return;
-    }
+    // Plain fork (SIGCHLD only) falls through to cooperative vfork path below.
+    // Previously this was a fast-path that created a fake dead child, but that
+    // prevented bash fork+exec from working (child never ran, never called execve).
 
     if ((flags & F_CLONE_THREAD) || ((flags & F_CLONE_VM) && !(flags & F_CLONE_VFORK))) {
         // Thread creation with cooperative scheduling.
@@ -1047,36 +1098,35 @@ static void sys_clone(Machine& m) {
         return;
     }
 
-    if (g_fork.in_child) {
-        // Nested fork not supported
-        m.set_result(-11);  // -EAGAIN
-        return;
-    }
-
     auto child_stack = m.sysarg(1);
     if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[clone] fork flags=0x%lx child_stack=0x%lx\n",
             (long)flags, (long)child_stack);
 
+    // Push a new fork frame (supports nested forks for pipes)
+    g_fork_stack.emplace_back();
+
     // Save parent registers
     for (int i = 0; i < 32; i++) {
-        g_fork.regs[i] = m.cpu.reg(i);
+        g_fork().regs[i] = m.cpu.reg(i);
     }
     g_process_model.init();
-    g_fork.pc = m.cpu.pc();  // Already past the ecall
-    g_fork.parent_pid = g_process_model.current_pid;
-    g_fork.parent_pgid = g_process_model.current_pgid;
-    g_fork.child_pid = g_process_model.allocate_pid();
-    if (g_fork.child_pid < 0) {
+    g_fork().pc = m.cpu.pc() + 4;  // Advance past the ecall instruction
+    g_fork().parent_pid = g_process_model.current_pid;
+    g_fork().parent_pgid = g_process_model.current_pgid;
+    g_fork().child_pid = g_process_model.allocate_pid();
+    if (g_fork().child_pid < 0) {
+        g_fork_stack.pop_back();
         m.set_result(-12);  // -ENOMEM
         return;
     }
-    g_fork.child_pgid = g_fork.child_pid;
-    if (!g_process_model.register_process(g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid)) {
+    g_fork().child_pgid = g_fork().child_pid;
+    if (!g_process_model.register_process(g_fork().child_pid, g_fork().parent_pid, g_fork().child_pgid)) {
+        g_fork_stack.pop_back();
         m.set_result(-12);  // -ENOMEM
         return;
     }
-    g_process_model.push_event(ProcessEventKind::Spawn, g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid, 0);
-    g_fork.exit_status = 0;
+    g_process_model.push_event(ProcessEventKind::Spawn, g_fork().child_pid, g_fork().parent_pid, g_fork().child_pgid, 0);
+    g_fork().exit_status = 0;
 
     // Set child's stack pointer if provided (non-zero).
     // musl's __clone stores the child function pointer and arg
@@ -1115,68 +1165,83 @@ static void sys_clone(Machine& m) {
             attr.read = true; attr.write = true; attr.exec = true;
             m.memory.set_page_attr(save_start, save_end - save_start, attr);
 
-            auto& r = g_fork.exec_data;
+            auto& r = g_fork().exec_data;
             r.addr = save_start;
             r.size = save_end - save_start;
             r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            arena_memcpy_out(m, r.data.data(), r.addr, r.size);
         }
     }
 
-    // Region 2: interpreter writable segments
+    // Region 2: interpreter writable segments + TLS/pthread overhead.
+    // musl's TLS and pthread struct live at/above the thread pointer (tp),
+    // which is typically near the end of the BSS. The pthread struct can
+    // extend BEYOND interp_rw_end. Add extra pages to capture it.
     if (g_exec_ctx.interp_rw_start > 0 && g_exec_ctx.interp_rw_end > g_exec_ctx.interp_rw_start) {
-        auto& r = g_fork.interp_data;
+        auto& r = g_fork().interp_data;
         r.addr = g_exec_ctx.interp_rw_start;
-        r.size = g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start;
+        // Extend to heap_start to capture TLS/pthread struct and any other
+        // data between BSS end and the native heap
+        uint64_t interp_save_end = g_exec_ctx.heap_start;
+        if (interp_save_end <= g_exec_ctx.interp_rw_end)
+            interp_save_end = (g_exec_ctx.interp_rw_end + 0x1000) & ~0xFFFULL;
+        r.size = interp_save_end - r.addr;
         r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
 
     // Region 3: stack (SP to stack top)
     {
         uint64_t sp = m.cpu.reg(riscv::REG_SP);
         uint64_t stack_top = g_exec_ctx.original_stack_top;
-        auto& r = g_fork.stack_data;
+        auto& r = g_fork().stack_data;
         r.addr = sp;
         r.size = stack_top - sp;
         r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
 
-    // Region 4: guest mmap allocations (TLS, libc malloc pages)
-    // musl uses mmap (not brk) for malloc. Guest mmaps are placed
-    // after our native heap area. Probe mmap_allocate(0) to find
-    // the current allocation frontier.
-    if (g_exec_ctx.heap_start > 0 && g_exec_ctx.heap_size > 0) {
-        uint64_t mmap_region_start = g_exec_ctx.heap_start + g_exec_ctx.heap_size;
+    // Region 4: native heap + guest mmap allocations.
+    // Save from heap_start all the way to mmap_frontier to capture
+    // everything: native heap metadata, TLS, libc malloc pages.
+    if (g_exec_ctx.heap_start > 0) {
+        uint64_t mmap_region_start = g_exec_ctx.heap_start;
         uint64_t mmap_frontier = m.memory.mmap_allocate(0);
+        fprintf(stderr, "[fork-save] regions: exec=[0x%lx,0x%lx) interp=[0x%lx,0x%lx) "
+                "stack=[0x%lx,0x%lx) mmap=[0x%lx,0x%lx) mmap_addr=0x%lx\n",
+                (long)g_fork().exec_data.addr, (long)(g_fork().exec_data.addr + g_fork().exec_data.size),
+                (long)g_fork().interp_data.addr, (long)(g_fork().interp_data.addr + g_fork().interp_data.size),
+                (long)g_fork().stack_data.addr, (long)(g_fork().stack_data.addr + g_fork().stack_data.size),
+                (long)mmap_region_start, (long)mmap_frontier, (long)m.memory.mmap_address());
         if (mmap_frontier > mmap_region_start) {
-            auto& r = g_fork.mmap_data;
+            auto& r = g_fork().mmap_data;
             r.addr = mmap_region_start;
             r.size = mmap_frontier - mmap_region_start;
             r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            arena_memcpy_out(m, r.data.data(), r.addr, r.size);
         }
     }
 
-    // Save VFS open fd set so child's dup2/pipe/open can be undone
-    g_fork.parent_open_fds = get_fs(m).get_open_fds();
+    // Save VFS fd table and per-fd flags so child's changes can be undone
+    g_fork().fd_snapshot = get_fs(m).snapshot_fds();
+    g_fork().saved_cloexec_flags = g_fd_cloexec_flags;
+    g_fork().saved_status_flags = g_fd_status_flags;
 
     // Save cooperative thread scheduler state. The fork child's execve
     // resets g_sched, and we need to restore the parent's thread state
     // when the child exits.
-    static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
-    std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
-    g_fork.saved_mmap_address = m.memory.mmap_address();
-    g_fork_saved_exec_ctx = g_exec_ctx;
-    g_fork_has_exec_ctx = true;
+    static_assert(sizeof(ForkState::saved_sched) >= sizeof(g_sched));
+    std::memcpy(g_fork().saved_sched, &g_sched, sizeof(g_sched));
+    g_fork().saved_mmap_address = m.memory.mmap_address();
+    g_fork().saved_exec_ctx = g_exec_ctx;
+    g_fork().has_exec_ctx = true;
 
     // Only set in_child AFTER all saves succeed.
     // This way if memcpy_out throws, the retry will re-enter clone
     // with in_child still false, allowing the save to be retried.
-    g_process_model.set_current(g_fork.child_pid);
-    g_fork.in_child = true;
-    g_fork.child_reaped = false;
+    g_process_model.set_current(g_fork().child_pid);
+    g_fork().in_child = true;
+    g_fork().child_reaped = false;
 
     // Return 0 = "you are the child"
     m.set_result(0);
@@ -1267,35 +1332,34 @@ static void sys_clone3(Machine& m) {
         return;
     }
 
-    // Fork path — delegate to same vfork emulation
-    if (g_fork.in_child) {
-        m.set_result(-11);  // -EAGAIN
-        return;
-    }
+    // Fork path — push fork frame (supports nested forks for pipes)
+    g_fork_stack.emplace_back();
 
     fprintf(stderr, "[clone3] fork flags=0x%lx stack=0x%lx+0x%lx\n",
             (long)flags, (long)stack, (long)stack_size);
 
     // Save parent registers BEFORE changing SP
     for (int i = 0; i < 32; i++) {
-        g_fork.regs[i] = m.cpu.reg(i);
+        g_fork().regs[i] = m.cpu.reg(i);
     }
     g_process_model.init();
-    g_fork.pc = m.cpu.pc();
-    g_fork.parent_pid = g_process_model.current_pid;
-    g_fork.parent_pgid = g_process_model.current_pgid;
-    g_fork.child_pid = g_process_model.allocate_pid();
-    if (g_fork.child_pid < 0) {
+    g_fork().pc = m.cpu.pc();
+    g_fork().parent_pid = g_process_model.current_pid;
+    g_fork().parent_pgid = g_process_model.current_pgid;
+    g_fork().child_pid = g_process_model.allocate_pid();
+    if (g_fork().child_pid < 0) {
+        g_fork_stack.pop_back();
         m.set_result(-12);  // -ENOMEM
         return;
     }
-    g_fork.child_pgid = g_fork.child_pid;
-    if (!g_process_model.register_process(g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid)) {
+    g_fork().child_pgid = g_fork().child_pid;
+    if (!g_process_model.register_process(g_fork().child_pid, g_fork().parent_pid, g_fork().child_pgid)) {
+        g_fork_stack.pop_back();
         m.set_result(-12);  // -ENOMEM
         return;
     }
-    g_process_model.push_event(ProcessEventKind::Spawn, g_fork.child_pid, g_fork.parent_pid, g_fork.child_pgid, 0);
-    g_fork.exit_status = 0;
+    g_process_model.push_event(ProcessEventKind::Spawn, g_fork().child_pid, g_fork().parent_pid, g_fork().child_pgid, 0);
+    g_fork().exit_status = 0;
 
     // Save parent memory regions BEFORE changing SP (stack save needs parent SP)
     {
@@ -1309,55 +1373,60 @@ static void sys_clone3(Machine& m) {
             riscv::PageAttributes attr;
             attr.read = true; attr.write = true; attr.exec = true;
             m.memory.set_page_attr(save_start, save_end - save_start, attr);
-            auto& r = g_fork.exec_data;
+            auto& r = g_fork().exec_data;
             r.addr = save_start;
             r.size = save_end - save_start;
             r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            arena_memcpy_out(m, r.data.data(), r.addr, r.size);
         }
     }
     if (g_exec_ctx.interp_rw_start > 0 && g_exec_ctx.interp_rw_end > g_exec_ctx.interp_rw_start) {
-        auto& r = g_fork.interp_data;
+        auto& r = g_fork().interp_data;
         r.addr = g_exec_ctx.interp_rw_start;
-        r.size = g_exec_ctx.interp_rw_end - g_exec_ctx.interp_rw_start;
+        uint64_t interp_save_end = g_exec_ctx.heap_start;
+        if (interp_save_end <= g_exec_ctx.interp_rw_end)
+            interp_save_end = (g_exec_ctx.interp_rw_end + 0x1000) & ~0xFFFULL;
+        r.size = interp_save_end - r.addr;
         r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
     {
         uint64_t sp = m.cpu.reg(riscv::REG_SP);
         uint64_t stack_top = g_exec_ctx.original_stack_top;
-        auto& r = g_fork.stack_data;
+        auto& r = g_fork().stack_data;
         r.addr = sp;
         r.size = stack_top - sp;
         r.data.resize(r.size);
-        m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+        arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
-    if (g_exec_ctx.heap_start > 0 && g_exec_ctx.heap_size > 0) {
-        uint64_t mmap_region_start = g_exec_ctx.heap_start + g_exec_ctx.heap_size;
+    if (g_exec_ctx.heap_start > 0) {
+        uint64_t mmap_region_start = g_exec_ctx.heap_start;
         uint64_t mmap_frontier = m.memory.mmap_allocate(0);
         if (mmap_frontier > mmap_region_start) {
-            auto& r = g_fork.mmap_data;
+            auto& r = g_fork().mmap_data;
             r.addr = mmap_region_start;
             r.size = mmap_frontier - mmap_region_start;
             r.data.resize(r.size);
-            m.memory.memcpy_out(r.data.data(), r.addr, r.size);
+            arena_memcpy_out(m, r.data.data(), r.addr, r.size);
         }
     }
-    g_fork.parent_open_fds = get_fs(m).get_open_fds();
-    static_assert(sizeof(g_fork.saved_sched) >= sizeof(g_sched));
-    std::memcpy(g_fork.saved_sched, &g_sched, sizeof(g_sched));
-    g_fork.saved_mmap_address = m.memory.mmap_address();
-    g_fork_saved_exec_ctx = g_exec_ctx;
-    g_fork_has_exec_ctx = true;
+    g_fork().fd_snapshot = get_fs(m).snapshot_fds();
+    g_fork().saved_cloexec_flags = g_fd_cloexec_flags;
+    g_fork().saved_status_flags = g_fd_status_flags;
+    static_assert(sizeof(ForkState::saved_sched) >= sizeof(g_sched));
+    std::memcpy(g_fork().saved_sched, &g_sched, sizeof(g_sched));
+    g_fork().saved_mmap_address = m.memory.mmap_address();
+    g_fork().saved_exec_ctx = g_exec_ctx;
+    g_fork().has_exec_ctx = true;
 
-    g_fork.in_child = true;
-    g_fork.child_reaped = false;
+    g_fork().in_child = true;
+    g_fork().child_reaped = false;
 
     // Set child stack AFTER saving parent state
     if (stack != 0 && stack_size != 0) {
         m.cpu.reg(riscv::REG_SP) = stack + stack_size;
     }
-    g_process_model.set_current(g_fork.child_pid);
+    g_process_model.set_current(g_fork().child_pid);
 
     m.set_result(0);
 }
@@ -1419,10 +1488,13 @@ static void sys_wait4(Machine& m) {
         reaped_pid, parent,
         child->pgid, exit_status);
     g_process_model.mark_reaped(reaped_pid, exit_status);
-    // Update g_fork if this was the vfork child
-    if (g_fork.child_pid == reaped_pid) {
-        g_fork.exit_status = exit_status;
-        g_fork.child_reaped = true;
+    // Update fork stack if this was a vfork child
+    for (auto& f : g_fork_stack) {
+        if (f.child_pid == reaped_pid) {
+            f.exit_status = exit_status;
+            f.child_reaped = true;
+            break;
+        }
     }
     m.set_result(reaped_pid);
 }
@@ -1831,6 +1903,10 @@ static void sys_execve(Machine& m) {
             std::cout << "[friscy] execve: jumping to 0x" << std::hex
                       << jump_target << std::dec << "\n";
 
+            // Uncomment to enable tracing for the new binary:
+            // g_trace_syscalls = true;
+            // g_trace_countdown = 50;
+
             // CRITICAL: Stop the machine to break out of the threaded dispatch
             // loop cleanly. After evict_execute_segments(), the decoded instruction
             // cache is freed. If we just return from this handler, the dispatch
@@ -1838,6 +1914,8 @@ static void sys_execve(Machine& m) {
             // SIGSEGV on the host. machine.stop() sets a flag that makes the
             // dispatch loop exit at the next checkpoint.
             g_execve_restart = true;
+            // Mark that child did execve so fork_parent_restore reloads text
+            if (!g_fork_stack.empty()) g_fork().child_did_execve = true;
             m.stop();
             return;  // don't set_result — execve doesn't return on success
         } catch (const riscv::MachineException& e) {
@@ -1856,7 +1934,41 @@ static void sys_execve(Machine& m) {
     }
 
     // ---- Same binary (busybox applet) or non-ELF ----
-    // Just set up fresh stack with new argv and re-enter the dynamic linker.
+    // Re-load data segments to get clean BSS/heap state, then re-enter
+    // the dynamic linker. Without this, the interpreter finds the parent's
+    // stale malloc metadata and lock state, causing allocator crashes.
+
+    // Reset cooperative thread scheduler (child has its own thread state)
+    g_sched.init(g_sched.threads[g_sched.current].tid);
+
+    // Evict stale decoder caches — segment data will be reloaded
+    m.memory.evict_execute_segments();
+
+    // Reload main binary + interpreter from ELF to get clean data segments
+    {
+        uint64_t load_base = 0;
+        if (g_exec_ctx.exec_info.type == elf::ET_DYN) {
+            auto [lo, hi] = elf::get_load_range(g_exec_ctx.exec_binary);
+            (void)hi;
+            load_base = (g_exec_ctx.exec_base >= lo)
+                ? (g_exec_ctx.exec_base - lo) : g_exec_ctx.exec_base;
+        }
+        dynlink::load_elf_segments(m, g_exec_ctx.exec_binary, load_base);
+    }
+    if (!g_exec_ctx.interp_binary.empty() && g_exec_ctx.interp_base != 0) {
+        dynlink::load_elf_segments(m, g_exec_ctx.interp_binary, g_exec_ctx.interp_base);
+    }
+
+    // Reset BRK to initial state
+    g_exec_ctx.brk_current = g_exec_ctx.brk_base;
+
+    // Make BRK region writable
+    if (g_exec_ctx.brk_base > 0) {
+        constexpr uint64_t BRK_MAX = 16ULL << 20;
+        riscv::PageAttributes rw;
+        rw.read = true; rw.write = true;
+        m.memory.set_page_attr(g_exec_ctx.brk_base, BRK_MAX, rw);
+    }
 
     uint64_t sp = dynlink::setup_dynamic_stack(
         m, g_exec_ctx.exec_info, g_exec_ctx.interp_base,
@@ -1865,6 +1977,11 @@ static void sys_execve(Machine& m) {
     for (int i = 1; i < 32; i++) m.cpu.reg(i) = 0;
     m.cpu.reg(riscv::REG_SP) = sp;
     m.cpu.jump(g_exec_ctx.interp_entry);
+
+    // Stop machine to break out of stale decoder context
+    g_execve_restart = true;
+    if (!g_fork_stack.empty()) g_fork().child_did_execve = true;
+    m.stop();
 }
 
 static void sys_openat(Machine& m) {
@@ -2272,12 +2389,22 @@ static void sys_write(Machine& m) {
 
     // Check VFS first — fd 1/2 may have been dup2'd to a pipe/file
     if (fs.is_open(fd)) {
+        // Check if this fd points to our tty placeholder (CharDevice named "tty").
+        // If so, route to host printer instead of VFS write.
+        auto entry = fs.get_entry(fd);
+        if (entry && entry->type == vfs::FileType::CharDev && entry->name == "tty") {
+            // This is our stdio placeholder — write to host console
+            try {
+                auto view = m.memory.memview(buf_addr, count);
+                m.print(reinterpret_cast<const char*>(view.data()), count);
+                m.set_result(count);
+            } catch (...) {
+                m.set_result(err::INVAL);
+            }
+            return;
+        }
         std::vector<uint8_t> buf(count);
         m.memory.memcpy_out(buf.data(), buf_addr, count);
-        // Also tap fd 1/2 writes to host printer (Node.js dup2's stdio to pipes)
-        if (fd == 1 || fd == 2) {
-            m.print(reinterpret_cast<const char*>(buf.data()), count);
-        }
         ssize_t n = fs.write(fd, buf.data(), count);
         // Wake threads sleeping on epoll instances watching this pipe fd
         for (auto& [epfd, inst] : g_epoll_instances) {
@@ -2357,6 +2484,22 @@ static void sys_writev(Machine& m) {
 
     // Check VFS first — fd 1/2 may have been dup2'd to a pipe/file
     if (fs.is_open(fd)) {
+        // Check if this fd points to our tty placeholder — route to host console
+        auto entry = fs.get_entry(fd);
+        if (entry && entry->type == vfs::FileType::CharDev && entry->name == "tty") {
+            size_t total = 0;
+            for (int i = 0; i < iovcnt; i++) {
+                uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+                uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+                if (len > 0) {
+                    auto view = m.memory.memview(base, len);
+                    m.print(reinterpret_cast<const char*>(view.data()), len);
+                    total += len;
+                }
+            }
+            m.set_result(total);
+            return;
+        }
         size_t total = 0;
         for (int i = 0; i < iovcnt; i++) {
             uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
@@ -2364,10 +2507,6 @@ static void sys_writev(Machine& m) {
             if (len > 0) {
                 std::vector<uint8_t> buf(len);
                 m.memory.memcpy_out(buf.data(), base, len);
-                // Also tap fd 1/2 writes to host printer
-                if (fd == 1 || fd == 2) {
-                    m.print(reinterpret_cast<const char*>(buf.data()), len);
-                }
                 ssize_t n = fs.write(fd, buf.data(), len);
                 if (n < 0) {
                     m.set_result(total > 0 ? (int64_t)total : n);
@@ -2860,14 +2999,13 @@ static void sys_mmap(Machine& m) {
         }
         constexpr uint64_t ARENA_LIMIT = (1ULL << riscv::encompassing_Nbit_arena);
 
-        // Single bump pointer for all allocations within the arena.
+        // Bump pointer for all allocations within the arena.
         // Sync with mmap_address() in case file-backed mmaps advanced it.
-        static uint64_t our_bump = 0;
         uint64_t cur_mmap_addr = m.memory.mmap_address();
-        if (our_bump == 0 || our_bump < cur_mmap_addr) {
-            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-sync] our_bump=0x%lx -> mmap_address=0x%lx\n",
-                    (long)our_bump, (long)cur_mmap_addr);
-            our_bump = cur_mmap_addr;
+        if (g_mmap_bump == 0 || g_mmap_bump < cur_mmap_addr) {
+            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-sync] g_mmap_bump=0x%lx -> mmap_address=0x%lx\n",
+                    (long)g_mmap_bump, (long)cur_mmap_addr);
+            g_mmap_bump = cur_mmap_addr;
         }
 
         uint64_t aligned_len = (length + 4095) & ~4095ULL;
@@ -2903,14 +3041,14 @@ static void sys_mmap(Machine& m) {
                     if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-hint-ignore] hint=0x%lx -> bump, len=0x%lx\n",
                             (long)addr_g, (long)length);
             }
-            if (our_bump + aligned_len > ARENA_LIMIT) {
+            if (g_mmap_bump + aligned_len > ARENA_LIMIT) {
                 // For huge allocations (>= 64MB), clamp to what fits in the arena.
                 // snmalloc reserves 256GB+ of virtual space but only commits
                 // small pages within it via MAP_FIXED later. Clamping gives it
                 // a smaller but usable region. This also covers PROT_NONE
                 // reservations from Go and other runtimes.
-                if (aligned_len >= (64ULL << 20) && (ARENA_LIMIT > our_bump + (4ULL << 20))) {
-                    uint64_t clamped = (ARENA_LIMIT - our_bump) & ~4095ULL;
+                if (aligned_len >= (64ULL << 20) && (ARENA_LIMIT > g_mmap_bump + (4ULL << 20))) {
+                    uint64_t clamped = (ARENA_LIMIT - g_mmap_bump) & ~4095ULL;
                     if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-clamp] len=0x%lx clamped to 0x%lx prot=%d\n",
                             (long)length, (long)clamped, prot);
                     aligned_len = clamped;
@@ -2919,17 +3057,17 @@ static void sys_mmap(Machine& m) {
                     static int oom_count = 0;
                     if (++oom_count <= 10)
                         if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx prot=%d\n",
-                                (long)length, (long)our_bump, (long)ARENA_LIMIT, prot);
+                                (long)length, (long)g_mmap_bump, (long)ARENA_LIMIT, prot);
                     return;
                 }
             }
-            result = our_bump;
-            our_bump += aligned_len;
+            result = g_mmap_bump;
+            g_mmap_bump += aligned_len;
         }
 
         // Keep libriscv's bump pointer in sync (needed for munmap etc.)
-        if (our_bump > m.memory.mmap_address()) {
-            m.memory.mmap_address() = our_bump;
+        if (g_mmap_bump > m.memory.mmap_address()) {
+            m.memory.mmap_address() = g_mmap_bump;
         }
 
         // Zero-fill anonymous pages (MAP_ANONYMOUS contract).
@@ -2955,7 +3093,7 @@ static void sys_mmap(Machine& m) {
         ++anon_count;
         if (anon_count <= 20)
             if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-anon] #%d addr=0x%lx len=0x%lx prot=%d flags=0x%x => 0x%lx (bump=0x%lx)\n",
-                    anon_count, (long)addr_g, (long)length, prot, flags, (long)result, (long)our_bump);
+                    anon_count, (long)addr_g, (long)length, prot, flags, (long)result, (long)g_mmap_bump);
 
         maybe_preempt(m);
         return;
@@ -3359,6 +3497,22 @@ static void sys_ioctl(Machine& m) {
     m.set_result(err::NOTSUP);
 }
 
+// Lazily register stdio fds (0/1/2) in VFS so dup/dup2 can operate on them.
+// Normally stdio goes directly to host console without VFS involvement,
+// but bash redirects need to dup2 them, which requires a VFS entry.
+static void ensure_stdio_in_vfs(vfs::VirtualFS& fs, int fd) {
+    if (fd < 0 || fd > 2 || !g_stdio_open[fd] || fs.is_open(fd))
+        return;
+    auto tty_entry = std::make_shared<vfs::Entry>();
+    tty_entry->type = vfs::FileType::CharDev;
+    tty_entry->name = "tty";
+    tty_entry->mode = 0666;
+    int tmp_fd = fs.open_pipe(tty_entry, (fd == 0) ? 0 : 1);
+    fs.dup2(tmp_fd, fd);
+    fs.close(tmp_fd);
+    g_tty_fds.insert(fd);
+}
+
 static void sys_fcntl(Machine& m) {
     auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
@@ -3416,6 +3570,7 @@ static void sys_fcntl(Machine& m) {
                 m.set_result(newfd);
                 return;
             }
+            ensure_stdio_in_vfs(fs, fd);
             int newfd = fs.dup(fd);
             // Propagate tty status to new fd
             if (newfd >= 0 && g_tty_fds.count(fd))
@@ -3478,9 +3633,13 @@ static void sys_close_range(Machine& m) {
     m.set_result(0);
 }
 
+// Lazily register stdio fds (0/1/2) in VFS so dup/dup2 can operate on them.
+// Normally stdio goes directly to host console without VFS involvement,
+// but bash redirects need to dup2 them, which requires a VFS entry.
 static void sys_dup(Machine& m) {
     auto& fs = get_fs(m);
     int oldfd = m.template sysarg<int>(0);
+    ensure_stdio_in_vfs(fs, oldfd);
     int result = fs.dup(oldfd);
     // Propagate tty status to new fd
     if (result >= 0 && g_tty_fds.count(oldfd))
@@ -3502,6 +3661,8 @@ static void sys_dup3(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
+    // Lazily register stdio fds in VFS so dup2 can operate on them
+    ensure_stdio_in_vfs(fs, oldfd);
     int result = fs.dup2(oldfd, newfd);
     // Propagate tty status: if old fd is tty, new fd becomes tty
     if (result >= 0) {
@@ -5262,30 +5423,22 @@ static void sys_brk(Machine& m) {
     auto new_end = m.sysarg(0);
 
     if (!g_exec_ctx.brk_overridden) {
-        // Before execve: track brk position ourselves since libriscv's
-        // built-in handler may not be installed.
+        // Before execve: use g_exec_ctx.brk_current so fork save/restore
+        // correctly captures the BRK heap region.
         uint64_t heap_addr = m.memory.heap_address();
         constexpr uint64_t BRK_MAX = 16ULL << 20;  // 16MB
-        static uint64_t current_brk = 0;
-        if (current_brk == 0) current_brk = heap_addr;
-
-        static int brk_count = 0;
-        ++brk_count;
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[brk#%d] new_end=0x%lx current=0x%lx heap_addr=0x%lx pc=0x%lx\n",
-                brk_count, (long)new_end, (long)current_brk, (long)heap_addr, (long)m.cpu.pc());
+        // Initialize brk_current if not yet set
+        if (g_exec_ctx.brk_current == 0 || g_exec_ctx.brk_current < heap_addr)
+            g_exec_ctx.brk_current = heap_addr;
 
         if (new_end == 0 || new_end < heap_addr) {
-            // Query or invalid: return current break
-            m.set_result(current_brk);
+            m.set_result(g_exec_ctx.brk_current);
         } else if (new_end > heap_addr + BRK_MAX) {
-            // Over limit: clamp and return current (failure)
-            m.set_result(current_brk);
+            m.set_result(g_exec_ctx.brk_current);
         } else {
-            // Valid extension
-            current_brk = new_end;
-            m.set_result(current_brk);
+            g_exec_ctx.brk_current = new_end;
+            m.set_result(g_exec_ctx.brk_current);
         }
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[brk#%d] => 0x%lx\n", brk_count, (long)current_brk);
         return;
     }
 

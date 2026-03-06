@@ -13,6 +13,8 @@
 //   - An entry point from a container rootfs (with --rootfs)
 
 #include <libriscv/machine.hpp>
+#include <libriscv/decoder_cache.hpp>
+#include <libriscv/threaded_bytecodes.hpp>
 #include "vfs.hpp"
 #include "syscalls.hpp"
 #include "network.hpp"
@@ -123,8 +125,15 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 if (syscalls::g_waiting_for_host_fetch) break;
                 if (syscalls::g_waiting_for_child) break;
                 if (syscalls::g_execve_restart) break;
+                if (syscalls::g_fork_child_exited) break;
                 if (!g_machine->instruction_limit_reached()) break;
                 // No yield needed — Worker thread doesn't block UI
+            }
+            // Handle fork child exit: restore parent state outside simulate()
+            if (syscalls::g_fork_child_exited) {
+                syscalls::fork_parent_restore(*g_machine);
+                retries = -1;
+                continue;
             }
             // Handle execve: new binary loaded, restart execution
             if (syscalls::g_execve_restart) {
@@ -152,6 +161,18 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             // the current function (set PC = RA). Common after fork child cleanup.
             if (std::string(e.what()).find("EBREAK") != std::string::npos) {
                 g_last_fault_kind = FRISCY_FAULT_EBREAK;
+                if (syscalls::g_fork_active()) {
+                    std::cerr << "[resume] EBREAK in fork child — forcing child exit\n";
+                    syscalls::g_fork().exit_status = 127;
+                    syscalls::g_process_model.push_event(
+                        syscalls::ProcessEventKind::Exit,
+                        syscalls::g_fork().child_pid, syscalls::g_fork().parent_pid,
+                        syscalls::g_fork().child_pgid, 127);
+                    syscalls::g_process_model.mark_exited(syscalls::g_fork().child_pid, 127);
+                    syscalls::g_fork_child_exited = true;
+                    g_machine->stop();
+                    continue;
+                }
                 if (friscy_stopped()) {
                     std::cerr << "[resume] EBREAK after stop: treating as completed run\n";
                     return 0;
@@ -917,6 +938,7 @@ int main(int argc, char** argv) {
                   << binary.size() << ")\n";
 #if defined(FRISCY_EXPERIMENT_EMPTY_MACHINE)
         riscv::MachineOptions<riscv::RISCV64> machine_opts{};
+        machine_opts.use_shared_execute_segments = false;
 #if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
         machine_opts.use_memory_arena = false;
         machine_opts.memory_max = 1024ULL << 20; // 1GiB page-backed budget
@@ -927,8 +949,10 @@ int main(int argc, char** argv) {
 #endif
                   << "\n";
         machine_ptr = std::make_unique<Machine>(machine_opts);
+        machine_ptr->set_options(std::make_shared<riscv::MachineOptions<riscv::RISCV64>>(machine_opts));
 #elif defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD) || defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
         riscv::MachineOptions<riscv::RISCV64> machine_opts{};
+        machine_opts.use_shared_execute_segments = false;
 #if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
         machine_opts.load_program = false;
 #endif
@@ -945,8 +969,14 @@ int main(int argc, char** argv) {
 #endif
                   << "\n";
         machine_ptr = std::make_unique<Machine>(binary, machine_opts);
+        machine_ptr->set_options(std::make_shared<riscv::MachineOptions<riscv::RISCV64>>(machine_opts));
 #else
-        machine_ptr = std::make_unique<Machine>(binary);
+        {
+            auto opts_ptr = std::make_shared<riscv::MachineOptions<riscv::RISCV64>>();
+            opts_ptr->use_shared_execute_segments = false;
+            machine_ptr = std::make_unique<Machine>(binary, *opts_ptr);
+            machine_ptr->set_options(opts_ptr);
+        }
 #endif
         auto& machine = *machine_ptr;
         std::cout << "[friscy-debug] Machine constructed (pc=0x"
@@ -1293,8 +1323,15 @@ int main(int argc, char** argv) {
                     if (syscalls::g_waiting_for_host_fetch) break;
                     if (syscalls::g_waiting_for_child) break;
                     if (syscalls::g_execve_restart) break;
+                    if (syscalls::g_fork_child_exited) break;
                     if (!machine.instruction_limit_reached()) break;
                     // No yield needed — Worker thread doesn't block UI
+                }
+                // Fork child exited: restore parent state outside simulate()
+                if (syscalls::g_fork_child_exited) {
+                    syscalls::fork_parent_restore(machine);
+                    retries = -1;
+                    continue;
                 }
                 // execve: re-enter simulate with new binary
                 if (syscalls::g_execve_restart) {
@@ -1316,6 +1353,12 @@ int main(int argc, char** argv) {
                     checkpoint::save_checkpoint_file(data, export_checkpoint_path);
                     fprintf(stderr, "[friscy] Checkpoint saved, exiting.\n");
                     return 0;
+                }
+                // Fork child exited: restore parent state outside simulate()
+                if (syscalls::g_fork_child_exited) {
+                    syscalls::fork_parent_restore(machine);
+                    retries = -1;
+                    continue;
                 }
                 // After execve, machine.stop() causes simulate to return
                 // with m_max_counter=0. instruction_limit_reached() returns
@@ -1472,6 +1515,44 @@ int main(int argc, char** argv) {
                 // emulation where futex force-unlock may trigger false positives.
                 if (std::string(e.what()).find("EBREAK") != std::string::npos) {
                     g_last_fault_kind = FRISCY_FAULT_EBREAK;
+                    // Diagnostic: check actual memory at the reported PC
+                    {   static bool once = true;
+                        if (once) {
+                            fprintf(stderr, "[bc-ids] SYSCALL=%d SYSTEM=%d STOP=%d\n",
+                                    riscv::RV32I_BC_SYSCALL, riscv::RV32I_BC_SYSTEM, riscv::RV32I_BC_STOP);
+                            once = false;
+                        }
+                        uint64_t epc = machine.cpu.pc();
+                        uint32_t mem_instr = 0;
+                        try { machine.memory.memcpy_out(&mem_instr, epc, 4); } catch (...) {}
+                        auto& seg = machine.cpu.current_execute_segment();
+                        auto* dcache = seg.decoder_cache();
+                        // SHIFT is 1 for compressed, 2 for non-compressed
+                        constexpr unsigned SHIFT = 1; // compressed enabled
+                        auto& dentry = dcache[epc >> SHIFT];
+                        fprintf(stderr, "[EBREAK-diag] pc=0x%lx mem=0x%08x decoder_bc=%d decoder_instr=0x%08x"
+                                " seg=[0x%lx,0x%lx) a7=%ld(0x%lx)\n",
+                                (long)epc, mem_instr, dentry.get_bytecode(), dentry.instr,
+                                (long)seg.exec_begin(), (long)seg.exec_end(),
+                                (long)machine.cpu.reg(17), (long)machine.cpu.reg(17));
+                    }
+                    if (syscalls::g_fork_active()) {
+                        // Treat EBREAK in fork child as child crash → exit(127)
+                        std::cerr << "[friscy] EBREAK in fork child (pc=0x"
+                                  << std::hex << machine.cpu.pc() << std::dec
+                                  << ") — forcing child exit\n";
+                        syscalls::g_fork().exit_status = 127;
+                        syscalls::g_process_model.push_event(
+                            syscalls::ProcessEventKind::Exit,
+                            syscalls::g_fork().child_pid, syscalls::g_fork().parent_pid,
+                            syscalls::g_fork().child_pgid, 127);
+                        syscalls::g_process_model.mark_exited(syscalls::g_fork().child_pid, 127);
+                        syscalls::g_fork_child_exited = true;
+                        machine.stop();
+                        // Don't retry — go to fork_parent_restore
+                        retries = -1;
+                        continue;
+                    }
                     if (machine.stopped()) {
                         std::cerr << "[friscy] EBREAK after stop: treating as graceful completion\n";
                         break;

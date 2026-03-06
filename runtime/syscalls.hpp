@@ -2638,8 +2638,15 @@ static bool fill_stat_from_fd(Machine& m, int fd, linux_stat64& st) {
     st.st_nlink = 1;
     st.st_blksize = 4096;
 
-    // stdio tty fds
+    // stdio fds: check VFS first (may have been dup2'd to pipe/file)
     if (fd == 0 || fd == 1 || fd == 2) {
+        if (fs.is_open(fd)) {
+            auto entry = fs.get_entry(fd);
+            if (entry && !(entry->type == vfs::FileType::CharDev && entry->name == "tty")) {
+                // Not a tty placeholder — fall through to VFS stat below
+                goto vfs_stat;
+            }
+        }
         st.st_mode = 020666;  // S_IFCHR | 0666
         return true;
     }
@@ -2657,6 +2664,7 @@ static bool fill_stat_from_fd(Machine& m, int fd, linux_stat64& st) {
     }
 
     // VFS-backed fd (regular file, dir, fifo, symlink)
+vfs_stat:
     auto entry = fs.get_entry(fd);
     if (entry) {
         std::string path = fs.get_path(fd);
@@ -3737,34 +3745,34 @@ static void sys_readv(Machine& m) {
         fd = 0;  // treat as stdin read
     }
 
-    // If fd 0 has been redirected (e.g. dup2'd to a pipe), try VFS first.
-    // If that source is empty, fall through to stdin source below.
-    // - Emscripten: Module._stdinBuffer
-    // - Native: real STDIN_FILENO
+    // If fd 0 has been redirected (dup2'd to a pipe/file), read from VFS.
+    // Only fall through to host stdin for our tty placeholder (CharDev "tty").
     if (fd == 0 && fs.is_open(fd)) {
-        size_t total = 0;
-        for (int i = 0; i < iovcnt; i++) {
-            uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
-            uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
-            if (len > 0) {
-                std::vector<uint8_t> buf(len);
-                ssize_t n = fs.read(fd, buf.data(), len);
-                if (n < 0) {
-                    m.set_result(total > 0 ? (int64_t)total : n);
-                    return;
+        auto entry = fs.get_entry(fd);
+        bool is_tty = entry && entry->type == vfs::FileType::CharDev && entry->name == "tty";
+        if (!is_tty) {
+            size_t total = 0;
+            for (int i = 0; i < iovcnt; i++) {
+                uint64_t base = m.memory.template read<uint64_t>(iov_addr + i * 16);
+                uint64_t len = m.memory.template read<uint64_t>(iov_addr + i * 16 + 8);
+                if (len > 0) {
+                    std::vector<uint8_t> buf(len);
+                    ssize_t n = fs.read(fd, buf.data(), len);
+                    if (n < 0) {
+                        m.set_result(total > 0 ? (int64_t)total : n);
+                        return;
+                    }
+                    if (n > 0) {
+                        m.memory.memcpy(base, buf.data(), n);
+                        total += n;
+                    }
+                    if (static_cast<size_t>(n) < len) break;
                 }
-                if (n > 0) {
-                    m.memory.memcpy(base, buf.data(), n);
-                    total += n;
-                }
-                if (static_cast<size_t>(n) < len) break;
             }
-        }
-        if (total > 0) {
-            m.set_result(total);
+            m.set_result(total);  // 0 = EOF for pipes/files
             return;
         }
-        // Fall through to stdin source below.
+        // tty placeholder — fall through to host stdin
     }
 
     if (fd == 0) {
@@ -4110,6 +4118,22 @@ static void sys_pselect6(Machine& m) {
         }
 
         if (check_fd == 0 && in_read) {
+            // Check if fd 0 is a VFS pipe/file (not tty placeholder)
+            auto& fs0 = get_fs(m);
+            if (fs0.is_open(0)) {
+                auto entry0 = fs0.get_entry(0);
+                bool is_tty0 = entry0 && entry0->type == vfs::FileType::CharDev && entry0->name == "tty";
+                if (!is_tty0) {
+                    // Pipe/file: check if data available
+                    if (entry0 && entry0->content.size() > 0) {
+                        ready_read |= (1ULL << fd);
+                        ready++;
+                    }
+                    // else: empty pipe = not ready (EOF handled by read)
+                    goto pselect_next_fd;
+                }
+            }
+            // tty or not in VFS — check host stdin
 #ifdef __EMSCRIPTEN__
             int has_data = EM_ASM_INT({
                 return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
@@ -4141,6 +4165,7 @@ static void sys_pselect6(Machine& m) {
                 ready++;
             }
         }
+pselect_next_fd:;
     }
 
     // If we need stdin and aren't polling (zero_timeout), block BEFORE
@@ -4202,6 +4227,25 @@ static void sys_ppoll(Machine& m) {
         }
 
         if (poll_fd == 0 && (events & 0x0001 /*POLLIN*/)) {
+            // Check if fd 0 is a VFS pipe/file (not tty placeholder)
+            auto& fs0 = get_fs(m);
+            if (fs0.is_open(0)) {
+                auto entry0 = fs0.get_entry(0);
+                bool is_tty0 = entry0 && entry0->type == vfs::FileType::CharDev && entry0->name == "tty";
+                if (!is_tty0) {
+                    // Pipe/file: check if data available
+                    if (entry0 && entry0->content.size() > 0) {
+                        revents |= 0x0001; // POLLIN
+                        ready++;
+                    } else {
+                        revents |= 0x0010; // POLLHUP (EOF on empty pipe)
+                        ready++;
+                    }
+                    m.memory.template write<int16_t>(entry_addr + 6, revents);
+                    continue;
+                }
+            }
+            // tty or not in VFS — check host stdin
 #ifdef __EMSCRIPTEN__
             int has_data = EM_ASM_INT({
                 return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 :
@@ -4384,7 +4428,17 @@ static void sys_epoll_pwait(Machine& m) {
         uint32_t revents = 0;
 
         if (fd == 0) {
-            // stdin — check JS buffer
+            // Check if fd 0 is a VFS pipe/file (not tty placeholder)
+            if (fs.is_open(0)) {
+                auto entry0 = fs.get_entry(0);
+                bool is_tty0 = entry0 && entry0->type == vfs::FileType::CharDev && entry0->name == "tty";
+                if (!is_tty0) {
+                    if ((interest.events & 0x01) && entry0 && entry0->content.size() > 0)
+                        revents |= 0x01;
+                    goto epoll_check_revents;
+                }
+            }
+            // tty or not in VFS — check host stdin
 #ifdef __EMSCRIPTEN__
             int has_data = EM_ASM_INT({
                 return (Module._stdinBuffer && Module._stdinBuffer.length > 0) ? 1 : 0;
@@ -4454,6 +4508,7 @@ static void sys_epoll_pwait(Machine& m) {
         }
 #endif
 
+epoll_check_revents:
         if (revents) {
             // struct epoll_event { uint32_t events; [4 pad]; uint64_t data; } = 16 bytes
             uint64_t offset = events_addr + ready * 16;

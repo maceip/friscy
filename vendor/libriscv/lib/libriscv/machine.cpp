@@ -288,6 +288,8 @@ namespace riscv
 				this->system_call(cpu.reg(REG_ECALL));
 				return;
 			case 1: // EBREAK
+				fprintf(stderr, "[EBREAK-REAL] pc=0x%lx instr=0x%08x\n",
+						(long)cpu.pc(), instr.whole);
 				this->ebreak();
 				return;
 			case 0x105: // WFI

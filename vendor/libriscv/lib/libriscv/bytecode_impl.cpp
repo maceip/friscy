@@ -850,7 +850,11 @@ INSTRUCTION(RV32I_BC_LIVEPATCH, execute_livepatch) {
 
 INSTRUCTION(RV32I_BC_FUNCTION, execute_decoded_function)
 {
-	//printf("Slowpath: 0x%X  (instr: 0x%X)\n", uint32_t(pc), DECODER().instr);
+	// Check if this is an ebreak (0x00100073) or ecall misrouted
+	if ((DECODER().instr & 0xFFF) == 0x073) {
+		fprintf(stderr, "[FUNC-SYSTEM] real_pc=0x%lx instr=0x%08x handler=%d\n",
+				(long)pc, DECODER().instr, DECODER().m_handler);
+	}
 	CPU().execute(DECODER().m_handler, DECODER().instr);
 	NEXT_INSTR();
 }

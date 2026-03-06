@@ -18,6 +18,7 @@ static constexpr bool verbose_syscalls = false;
 #include <signal.h>
 #undef sa_handler
 #include <unistd.h>
+#include <execinfo.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #if !defined(__OpenBSD__) && !defined(TARGET_OS_IPHONE)
@@ -100,6 +101,15 @@ template <int W>
 static void syscall_ebreak(riscv::Machine<W>& machine)
 {
 	printf("\n>>> EBREAK at %#lX\n", (long) machine.cpu.pc());
+	// Backtrace to find caller
+	void* bt[16];
+	int n = backtrace(bt, 16);
+	char** syms = backtrace_symbols(bt, n);
+	if (syms) {
+		for (int i = 0; i < n && i < 8; i++)
+			fprintf(stderr, "[EBREAK-bt] %s\n", syms[i]);
+		free(syms);
+	}
 	throw MachineException(UNHANDLED_SYSCALL, "EBREAK instruction");
 }
 

@@ -232,7 +232,23 @@ inline void Machine<W>::set_result(Args... args) noexcept {
 template <int W> inline
 void Machine<W>::ebreak()
 {
-	// its simpler and more flexible to just call a user-provided function
+	static int ebreak_count = 0;
+	if (ebreak_count++ < 3) {
+		fprintf(stderr, "[ebreak] sp=0x%lx ra=0x%lx a0=0x%lx a7=%ld\n",
+				(long)cpu.reg(2), (long)cpu.reg(1), (long)cpu.reg(10), (long)cpu.reg(17));
+		// Dump guest call stack (walk RA on stack)
+		auto sp = cpu.reg(2);
+		fprintf(stderr, "[ebreak] stack walk: ");
+		for (int i = 0; i < 8; i++) {
+			try {
+				uint64_t val = 0;
+				memory.memcpy_out(&val, sp + i*8, 8);
+				if (val >= 0x18000000 && val < 0x1c000000)
+					fprintf(stderr, "0x%lx ", (long)val);
+			} catch (...) { break; }
+		}
+		fprintf(stderr, "\n");
+	}
 	this->system_call(riscv::SYSCALL_EBREAK);
 }
 

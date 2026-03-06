@@ -1903,10 +1903,6 @@ static void sys_execve(Machine& m) {
             std::cout << "[friscy] execve: jumping to 0x" << std::hex
                       << jump_target << std::dec << "\n";
 
-            // Uncomment to enable tracing for the new binary:
-            // g_trace_syscalls = true;
-            // g_trace_countdown = 50;
-
             // CRITICAL: Stop the machine to break out of the threaded dispatch
             // loop cleanly. After evict_execute_segments(), the decoded instruction
             // cache is freed. If we just return from this handler, the dispatch
@@ -2219,20 +2215,21 @@ static void sys_read(Machine& m) {
         }
     }
 
-    // If fd has been redirected (e.g. dup2'd to a pipe), try VFS first.
-    // If that source is empty, fall back to the host stdin source:
-    // - Emscripten: Module._stdinBuffer
-    // - Native: real STDIN_FILENO
-    // This avoids getting stuck on an empty internal pipe after restore.
+    // If fd 0 has been redirected (dup2'd to a pipe/file), read from VFS.
+    // Only fall through to host stdin for our tty placeholder (CharDev "tty").
     if (fd == 0 && fs.is_open(fd)) {
-        std::vector<uint8_t> buf(count);
-        ssize_t n = fs.read(fd, buf.data(), count);
-        if (n > 0) {
-            m.memory.memcpy(buf_addr, buf.data(), n);
-            m.set_result(n);
+        auto entry = fs.get_entry(fd);
+        bool is_tty = entry && entry->type == vfs::FileType::CharDev && entry->name == "tty";
+        if (!is_tty) {
+            std::vector<uint8_t> buf(count);
+            ssize_t n = fs.read(fd, buf.data(), count);
+            if (n > 0) {
+                m.memory.memcpy(buf_addr, buf.data(), n);
+            }
+            m.set_result(n > 0 ? n : 0);  // 0 = EOF for pipes/files
             return;
         }
-        // Fall through to stdin source below.
+        // tty placeholder — fall through to host stdin
     }
 
     if (fd == 0) {
@@ -2335,6 +2332,7 @@ static void sys_write(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
+    TRACE_SC("write(fd=%d, count=%zu)", fd, count);
 
     // /dev/tty fds (other than 0/1/2) redirect writes to stdout
     if (fd > 2 && g_tty_fds.count(fd)) {
@@ -2481,6 +2479,8 @@ static void sys_writev(Machine& m) {
     int fd = m.template sysarg<int>(0);
     auto iov_addr = m.sysarg(1);
     int iovcnt = m.template sysarg<int>(2);
+
+    TRACE_SC("writev(fd=%d, iovcnt=%d)", fd, iovcnt);
 
     // Check VFS first — fd 1/2 may have been dup2'd to a pipe/file
     if (fs.is_open(fd)) {
@@ -3385,13 +3385,24 @@ static void sys_sendfile(Machine& m) {
 
     if (count == 0) { m.set_result(0); return; }
 
-    // Write to out_fd
-    if (out_fd == 1 || out_fd == 2) {
-        // stdout/stderr - use printer
+    // Write to out_fd — check VFS first (fd may be dup2'd to a pipe/file)
+    auto& fs = *ctx->fs;
+    if (fs.is_open(out_fd)) {
+        auto entry = fs.get_entry(out_fd);
+        if (entry && entry->type == vfs::FileType::CharDev && entry->name == "tty") {
+            // tty placeholder — write to host console
+            m.print(reinterpret_cast<const char*>(buf.data()), count);
+            m.set_result(count);
+        } else {
+            ssize_t n = fs.write(out_fd, buf.data(), count);
+            m.set_result(n);
+        }
+    } else if (out_fd == 1 || out_fd == 2) {
+        // Default stdout/stderr - use printer
         m.print(reinterpret_cast<const char*>(buf.data()), count);
         m.set_result(count);
     } else {
-        ssize_t n = ctx->fs->write(out_fd, buf.data(), count);
+        ssize_t n = fs.write(out_fd, buf.data(), count);
         m.set_result(n);
     }
 }

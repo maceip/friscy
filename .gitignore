@@ -45,6 +45,9 @@ tests/test_http_minimal
 tests/*.tar
 tests/echo_server/echo_server
 
+# Python cache
+__pycache__/
+
 # Editor/IDE
 .vscode/
 .idea/
@@ -74,6 +77,25 @@ docs_site/*.ckpt
 !docs_site/codex-version-post.ckpt
 !docs_site/codex-haiku.ckpt
 !docs_site/codex-limerick.ckpt
+
+# Extracted rootfs (regenerated from rootfs.tar)
+docs_site/tmp-extract/
+
+# Debug / repro logs
+*.log
+!docs_site/*.log
+
+# Perf lab (local benchmark workspace)
+perf-lab/
+
+# Native binary at root
+friscy
+
+# Test screenshot artifacts
+tests/artifacts/*.png
+
+# Generated reports
+docs/generated/
 
 # OS
 .DS_Store

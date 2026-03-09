@@ -30,6 +30,32 @@ bool read_file(vfs::VirtualFS& fs, const std::string& path, std::string& out) {
     return true;
 }
 
+bool dir_contains(vfs::VirtualFS& fs, const std::string& path, const std::string& want_name) {
+    const int dfd = fs.opendir(path);
+    if (dfd < 0) return false;
+    uint8_t buf[4096];
+    bool found = false;
+    for (;;) {
+        const auto n = fs.getdents64(dfd, buf, sizeof(buf));
+        if (n <= 0) break;
+        size_t off = 0;
+        while (off + 19 <= static_cast<size_t>(n)) {
+            uint16_t reclen = 0;
+            std::memcpy(&reclen, buf + off + 16, sizeof(reclen));
+            if (reclen < 20 || off + reclen > static_cast<size_t>(n)) break;
+            const char* name = reinterpret_cast<const char*>(buf + off + 19);
+            if (want_name == name) {
+                found = true;
+                break;
+            }
+            off += reclen;
+        }
+        if (found) break;
+    }
+    fs.close(dfd);
+    return found;
+}
+
 int fail(const std::string& msg) {
     std::cerr << "[vfs_overlay_selftest] FAIL: " << msg << "\n";
     return 1;
@@ -47,6 +73,22 @@ int main() {
     }
     if (!write_file(fs, "/tmp/scratch.txt", "scratch")) {
         return fail("write scratch");
+    }
+    if (fs.mkdir("/tmp/newdir", 0755) != 0) return fail("mkdir /tmp/newdir");
+    if (fs.mkdir("/tmp/newdir/nested", 0755) != 0) return fail("mkdir /tmp/newdir/nested");
+    if (!dir_contains(fs, "/tmp/newdir", "nested")) {
+        return fail("opendir/getdents for newly-created directory");
+    }
+    // Path normalization regressions: ./ and trailing slash must resolve.
+    if (!write_file(fs, "/etc/./norm.txt", "norm")) {
+        return fail("write with ./ path");
+    }
+    std::string norm;
+    if (!read_file(fs, "/etc/./norm.txt/", norm)) {
+        return fail("read with ./ + trailing / path");
+    }
+    if (norm != "norm") {
+        return fail("normalized path content mismatch");
     }
 
     // Simulate upper-layer edits: rename old config away, write new one, delete old.

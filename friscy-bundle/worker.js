@@ -64,6 +64,7 @@ const CMD_RESIZE = 6;
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const CMD_NETWORK_RPC_DONE = 7;
 const CMD_EXPORT_VFS = 8;
+const CMD_EXPORT_CHECKPOINT = 9;
 
 const PROCESS_EVENT_KIND_SPAWN = 1;
 const PROCESS_EVENT_KIND_EXIT = 2;
@@ -143,6 +144,8 @@ let jitPrewarmEnabled = true;
 let netWorker = null;
 let netRpcId = 1;
 const pendingRpcs = new Map();
+const syntheticSockets = new Map();
+const syntheticRecvLogCount = new Map();
 let processDrainResolved = false;
 let processDrainMissingLogged = false;
 let processEventsDirectPathSeen = false;
@@ -150,6 +153,152 @@ let lastProcessExitStatus = null;
 let lastProcessWaitWakeStatus = null;
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+function parseSockaddr(addrData) {
+    if (!addrData || addrData.length < 8) return null;
+    const dv = new DataView(addrData.buffer, addrData.byteOffset, addrData.byteLength);
+    const family = dv.getUint16(0, true);
+    if (family === 2 && addrData.length >= 8) {
+        const port = (addrData[2] << 8) | addrData[3];
+        const host = `${addrData[4]}.${addrData[5]}.${addrData[6]}.${addrData[7]}`;
+        return { family, host, port };
+    }
+    if (family === 10 && addrData.length >= 28) {
+        const port = (addrData[2] << 8) | addrData[3];
+        const parts = [];
+        for (let i = 8; i < 24; i += 2) {
+            parts.push(((addrData[i] << 8) | addrData[i + 1]).toString(16));
+        }
+        const host = parts.join(':');
+        return { family, host, port };
+    }
+    return null;
+}
+
+function syntheticHttpFetch(sock) {
+    const req = sock.req;
+    if (!req || sock.inflight) return;
+    const headerEnd = req.indexOf('\r\n\r\n');
+    if (headerEnd < 0) return;
+    sock.inflight = true;
+
+    try {
+        const head = req.slice(0, headerEnd);
+        const lines = head.split('\r\n');
+        const requestLine = lines[0] || 'GET / HTTP/1.1';
+        const m = requestLine.match(/^([A-Z]+)\s+(\S+)\s+HTTP\/\d\.\d$/);
+        const method = m ? m[1] : 'GET';
+        let path = m ? m[2] : '/';
+        let hostHeader = '';
+        for (let i = 1; i < lines.length; i++) {
+            const line = lines[i];
+            if (/^host:/i.test(line)) {
+                hostHeader = line.slice(5).trim();
+                break;
+            }
+        }
+        const authority = hostHeader || (sock.port ? `${sock.host}:${sock.port}` : sock.host);
+        if (!/^https?:\/\//i.test(path)) {
+            path = `http://${authority}${path.startsWith('/') ? '' : '/'}${path}`;
+        }
+        console.log(`[worker][synth-net] fetch ${method} ${path}`);
+
+        const bodyStart = headerEnd + 4;
+        const bodyBytes = encoder.encode(req.slice(bodyStart));
+        const opts = { method, headers: {}, body: undefined };
+        for (let i = 1; i < lines.length; i++) {
+            const line = lines[i];
+            const idx = line.indexOf(':');
+            if (idx <= 0) continue;
+            const k = line.slice(0, idx).trim();
+            const v = line.slice(idx + 1).trim();
+            if (!k) continue;
+            if (k.toLowerCase() === 'host') continue;
+            opts.headers[k] = v;
+        }
+        if (bodyBytes.length > 0 && method !== 'GET' && method !== 'HEAD') {
+            opts.body = bodyBytes;
+        }
+
+        let status = 0;
+        let statusText = '';
+        let respBody = new Uint8Array(0);
+        const respHeaders = {};
+        let useProxy = false;
+        try {
+            const target = new URL(path, self.location?.origin || undefined);
+            useProxy = !!(self.hostFetchProxy && self.location && target.origin !== self.location.origin);
+        } catch (_e) {
+            useProxy = false;
+        }
+
+        if (useProxy && typeof XMLHttpRequest === 'function') {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', self.hostFetchProxy, false);
+            xhr.setRequestHeader('content-type', 'application/json');
+            xhr.send(JSON.stringify({ url: path, options: opts }));
+            if (xhr.status !== 200) {
+                throw new Error(`host fetch proxy status ${xhr.status}`);
+            }
+            const proxyJson = JSON.parse(xhr.responseText || '{}');
+            status = Number(proxyJson?.status || 0);
+            statusText = String(proxyJson?.statusText || '');
+            const hdrs = proxyJson?.headers || {};
+            for (const [k, v] of Object.entries(hdrs)) {
+                respHeaders[String(k).toLowerCase()] = String(v);
+            }
+            respBody = encoder.encode(String(proxyJson?.body || ''));
+        } else {
+            throw new Error('no synchronous host fetch bridge available');
+        }
+
+        if (!Number.isFinite(status) || status <= 0) {
+            throw new Error('network fetch failed');
+        }
+        console.log(`[worker][synth-net] fetch status=${status}`);
+        let headerText = `HTTP/1.1 ${status} ${statusText}\r\n`;
+        for (const [k, v] of Object.entries(respHeaders)) {
+            const lk = String(k).toLowerCase();
+            if (lk === 'content-length' || lk === 'transfer-encoding' || lk === 'content-encoding' || lk === 'connection') {
+                continue;
+            }
+            headerText += `${k}: ${v}\r\n`;
+        }
+        headerText += 'connection: close\r\n';
+        headerText += `content-length: ${respBody.length}\r\n\r\n`;
+        const headerBytes = encoder.encode(headerText);
+        const packet = new Uint8Array(headerBytes.length + respBody.length);
+        packet.set(headerBytes, 0);
+        packet.set(respBody, headerBytes.length);
+        sock.recv.push(packet);
+    } catch (e) {
+        const errMsg = `HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\n\r\n${String(e?.message || e)}`;
+        sock.recv.push(encoder.encode(errMsg));
+    } finally {
+        sock.req = '';
+        sock.inflight = false;
+    }
+}
+
+async function syntheticDnsFetch(sock, payload) {
+    try {
+        const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload || 0);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        const b64url = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        const r = await fetch(`https://cloudflare-dns.com/dns-query?dns=${b64url}`, {
+            headers: { Accept: 'application/dns-message' },
+        });
+        if (!r.ok) return;
+        const out = new Uint8Array(await r.arrayBuffer());
+        if (out.length) sock.recv.push(out);
+    } catch (_e) {
+        // keep socket non-fatal; guest will handle EAGAIN/timeout
+    } finally {
+        sock.inflight = false;
+    }
+}
 
 /**
  * Write bytes to the stdout ring buffer.
@@ -219,51 +368,95 @@ function requestStdin(maxLen) {
  */
 function networkRPC(op, fd, arg1, arg2, data) {
     if (!netWorker) {
-        // Fallback or JSPI environment - if not WebTransport proxy
-        if (!netView || !netBytes) return { result: -38, data: null };
-
-        Atomics.store(netView, 1, op);
-        Atomics.store(netView, 2, fd);
-        Atomics.store(netView, 3, arg1);
-        Atomics.store(netView, 4, arg2);
-
-        if (data && data.length > 0) {
-            const len = Math.min(data.length, NET_DATA_SIZE);
-            Atomics.store(netView, 6, len);
-            netBytes.set(data.subarray(0, len), NET_HEADER);
-        } else {
-            Atomics.store(netView, 6, 0);
+        // No WebTransport proxy: synthetic HTTP socket bridge via fetch.
+        if (op === NET_OP_SOCKET_CREATE) {
+            syntheticSockets.set(fd, {
+                fd,
+                req: '',
+                recv: [],
+                host: '',
+                port: 0,
+                connected: false,
+                inflight: false,
+                type: arg2 | 0,
+                domain: arg1 | 0,
+            });
+            return { result: 0, data: null };
         }
-
-        Atomics.store(netView, 0, 1);
-        Atomics.notify(netView, 0);
-
-        while (true) {
-            const lock = Atomics.load(netView, 0);
-            if (lock === 2) break;
-            Atomics.wait(netView, 0, lock, 100);
-        }
-
-        const result = Atomics.load(netView, 5);
-        const respLen = Atomics.load(netView, 6);
-        let respData = null;
-        if (respLen > 0) {
-            respData = new Uint8Array(respLen);
-            for (let i = 0; i < respLen; i++) {
-                respData[i] = netBytes[NET_HEADER + i];
+        const sock = syntheticSockets.get(fd);
+        if (!sock) return { result: -9, data: null };
+        if (op === NET_OP_CONNECT) {
+            const parsed = parseSockaddr(data || new Uint8Array(0));
+            if (parsed) {
+                sock.host = parsed.host;
+                sock.port = parsed.port;
             }
+            sock.connected = true;
+            console.log(`[worker][synth-net] connect fd=${fd} host=${sock.host} port=${sock.port}`);
+            return { result: 0, data: null };
         }
-
-        Atomics.store(netView, 0, 0);
-        return { result, data: respData };
+        if (op === NET_OP_SEND) {
+            const payload = data || new Uint8Array(0);
+            const copied = new Uint8Array(payload.length);
+            copied.set(payload);
+            sock.req += decoder.decode(copied);
+            if (payload.length > 0) {
+                console.log(`[worker][synth-net] send fd=${fd} bytes=${payload.length}`);
+            }
+            if (sock.type === 2) {
+                // UDP path: treat payload as DNS wire query.
+                sock.inflight = true;
+                syntheticDnsFetch(sock, copied).catch(() => {});
+                return { result: payload.length, data: null };
+            }
+            // Fire and forget; recv will pick up buffered response.
+            syntheticHttpFetch(sock);
+            return { result: payload.length, data: null };
+        }
+        if (op === NET_OP_RECV) {
+            if (!sock.recv.length) {
+                const c = (syntheticRecvLogCount.get(fd) || 0) + 1;
+                syntheticRecvLogCount.set(fd, c);
+                if (c <= 8) {
+                    console.log(`[worker][synth-net] recv fd=${fd} EAGAIN inflight=${sock.inflight} q=${sock.recv.length}`);
+                }
+                return { result: -11, data: null }; // EAGAIN
+            }
+            const buf = sock.recv[0];
+            const maxLen = Math.max(0, arg1 | 0);
+            const n = Math.min(maxLen, buf.length);
+            const out = buf.slice(0, n);
+            if (n === buf.length) sock.recv.shift();
+            else sock.recv[0] = buf.slice(n);
+            console.log(`[worker][synth-net] recv fd=${fd} bytes=${out.length}`);
+            return { result: out.length, data: out };
+        }
+        if (op === NET_OP_HAS_DATA) {
+            return { result: sock.recv.length > 0 ? 1 : 0, data: null };
+        }
+        if (op === NET_OP_CLOSE || op === NET_OP_SHUTDOWN) {
+            syntheticSockets.delete(fd);
+            return { result: 0, data: null };
+        }
+        return { result: 0, data: null };
     }
 
     // Modern isolated network lane via net_lane_worker
     const id = netRpcId++;
+    let payload = null;
+    let transfer = [];
+    if (data && data.length > 0) {
+        // Avoid transferring a SharedArrayBuffer-backed view directly.
+        const copied = new Uint8Array(data.length);
+        copied.set(data);
+        payload = copied.buffer;
+        transfer = [payload];
+    }
+
     netWorker.postMessage({
         type: 'rpc', id, op, fd, arg1, arg2, 
-        data: data ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : null
-    }, data ? [data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)] : []);
+        data: payload
+    }, transfer);
 
     // We still have to block the worker thread so Wasm doesn't continue until the socket responds
     // Emscripten Asyncify could be used, but since we are in a worker, Atomics is easier.
@@ -274,10 +467,15 @@ function networkRPC(op, fd, arg1, arg2, data) {
     Atomics.store(netView, 0, 1);
     Atomics.store(netView, 7, id);
     
+    const t0 = Date.now();
     while (true) {
         const lock = Atomics.load(netView, 0);
         if (lock === 2 && Atomics.load(netView, 7) === id) break;
         Atomics.wait(netView, 0, lock, 100);
+        if (Date.now() - t0 > 10000) {
+            Atomics.store(netView, 0, 0);
+            return { result: -110, data: null }; // ETIMEDOUT
+        }
     }
 
     const result = Atomics.load(netView, 5);
@@ -449,6 +647,31 @@ function getStopReason(friscy_stop_reason, friscy_stopped) {
         : STOP_REASON_NONE;
 }
 
+function exportLiveCheckpointBytes() {
+    if (!emModule) throw new Error('Module not initialized');
+    const sizePtr = emModule._malloc(4);
+    const liveExport = emModule._friscy_save_live_checkpoint || emModule._friscy_export_checkpoint;
+    if (!liveExport) {
+        emModule._free(sizePtr);
+        throw new Error('No checkpoint export function available');
+    }
+    const dataPtr = liveExport(sizePtr);
+    const size = Number(emModule.HEAPU32[Number(sizePtr) >> 2]);
+    emModule._free(sizePtr);
+    if (!dataPtr || size <= 0) {
+        throw new Error('Live checkpoint export returned empty payload');
+    }
+    const ptr = Number(dataPtr) >>> 0;
+    const len = size >>> 0;
+    const heapLen = emModule.HEAPU8.byteLength >>> 0;
+    if (len === 0 || ptr + len > heapLen) {
+        throw new Error(`Live checkpoint buffer out of bounds (ptr=${ptr} size=${len} heap=${heapLen})`);
+    }
+    const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, len).slice();
+    if (liveExport !== emModule._friscy_save_live_checkpoint) emModule._free(dataPtr);
+    return copy;
+}
+
 /**
  * Run the resume loop.
  */
@@ -462,6 +685,9 @@ async function runResumeLoop() {
         stopTimeslice: 0,
         stopWaitChild: 0,
         timesliceResumeAttempts: 0,
+        resumeThrows: 0,
+        recoveredThrows: 0,
+        jitSuppressedByFaults: 0,
         jitDispatches: 0,
         jitFallbacks: 0,
         jitDirectRuns: 0,
@@ -511,6 +737,8 @@ async function runResumeLoop() {
     const friscy_get_fetch_request = emModule._friscy_get_fetch_request;
     const friscy_get_fetch_request_len = emModule._friscy_get_fetch_request_len;
     const friscy_set_fetch_response = emModule._friscy_set_fetch_response;
+    let consecutiveResumeThrows = 0;
+    let suppressJitDispatch = false;
 
     while (true) {
         const rawStopReason = getStopReason(friscy_stop_reason, friscy_stopped);
@@ -547,9 +775,23 @@ async function runResumeLoop() {
                     console.error('[worker] VFS export failed:', e.message);
                 }
             }
+        } else if (currentCmd === CMD_EXPORT_CHECKPOINT) {
+            Atomics.store(controlView, 0, CMD_IDLE);
+            try {
+                const copy = exportLiveCheckpointBytes();
+                self.postMessage({
+                    type: 'checkpoint-exported-live',
+                    data: copy,
+                    metrics: { bytes: copy.length },
+                }, [copy.buffer]);
+            } catch (e) {
+                console.error('[worker] Live export failed in resume loop:', e.message, e.stack);
+                self.postMessage({ type: 'checkpoint-export-error', message: e.message, stack: e.stack });
+            }
         }
 
         if (stopReason & STOP_REASON_STDIN) {
+            let receivedStdin = false;
             const cmd = Atomics.load(controlView, 0);
             if (cmd === CMD_STDIN_READY) {
                 const len = Atomics.load(controlView, 2);
@@ -557,6 +799,7 @@ async function runResumeLoop() {
                     for (let i = 0; i < len; i++) {
                         emModule._stdinBuffer.push(controlBytes[64 + i]);
                     }
+                    receivedStdin = true;
                 }
                 Atomics.store(controlView, 0, CMD_IDLE);
             } else {
@@ -571,9 +814,18 @@ async function runResumeLoop() {
                         for (let i = 0; i < len; i++) {
                             emModule._stdinBuffer.push(controlBytes[64 + i]);
                         }
+                        receivedStdin = true;
                     }
+                    Atomics.store(controlView, 0, CMD_IDLE);
+                } else {
+                    // Keep request visible to the UI so automation/users can
+                    // gate command injection on explicit stdin demand.
+                    Atomics.store(controlView, 0, CMD_STDIN_REQUEST);
                 }
-                Atomics.store(controlView, 0, CMD_IDLE);
+            }
+            if (!receivedStdin) {
+                await new Promise((r) => setTimeout(r, 10));
+                continue;
             }
         }
         drainProcessEvents();
@@ -690,7 +942,7 @@ async function runResumeLoop() {
             }
         }
 
-        if (jitManager.jitCompiler) {
+        if (jitManager.jitCompiler && !suppressJitDispatch) {
             let pc = friscy_get_pc() >>> 0;
             const statePtr = friscy_get_state_ptr();
             const MAX_CHAIN = 32;
@@ -749,15 +1001,51 @@ async function runResumeLoop() {
         while (true) {
             try {
                 stillStopped = await friscy_resume();
+                consecutiveResumeThrows = 0;
                 break;
             } catch (resumeErr) {
+                telemetry.resumeThrows++;
                 console.error('[worker] friscy_resume threw:', resumeErr?.message || resumeErr);
+                if (stopReason & STOP_REASON_STDIN) {
+                    telemetry.recoveredThrows++;
+                    stillStopped = 1;
+                    break;
+                }
+                const resumeErrText = String(resumeErr);
+                const resumeErrMsg = (resumeErr && typeof resumeErr === 'object' && 'message' in resumeErr)
+                    ? String(resumeErr.message)
+                    : '';
+                if (Array.isArray(resumeErr) || resumeErrText.includes('[array Array]') || resumeErrMsg.includes('[array Array]')) {
+                    // JSPI/Wasm exception payloads can surface as raw JS arrays.
+                    // Treat them as transient stop boundaries instead of hard faults.
+                    telemetry.recoveredThrows++;
+                    if (typeof emModule._friscy_recover_fault === 'function') {
+                        try { emModule._friscy_recover_fault(); } catch (_) {}
+                    }
+                    stillStopped = 1;
+                    break;
+                }
+                // Some resume throws are non-fatal in JSPI mode. If the VM is
+                // already stopped with a concrete stop-reason, continue loop.
+                const stoppedNow = !!(friscy_stopped && friscy_stopped());
+                const reasonNow = getStopReason(friscy_stop_reason, friscy_stopped);
+                if (stoppedNow && reasonNow !== STOP_REASON_NONE) {
+                    telemetry.recoveredThrows++;
+                    stillStopped = 1;
+                    break;
+                }
+                consecutiveResumeThrows++;
+                if (consecutiveResumeThrows >= 3) {
+                    suppressJitDispatch = true;
+                    telemetry.jitSuppressedByFaults++;
+                }
                 if (faultRetries++ >= 8) {
                     flushTelemetry('too_many_faults');
                     return;
                 }
                 if (typeof emModule._friscy_recover_fault === 'function') {
                     try { emModule._friscy_recover_fault(); } catch (_) {}
+                    await new Promise((r) => setTimeout(r, 0));
                     continue;
                 }
                 flushTelemetry('resume_exception');
@@ -1019,9 +1307,22 @@ self.onmessage = async function(e) {
     if (msg.type === 'net_proxy') {
         console.log('[worker] Initializing WebTransport proxy lane to:', msg.proxyUrl);
         netWorker = new Worker('./net_lane_worker.js', { type: 'module' });
+        netWorker.onerror = (err) => {
+            console.error('[worker] net lane worker error:', err?.message || err);
+            netWorker = null;
+        };
         
         netWorker.onmessage = (e) => {
             const laneMsg = e.data;
+            if (laneMsg.type === 'ready') {
+                console.log('[worker] net lane ready');
+                return;
+            }
+            if (laneMsg.type === 'error') {
+                console.error('[worker] net lane init failed:', laneMsg.message || 'unknown');
+                netWorker = null;
+                return;
+            }
             if (laneMsg.type === 'rpc_result') {
                 if (!netView) return;
                 Atomics.store(netView, 5, laneMsg.result);
@@ -1246,21 +1547,7 @@ self.onmessage = async function(e) {
             return;
         }
         try {
-            const sizePtr = emModule._malloc(4);
-            const liveExport = emModule._friscy_save_live_checkpoint || emModule._friscy_export_checkpoint;
-            if (!liveExport) {
-                emModule._free(sizePtr);
-                throw new Error('No checkpoint export function available');
-            }
-            const dataPtr = liveExport(sizePtr);
-            const size = Number(emModule.HEAPU32[Number(sizePtr) >> 2]);
-            emModule._free(sizePtr);
-            if (!dataPtr || size <= 0) {
-                throw new Error('Live checkpoint export returned empty payload');
-            }
-            const ptr = Number(dataPtr);
-            const copy = new Uint8Array(emModule.HEAPU8.buffer, ptr, size).slice();
-            if (liveExport !== emModule._friscy_save_live_checkpoint) emModule._free(dataPtr);
+            const copy = exportLiveCheckpointBytes();
             self.postMessage({
                 type: 'checkpoint-exported-live',
                 data: copy,

@@ -4,6 +4,13 @@
 // Uses libriscv's userdata mechanism to pass VFS to syscall handlers.
 #pragma once
 
+// Kill all debug logging — every fprintf/cerr costs CPU even to /dev/null
+#ifdef FRISCY_QUIET
+#define dbg_fprintf(...) ((void)0)
+#else
+#define dbg_fprintf fprintf
+#endif
+
 #include <libriscv/machine.hpp>
 #include "vfs.hpp"
 #include "elf_loader.hpp"
@@ -12,6 +19,7 @@
 #include <ctime>
 #include <cstring>
 #include <random>
+#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <vector>
@@ -34,6 +42,10 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // Used by JS resume loop to distinguish stdin-wait from program exit.
 inline bool g_waiting_for_stdin = false;
 
+// Flag: safe-mode disables selected custom runtime behaviour that may hide
+// accelerator bugs.
+inline bool g_safe_mode = false;
+
 // Flag: when true, native mode stops on first stdin read instead of blocking.
 // Used by --export-checkpoint to capture state at the stdin-wait point.
 inline bool g_checkpoint_on_stdin = false;
@@ -53,19 +65,153 @@ inline std::string g_host_fetch_response;
 // The dispatch loop must re-enter simulate() with the new binary.
 inline bool g_execve_restart = false;
 
+// Fork lifecycle state model (durable over implicit lifecycle flags).
+enum class ProcessState : uint8_t {
+    ParentSaved = 0,    // Parent context checkpointed before child execution.
+    ChildRunning,       // Child execution is active.
+    ChildExeced,        // Child execve loaded a new image.
+    ChildExited,        // Child completed and restore is pending.
+    ParentRestored,     // Parent restored from child frame.
+    ParentWaiting,      // Parent blocked in wait4().
+    ChildReaped,        // Parent reaped child exit status.
+    Failed,             // State-machine invariant break.
+};
+
+inline const char* process_state_name(ProcessState state) {
+    switch (state) {
+        case ProcessState::ParentSaved: return "ParentSaved";
+        case ProcessState::ChildRunning: return "ChildRunning";
+        case ProcessState::ChildExeced: return "ChildExeced";
+        case ProcessState::ChildExited: return "ChildExited";
+        case ProcessState::ParentRestored: return "ParentRestored";
+        case ProcessState::ParentWaiting: return "ParentWaiting";
+        case ProcessState::ChildReaped: return "ChildReaped";
+        case ProcessState::Failed: return "Failed";
+    }
+    return "Unknown";
+}
+
+struct ForkLifecycle {
+    ProcessState state = ProcessState::ParentSaved;
+    bool parent_context_restored = false;
+};
+
+inline ForkLifecycle g_fork_lifecycle = {ProcessState::ParentSaved, false};
+struct ForkState;
+inline bool g_fork_active();
+inline int32_t fork_child_pid();
+
+inline uint64_t fork_regs_hash(const Machine& m) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < 32; i++) {
+        h ^= m.cpu.reg(i);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+inline bool process_state_transition_allowed(ProcessState from, ProcessState to) {
+    if (from == to) return true;
+    switch (from) {
+        case ProcessState::ParentSaved:
+            return to == ProcessState::ChildRunning
+                || to == ProcessState::ChildReaped
+                || to == ProcessState::Failed;
+        case ProcessState::ChildRunning:
+            return to == ProcessState::ChildExeced
+                || to == ProcessState::ChildExited
+                || to == ProcessState::ParentWaiting
+                || to == ProcessState::ParentSaved
+                || to == ProcessState::Failed;
+        case ProcessState::ChildExeced:
+            return to == ProcessState::ChildExited || to == ProcessState::Failed;
+        case ProcessState::ChildExited:
+            return to == ProcessState::ParentRestored || to == ProcessState::Failed;
+        case ProcessState::ParentRestored:
+            return to == ProcessState::ParentWaiting
+                || to == ProcessState::ChildReaped
+                || to == ProcessState::ParentSaved
+                || to == ProcessState::Failed;
+        case ProcessState::ParentWaiting:
+            return to == ProcessState::ChildExited
+                || to == ProcessState::ChildReaped
+                || to == ProcessState::ParentSaved
+                || to == ProcessState::Failed;
+        case ProcessState::ChildReaped:
+            return to == ProcessState::ParentSaved
+                || to == ProcessState::ChildReaped
+                || to == ProcessState::Failed;
+        case ProcessState::Failed:
+            return to == ProcessState::Failed;
+    }
+    return false;
+}
+
+inline void expect_transition(ProcessState from, ProcessState to, const char* event, const char* reason) {
+    if (process_state_transition_allowed(from, to)) return;
+    dbg_fprintf(stderr,
+            "[fork-lifecycle] FATAL invalid transition from=%s to=%s event=%s reason=%s\n",
+            process_state_name(from),
+            process_state_name(to),
+            event ? event : "?(event)",
+            reason ? reason : "?(reason)");
+    __builtin_trap();
+}
+
 // ============================================================================
 // Phase 2: wait/yield/resume for child processes
 // ============================================================================
 // When parent calls wait4() and child hasn't exited yet, the machine yields
-// back to the host JS (m.stop()) with g_waiting_for_child=true.  The host
+// back to the host (m.stop()) with ProcessState::ParentWaiting.  The host
 // detects this via friscy_stop_reason() bitmask and can either:
 //   a) let the vfork child run to completion then resume (single-worker), or
 //   b) (Phase 3) resume a child worker, wait for its Exit event, then resume.
-// When the child exits, host calls friscy_notify_child_exit(pid, status) which
-// populates g_child_exit_delivered, then resumes the machine.  The rewound
-// wait4 syscall re-executes and finds the child Exited → returns normally.
-inline bool g_waiting_for_child = false;
+// When the child exits, host calls friscy_notify_child_exit(pid, status), then
+// resumes the machine.  The rewound wait4 syscall re-executes and finds the
+// child Exited → returns normally.
 inline pid_t g_wait_blocked_pid = 0;
+
+// Fork lifecycle state for the current vfork frame (top of g_fork_stack).
+// Parent/child synchronization is now expressed as explicit state transitions.
+inline ForkLifecycle& fork_lifecycle() {
+    return g_fork_lifecycle;
+}
+inline ForkLifecycle& fork_lifecycle(Machine&) {
+    return g_fork_lifecycle;
+}
+
+inline void fork_set_state(Machine& m, ProcessState to, const char* event, const char* reason = "state transition") {
+    auto& lc = fork_lifecycle(m);
+    expect_transition(lc.state, to, event, reason);
+    const ProcessState from = lc.state;
+    if (from == to) return;
+    lc.state = to;
+    lc.parent_context_restored = (to == ProcessState::ParentRestored);
+    const uint64_t pc = m.cpu.pc();
+    const uint64_t a0 = m.cpu.reg(riscv::REG_ARG0);
+    const uint64_t sp = m.cpu.reg(riscv::REG_SP);
+    const uint64_t ra = m.cpu.reg(riscv::REG_RA);
+    const uint64_t reg_hash = fork_regs_hash(m);
+    const int32_t child_pid = fork_child_pid();
+    dbg_fprintf(stderr,
+            "[fork-lifecycle] event=%s reason=%s from=%s to=%s pc=0x%lx a0=0x%lx sp=0x%lx ra=0x%lx reg_hash=0x%lx child_pid=%d\n",
+            event ? event : "?(event)",
+            reason ? reason : "?(reason)",
+            process_state_name(from),
+            process_state_name(to),
+            (long)pc,
+            (long)a0,
+            (long)sp,
+            (long)ra,
+            (long)reg_hash,
+            child_pid);
+}
+
+inline const char* fork_state_name() { return process_state_name(fork_lifecycle().state); }
+
+inline bool fork_parent_context_restored() {
+    return fork_lifecycle().parent_context_restored;
+}
 
 // Stop-reason bitmask — returned by friscy_stop_reason() export.
 // Worker.js inspects this to decide how to handle each yield.
@@ -76,14 +222,400 @@ static constexpr uint32_t STOP_REASON_TIMESLICE   = 1u << 2;
 static constexpr uint32_t STOP_REASON_WAIT_CHILD  = 1u << 3;
 static constexpr uint32_t STOP_REASON_FORK_RESTORE = 1u << 4;
 
-// Flag: fork child has exited, parent restore needed OUTSIDE simulate()
-// The restore can't happen inside simulate() because evicting execute segments
-// invalidates the decoder cache that simulate()'s local variables reference.
-inline bool g_fork_child_exited = false;
-
 // Global mmap bump pointer — must be file-scope so fork_parent_restore can
 // reset it. See sys_mmap for usage.
 inline uint64_t g_mmap_bump = 0;
+
+// Safe-mode bypass for custom mmap handling.
+inline bool g_disable_custom_mmap_wrapper = false;
+inline uint64_t g_custom_mmap_bypass_pc = 0;
+
+// Syscall tracing (disabled by default to reduce log noise)
+inline bool g_trace_syscalls = false;
+inline int g_trace_countdown = 800;
+inline bool g_perf_stats = false;
+
+// Lightweight mmap/munmap churn rails.
+// Goal: identify high-frequency alloc/free loops without requiring full strace.
+struct MmapRails {
+    uint64_t mmap_ops = 0;
+    uint64_t munmap_ops = 0;
+    uint64_t mmap_fails = 0;
+    uint64_t mmap_bytes = 0;
+    uint64_t munmap_bytes = 0;
+    uint64_t live_bytes = 0;
+    uint64_t peak_live_bytes = 0;
+    std::unordered_map<uint64_t, uint64_t> mmap_pc_hits;
+    std::unordered_map<uint64_t, uint64_t> munmap_pc_hits;
+    std::unordered_map<uint64_t, uint64_t> mmap_ra_hits;
+    std::unordered_map<uint64_t, uint64_t> munmap_ra_hits;
+};
+inline MmapRails g_mmap_rails;
+inline int g_mmap_boundary_dump_budget = 1;
+inline uint64_t g_mmap_boundary_target_call = 0;
+inline bool g_mmap_boundary_watch_all_calls = false;
+inline bool g_mmap_boundary_panic_on_drift = false;
+inline uint64_t g_mmap_boundary_call_id = 0;
+inline bool g_mmap_boundary_budget_inited = false;
+inline bool g_mmap_boundary_pc_decode_dumped = false;
+inline bool g_mmap_boundary_target_seen = false;
+inline uint64_t g_mmap_boundary_entry_a7 = 0;
+inline uint64_t g_mmap_boundary_entry_ra = 0;
+inline uint64_t g_mmap_boundary_entry_sp = 0;
+inline bool g_mmap_boundary_target_drifts = false;
+
+static inline void init_mmap_boundary_budget() {
+    if (g_mmap_boundary_budget_inited) return;
+    g_mmap_boundary_budget_inited = true;
+    if (const char* env = std::getenv("FRISCY_MMAP_BOUNDARY_DUMPS")) {
+        const long requested = std::strtol(env, nullptr, 10);
+        if (requested > 0)
+            g_mmap_boundary_dump_budget = (requested > 64) ? 64 : (int)requested;
+    }
+    if (const char* env = std::getenv("FRISCY_MMAP_BOUNDARY_TARGET_CALL")) {
+        const long requested = std::strtol(env, nullptr, 10);
+        if (requested > 0)
+            g_mmap_boundary_target_call = (uint64_t)requested;
+        else
+            g_mmap_boundary_target_call = 0;
+    }
+    g_mmap_boundary_watch_all_calls = (g_mmap_boundary_target_call == 0);
+    if (const char* env = std::getenv("FRISCY_MMAP_BOUNDARY_PANIC")) {
+        const long requested = std::strtol(env, nullptr, 10);
+        g_mmap_boundary_panic_on_drift = requested != 0;
+    }
+}
+
+static inline constexpr uint64_t kMmapBoundaryPc = 0x18035938ULL;
+static inline uint64_t begin_mmap_boundary_probe(Machine& m) {
+    init_mmap_boundary_budget();
+    if (m.cpu.pc() != kMmapBoundaryPc || g_mmap_boundary_dump_budget <= 0)
+        return 0;
+    g_mmap_boundary_dump_budget--;
+    return ++g_mmap_boundary_call_id;
+}
+
+static inline void dump_hex_window(Machine& m, uint64_t start, uint64_t len, const char* label) {
+    fprintf(stderr, "[mmap-boundary] %s 0x%lx-0x%lx: ", label, (long)start, (long)(start + len));
+    for (uint64_t off = 0; off < len; off++) {
+        uint64_t addr = start + off;
+        unsigned byte_val = 0xEE;
+        try {
+            byte_val = static_cast<unsigned>(m.memory.template read<uint8_t>(addr));
+        } catch (...) {
+            byte_val = 0xEE;
+        }
+        fprintf(stderr, "%02x%s", byte_val, (off + 1 < len) ? " " : "\n");
+    }
+}
+
+static inline void dump_stack_window(Machine& m, uint64_t sp) {
+    constexpr uint64_t stack_bytes = 128;
+    const uint64_t start = sp > 64 ? sp - 64 : 0;
+    fprintf(stderr, "[mmap-boundary] stack a7=0x%lx ra=0x%lx sp=0x%lx\n",
+            (long)m.cpu.reg(17), (long)m.cpu.reg(1), (long)sp);
+    dump_hex_window(m, start, stack_bytes, "sp window");
+}
+
+static inline void dump_mmap_boundary_phase(Machine& m, uint64_t call_id, const char* phase) {
+    if (call_id == 0)
+        return;
+
+    const uint64_t pc = m.cpu.pc();
+    fprintf(stderr, "[mmap-boundary] phase=%s call=%lu pc=0x%lx a0=0x%lx a1=0x%lx a2=0x%lx a3=0x%lx a4=0x%lx a5=0x%lx a6=0x%lx a7=0x%lx ra=0x%lx sp=0x%lx result=0x%lx\n",
+            phase,
+            (unsigned long)call_id,
+            (long)pc,
+            (long)m.cpu.reg(10), (long)m.cpu.reg(11), (long)m.cpu.reg(12), (long)m.cpu.reg(13),
+            (long)m.cpu.reg(14), (long)m.cpu.reg(15), (long)m.cpu.reg(16), (long)m.cpu.reg(17),
+            (long)m.cpu.reg(1), (long)m.cpu.reg(2),
+            (long)m.cpu.reg(10));
+    try {
+        auto& seg = m.cpu.current_execute_segment();
+        fprintf(stderr, "[mmap-boundary] current seg=0x%lx-0x%lx translated=%d\n",
+                (long)seg.exec_begin(), (long)seg.exec_end(),
+                (int)seg.is_binary_translated());
+        if (pc >= seg.exec_begin() && pc + 4 <= seg.exec_end()) {
+            auto* instr_ptr = seg.exec_data(pc);
+            uint32_t inst = 0;
+            if (instr_ptr) {
+                std::memcpy(&inst, instr_ptr, sizeof(inst));
+                fprintf(stderr, "[mmap-boundary] decode bytes around pc raw=0x%08x\n", (unsigned)inst);
+            }
+        }
+    } catch (...) {
+        fprintf(stderr, "[mmap-boundary] seg decode unavailable\n");
+    }
+
+    dump_hex_window(m, pc > 16 ? pc - 16 : 0, 64, "pc window");
+    dump_stack_window(m, m.cpu.reg(2));
+    fprintf(stderr, "[mmap-boundary] ---- end ----\n");
+}
+
+static inline void dump_mmap_boundary_decode_once(Machine& m, const char* phase) {
+    if (g_mmap_boundary_pc_decode_dumped) return;
+    g_mmap_boundary_pc_decode_dumped = true;
+    const uint64_t pc = m.cpu.pc();
+    fprintf(stderr, "[mmap-boundary] decode-one-shot phase=%s pc=0x%lx\n", phase, (long)pc);
+    try {
+        auto& seg = m.cpu.current_execute_segment();
+        const uint64_t start = (pc >= 24) ? pc - 24 : 0;
+        const uint64_t end = pc + 24;
+        fprintf(stderr, "[mmap-boundary] decode seg=0x%lx-0x%lx\n", (long)seg.exec_begin(), (long)seg.exec_end());
+        for (uint64_t addr = start; addr < end; addr += 4) {
+            if (!(addr >= seg.exec_begin() && addr + 4 <= seg.exec_end())) {
+                fprintf(stderr, "[mmap-boundary] decode[%lx]=--\n", (long)addr);
+                continue;
+            }
+            auto* instr_ptr = seg.exec_data(addr);
+            uint32_t inst = 0;
+            if (instr_ptr) {
+                std::memcpy(&inst, instr_ptr, sizeof(inst));
+                fprintf(stderr, "[mmap-boundary] decode[%lx]=0x%08x\n", (long)addr, (unsigned)inst);
+            } else {
+                fprintf(stderr, "[mmap-boundary] decode[%lx]=null\n", (long)addr);
+            }
+        }
+    } catch (...) {
+        fprintf(stderr, "[mmap-boundary] decode-one-shot unavailable\n");
+    }
+}
+
+static inline void check_mmap_boundary_drift(Machine& m, uint64_t call_id, const char* phase) {
+    const bool watched = (g_mmap_boundary_watch_all_calls || call_id == g_mmap_boundary_target_call);
+    if (!watched)
+        return;
+
+    if (std::strcmp(phase, "entry") == 0 || !g_mmap_boundary_target_seen) {
+        g_mmap_boundary_target_seen = true;
+        g_mmap_boundary_entry_a7 = m.cpu.reg(17);
+        g_mmap_boundary_entry_ra = m.cpu.reg(1);
+        g_mmap_boundary_entry_sp = m.cpu.reg(2);
+        g_mmap_boundary_target_drifts = false;
+        fprintf(stderr, "[mmap-boundary] watch-call=%lu entry-snapshot a7=0x%lx ra=0x%lx sp=0x%lx\n",
+                (unsigned long)call_id, (long)g_mmap_boundary_entry_a7, (long)g_mmap_boundary_entry_ra, (long)g_mmap_boundary_entry_sp);
+        return;
+    }
+
+    if (!g_mmap_boundary_target_seen) return;
+
+    const bool drift = (m.cpu.reg(17) != g_mmap_boundary_entry_a7) ||
+        (m.cpu.reg(1) != g_mmap_boundary_entry_ra) ||
+        (m.cpu.reg(2) != g_mmap_boundary_entry_sp);
+    if (!drift || g_mmap_boundary_target_drifts) return;
+
+    g_mmap_boundary_target_drifts = true;
+    fprintf(stderr, "[mmap-boundary] panic-watch call=%lu phase=%s a7=0x%lx->0x%lx ra=0x%lx->0x%lx sp=0x%lx->0x%lx\n",
+            (unsigned long)call_id, phase,
+            (long)g_mmap_boundary_entry_a7, (long)m.cpu.reg(17),
+            (long)g_mmap_boundary_entry_ra, (long)m.cpu.reg(1),
+            (long)g_mmap_boundary_entry_sp, (long)m.cpu.reg(2));
+    if (g_mmap_boundary_panic_on_drift) {
+        std::abort();
+    }
+}
+
+static inline bool rails_heavy_enabled() {
+    return g_trace_syscalls || g_perf_stats;
+}
+
+static inline void reset_mmap_rails() {
+    g_mmap_rails = MmapRails{};
+}
+
+static inline std::pair<uint64_t, uint64_t> rails_top_pc(
+    const std::unordered_map<uint64_t, uint64_t>& hits) {
+    uint64_t best_pc = 0;
+    uint64_t best_count = 0;
+    for (const auto& kv : hits) {
+        if (kv.second > best_count) {
+            best_pc = kv.first;
+            best_count = kv.second;
+        }
+    }
+    return {best_pc, best_count};
+}
+
+static inline void rails_emit_mmap_summary(const char* reason) {
+    if (!rails_heavy_enabled()) return;
+    auto [top_mmap_pc, top_mmap_count] = rails_top_pc(g_mmap_rails.mmap_pc_hits);
+    auto [top_munmap_pc, top_munmap_count] = rails_top_pc(g_mmap_rails.munmap_pc_hits);
+    auto [top_mmap_ra, top_mmap_ra_count] = rails_top_pc(g_mmap_rails.mmap_ra_hits);
+    auto [top_munmap_ra, top_munmap_ra_count] = rails_top_pc(g_mmap_rails.munmap_ra_hits);
+    fprintf(stderr,
+            "[mmap-rails] %s mmap_ops=%lu munmap_ops=%lu mmap_fail=%lu live=%luMB peak=%luMB "
+            "mmap_bytes=%luMB munmap_bytes=%luMB top_mmap_pc=0x%lx(%lu) top_munmap_pc=0x%lx(%lu) "
+            "top_mmap_ra=0x%lx(%lu) top_munmap_ra=0x%lx(%lu)\n",
+            reason,
+            (unsigned long)g_mmap_rails.mmap_ops,
+            (unsigned long)g_mmap_rails.munmap_ops,
+            (unsigned long)g_mmap_rails.mmap_fails,
+            (unsigned long)(g_mmap_rails.live_bytes >> 20),
+            (unsigned long)(g_mmap_rails.peak_live_bytes >> 20),
+            (unsigned long)(g_mmap_rails.mmap_bytes >> 20),
+            (unsigned long)(g_mmap_rails.munmap_bytes >> 20),
+            (unsigned long)top_mmap_pc, (unsigned long)top_mmap_count,
+            (unsigned long)top_munmap_pc, (unsigned long)top_munmap_count,
+            (unsigned long)top_mmap_ra, (unsigned long)top_mmap_ra_count,
+            (unsigned long)top_munmap_ra, (unsigned long)top_munmap_ra_count);
+}
+
+static inline void rails_note_mmap(uint64_t pc, uint64_t ra, uint64_t bytes) {
+    g_mmap_rails.mmap_ops++;
+    g_mmap_rails.mmap_bytes += bytes;
+    g_mmap_rails.live_bytes += bytes;
+    g_mmap_rails.peak_live_bytes = std::max(g_mmap_rails.peak_live_bytes, g_mmap_rails.live_bytes);
+    if (rails_heavy_enabled()) {
+        g_mmap_rails.mmap_pc_hits[pc]++;
+        g_mmap_rails.mmap_ra_hits[ra]++;
+        const uint64_t ops = g_mmap_rails.mmap_ops + g_mmap_rails.munmap_ops;
+        if ((ops % 512) == 0) {
+            rails_emit_mmap_summary("periodic");
+        }
+    }
+}
+
+static inline void rails_note_mmap_fail(uint64_t pc) {
+    g_mmap_rails.mmap_fails++;
+    if (rails_heavy_enabled()) {
+        g_mmap_rails.mmap_pc_hits[pc]++;
+        const uint64_t ops = g_mmap_rails.mmap_ops + g_mmap_rails.munmap_ops + g_mmap_rails.mmap_fails;
+        if ((ops % 256) == 0) {
+            rails_emit_mmap_summary("mmap-fail");
+        }
+    }
+}
+
+static inline void rails_note_munmap(uint64_t pc, uint64_t ra, uint64_t bytes) {
+    g_mmap_rails.munmap_ops++;
+    g_mmap_rails.munmap_bytes += bytes;
+    g_mmap_rails.live_bytes = (g_mmap_rails.live_bytes > bytes) ? (g_mmap_rails.live_bytes - bytes) : 0;
+    if (rails_heavy_enabled()) {
+        g_mmap_rails.munmap_pc_hits[pc]++;
+        g_mmap_rails.munmap_ra_hits[ra]++;
+        const uint64_t ops = g_mmap_rails.mmap_ops + g_mmap_rails.munmap_ops;
+        if ((ops % 512) == 0) {
+            rails_emit_mmap_summary("periodic");
+        }
+    }
+}
+
+static inline uint64_t arena_limit() {
+    return (1ULL << riscv::encompassing_Nbit_arena);
+}
+
+static inline void sync_mmap_bump(Machine& m) {
+    uint64_t cur_mmap_addr = m.memory.mmap_address();
+    if (g_mmap_bump == 0 || g_mmap_bump < cur_mmap_addr) {
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[mmap-sync] g_mmap_bump=0x%lx -> mmap_address=0x%lx\n",
+                (long)g_mmap_bump, (long)cur_mmap_addr);
+        g_mmap_bump = cur_mmap_addr;
+    }
+}
+
+static inline void publish_mmap_bump(Machine& m) {
+    if (g_mmap_bump > m.memory.mmap_address()) {
+        m.memory.mmap_address() = g_mmap_bump;
+    }
+}
+
+static inline void invalidate_reuse_cache(Machine& m, uint64_t addr, uint64_t len) {
+    if (len == 0) return;
+    if (addr + len <= m.memory.mmap_start()) return;
+    const uint64_t clipped_addr = std::max<uint64_t>(addr, m.memory.mmap_start());
+    const uint64_t clipped_end = addr + len;
+    if (clipped_end > clipped_addr) {
+        m.memory.mmap_cache().invalidate(clipped_addr, clipped_end - clipped_addr);
+    }
+}
+
+struct AnonMapResult {
+    uint64_t addr = 0;
+    uint64_t aligned_len = 0;
+    int error = 0;
+    bool from_reuse_cache = false;
+    bool ignored_hint = false;
+};
+
+static inline AnonMapResult alloc_anon_mapping(Machine& m, uint64_t addr_hint, uint64_t length, int flags) {
+    constexpr int MAP_FIXED = 0x10;
+    AnonMapResult out {};
+
+    if (length == 0) {
+        out.error = -22;
+        return out;
+    }
+
+    sync_mmap_bump(m);
+
+    const uint64_t limit = arena_limit();
+    out.aligned_len = (length + 4095) & ~4095ULL;
+
+    if (flags & MAP_FIXED) {
+        if (addr_hint + out.aligned_len > limit) {
+            out.error = -12;
+            return out;
+        }
+        invalidate_reuse_cache(m, addr_hint, out.aligned_len);
+        out.addr = addr_hint;
+        g_mmap_bump = std::max(g_mmap_bump, addr_hint + out.aligned_len);
+        publish_mmap_bump(m);
+        return out;
+    }
+
+    if (addr_hint != 0 && addr_hint >= limit) {
+        out.ignored_hint = true;
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[mmap-hint-ignore] hint=0x%lx -> allocator, len=0x%lx\n",
+                (long)addr_hint, (long)length);
+        addr_hint = 0;
+    }
+
+    auto reused = m.memory.mmap_cache().find(out.aligned_len);
+    if (!reused.empty()) {
+        out.addr = reused.addr;
+        out.from_reuse_cache = true;
+        return out;
+    }
+
+    if (g_mmap_bump + out.aligned_len > limit) {
+        if (out.aligned_len >= (64ULL << 20) && (limit > g_mmap_bump + (4ULL << 20))) {
+            const uint64_t clamped = (limit - g_mmap_bump) & ~4095ULL;
+            out.aligned_len = clamped;
+        } else {
+            out.error = -12;
+            return out;
+        }
+    }
+
+    out.addr = g_mmap_bump;
+    g_mmap_bump += out.aligned_len;
+    publish_mmap_bump(m);
+    return out;
+}
+
+static inline uint64_t munmap_return_ra(Machine& m) {
+    uint64_t munmap_ra = m.cpu.reg(1);
+    if (m.cpu.pc() == 0x18035a8aULL) {
+        try {
+            munmap_ra = m.memory.template read<uint64_t>(m.cpu.reg(2) + 24);
+        } catch (...) {}
+    }
+    return munmap_ra;
+}
+
+static inline void custom_unmap_range(Machine& m, uint64_t addr, uint64_t aligned_len, uint64_t pc, uint64_t ra) {
+    if (addr >= m.memory.mmap_start() && aligned_len > 0) {
+        if (g_mmap_bump != 0 && addr + aligned_len == g_mmap_bump) {
+            g_mmap_bump = addr;
+            if (m.memory.mmap_address() > g_mmap_bump) {
+                m.memory.mmap_address() = g_mmap_bump;
+            }
+        } else {
+            m.memory.mmap_cache().insert(addr, aligned_len);
+        }
+    }
+    rails_note_munmap(pc, ra, aligned_len);
+}
 
 // Perform the actual fork parent restore. Must be called OUTSIDE simulate()
 // so that the next simulate() call starts with fresh decoder cache pointers.
@@ -102,7 +634,7 @@ inline void arena_memcpy_out(Machine& m, void* dst, uint64_t src, size_t len) {
             std::memcpy(dst, arena + src, len);
             return;
         }
-        fprintf(stderr, "[arena_memcpy_out] FALLBACK: src=0x%lx len=0x%lx arena_size=0x%lx\n",
+        dbg_fprintf(stderr, "[arena_memcpy_out] FALLBACK: src=0x%lx len=0x%lx arena_size=0x%lx\n",
                 (long)src, (long)len, (long)m.memory.memory_arena_size());
     }
     m.memory.memcpy_out(dst, src, len);
@@ -118,12 +650,9 @@ inline void arena_memcpy_in(Machine& m, uint64_t dst, const void* src, size_t le
     m.memory.memcpy(dst, src, len);
 }
 
-// Syscall tracing (disabled by default to reduce log noise)
-inline bool g_trace_syscalls = false;
-inline int g_trace_countdown = 800;
 #define TRACE_SC(name, ...) do { \
     if (g_trace_syscalls && g_trace_countdown-- > 0) \
-        fprintf(stderr, "[TRACE] " name " pc=0x%lx\n", __VA_ARGS__, (long)m.cpu.pc()); \
+        dbg_fprintf(stderr, "[TRACE] " name " pc=0x%lx\n", __VA_ARGS__, (long)m.cpu.pc()); \
 } while(0)
 
 // Network bridge function pointers (set by main.cpp after network.hpp is included).
@@ -211,7 +740,7 @@ struct ProcessEvent {
     int32_t exit_status = 0;
 };
 
-enum class ProcessState : uint8_t {
+enum class TaskState : uint8_t {
     Running = 0,
     Exited  = 1,
     Reaped  = 2,
@@ -221,7 +750,7 @@ struct ProcessInfo {
     pid_t pid  = 0;
     pid_t ppid = 0;
     pid_t pgid = 0;
-    ProcessState state = ProcessState::Reaped;
+    TaskState state = TaskState::Reaped;
     int32_t exit_status = 0;
 };
 
@@ -241,7 +770,7 @@ struct ProcessModel {
 
     void init() {
         if (initialized) return;
-        table[0] = {1, 0, 1, ProcessState::Running, 0};
+        table[0] = {1, 0, 1, TaskState::Running, 0};
         count = 1;
         next_pid = 100;
         initialized = true;
@@ -267,14 +796,14 @@ struct ProcessModel {
     bool register_process(pid_t pid, pid_t ppid, pid_t pgid) {
         init();
         if (count >= (int)MAX_PROCS) return false;
-        table[count++] = {pid, ppid, pgid, ProcessState::Running, 0};
+        table[count++] = {pid, ppid, pgid, TaskState::Running, 0};
         return true;
     }
 
     bool has_exited_child(pid_t ppid) {
         init();
         for (int i = 0; i < count; i++) {
-            if (table[i].ppid == ppid && table[i].state == ProcessState::Exited) {
+            if (table[i].ppid == ppid && table[i].state == TaskState::Exited) {
                 return true;
             }
         }
@@ -287,14 +816,14 @@ struct ProcessModel {
         init();
         // First pass: exited children (prefer these for immediate reap)
         for (int i = 0; i < count; i++) {
-            if (table[i].ppid == ppid && table[i].state == ProcessState::Exited) {
+            if (table[i].ppid == ppid && table[i].state == TaskState::Exited) {
                 if (wait_pid <= 0 || table[i].pid == wait_pid)
                     return &table[i];
             }
         }
         // Second pass: running children (caller will block or WNOHANG)
         for (int i = 0; i < count; i++) {
-            if (table[i].ppid == ppid && table[i].state == ProcessState::Running) {
+            if (table[i].ppid == ppid && table[i].state == TaskState::Running) {
                 if (wait_pid <= 0 || table[i].pid == wait_pid)
                     return &table[i];
             }
@@ -322,7 +851,7 @@ struct ProcessModel {
         init();
         auto* p = find(pid);
         if (!p) return false;
-        p->state = ProcessState::Reaped;
+        p->state = TaskState::Reaped;
         p->exit_status = status;
         return true;
     }
@@ -331,7 +860,7 @@ struct ProcessModel {
         init();
         auto* p = find(pid);
         if (!p) return;
-        p->state = ProcessState::Exited;
+        p->state = TaskState::Exited;
         p->exit_status = status;
     }
 
@@ -380,7 +909,7 @@ struct ProcessModel {
     void gc_reaped() {
         int dst = 0;
         for (int i = 0; i < count; i++) {
-            if (table[i].state != ProcessState::Reaped) {
+        if (table[i].state != TaskState::Reaped) {
                 if (dst != i) table[dst] = table[i];
                 dst++;
             }
@@ -392,7 +921,7 @@ struct ProcessModel {
     bool pid_exists(pid_t pid) {
         init();
         auto* p = find(pid);
-        return p && p->state != ProcessState::Reaped;
+        return p && p->state != TaskState::Reaped;
     }
 };
 
@@ -480,6 +1009,36 @@ inline ForkState& g_fork() {
 inline bool g_fork_active() {
     return !g_fork_stack.empty();
 }
+inline int32_t fork_child_pid() {
+    return g_fork_active() ? static_cast<int32_t>(g_fork().child_pid) : 0;
+}
+inline ProcessState fork_state() {
+    return fork_lifecycle().state;
+}
+inline bool fork_parent_waiting() { return fork_state() == ProcessState::ParentWaiting; }
+inline bool fork_child_running() { return fork_state() == ProcessState::ChildRunning; }
+inline bool fork_child_exited() { return fork_state() == ProcessState::ChildExited; }
+inline bool fork_child_reaped() { return fork_state() == ProcessState::ChildReaped; }
+inline bool fork_parent_restoring() { return fork_state() == ProcessState::ParentRestored; }
+inline bool fork_parent_saved() { return fork_state() == ProcessState::ParentSaved; }
+inline void fork_mark_child_running(Machine& m) {
+    fork_set_state(m, ProcessState::ChildRunning, "fork", "child running");
+}
+inline void fork_mark_parent_waiting(Machine& m) {
+    fork_set_state(m, ProcessState::ParentWaiting, "wait4", "parent waiting");
+}
+inline void fork_mark_child_exited(Machine& m) {
+    fork_set_state(m, ProcessState::ChildExited, "exit", "child exit");
+}
+inline void fork_mark_child_execd(Machine& m) {
+    fork_set_state(m, ProcessState::ChildExeced, "execve", "child execed");
+}
+inline void fork_mark_child_reaped(Machine& m) {
+    fork_set_state(m, ProcessState::ChildReaped, "wait4", "child reaped");
+}
+inline void fork_mark_parent_restored(Machine& m) {
+    fork_set_state(m, ProcessState::ParentRestored, "restore", "parent restored");
+}
 
 // Terminal (tty) state — stored per-fd for stdin/stdout/stderr.
 // Makes isatty(0) return true, enables raw mode for interactive shells.
@@ -548,7 +1107,8 @@ struct VThread {
     uint64_t syscall_budget;   // Syscalls remaining before forced yield
 };
 constexpr int MAX_VTHREADS = 16;
-constexpr uint64_t THREAD_QUANTUM = 50000;
+constexpr uint64_t THREAD_QUANTUM_MAIN = 200000;  // Main thread gets long slices
+constexpr uint64_t THREAD_QUANTUM_BG   = 10000;   // Background threads yield quickly
 struct ThreadScheduler {
     VThread threads[MAX_VTHREADS];
     int current = 0;      // Index of currently running thread
@@ -569,7 +1129,7 @@ struct ThreadScheduler {
                 threads[i].active = true;
                 threads[i].waiting = false;
                 threads[i].clear_child_tid = 0;
-                threads[i].syscall_budget = THREAD_QUANTUM;
+                threads[i].syscall_budget = THREAD_QUANTUM_BG;
                 count++;
                 return i;
             }
@@ -577,9 +1137,13 @@ struct ThreadScheduler {
         return -1;  // No slots
     }
 
-    // Find next runnable thread (not waiting, not current)
+    // Find next runnable thread — prefer main thread (index 0)
     int next_runnable(int skip = -1) {
-        for (int i = 0; i < MAX_VTHREADS; i++) {
+        // Priority: always check main thread first (it does the real work)
+        if (0 != skip && threads[0].active && !threads[0].waiting) {
+            return 0;
+        }
+        for (int i = 1; i < MAX_VTHREADS; i++) {
             if (i != skip && threads[i].active && !threads[i].waiting) {
                 return i;
             }
@@ -633,8 +1197,8 @@ inline bool switch_to_thread(Machine& m, int target_idx) {
     restore_thread(m, tgt);
 
     g_sched.current = target_idx;
-    // Reset target's budget for its new time slice
-    tgt.syscall_budget = THREAD_QUANTUM;
+    // Reset target's budget — main thread gets longer slices
+    tgt.syscall_budget = (target_idx == 0) ? THREAD_QUANTUM_MAIN : THREAD_QUANTUM_BG;
     return true;
 }
 
@@ -652,12 +1216,12 @@ inline void maybe_preempt(Machine& m) {
     if (next >= 0) {
         static int preempt_count = 0;
         if (++preempt_count <= 20)
-            fprintf(stderr, "[preempt] t%d -> t%d (quantum exhausted)\n",
+            dbg_fprintf(stderr, "[preempt] t%d -> t%d (quantum exhausted)\n",
                     g_sched.current, next);
         switch_to_thread(m, next);
     } else {
         // No other runnable thread, reset our budget
-        cur.syscall_budget = THREAD_QUANTUM;
+        cur.syscall_budget = (g_sched.current == 0) ? THREAD_QUANTUM_MAIN : THREAD_QUANTUM_BG;
     }
 }
 
@@ -887,7 +1451,7 @@ static void sys_exit(Machine& m);
 // exit_group — terminate all threads and stop the machine
 static void sys_exit_group(Machine& m) {
     int exit_code = m.template sysarg<int>(0);
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit_group] code=%d from thread t%d (tid=%d)\n",
+    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[exit_group] code=%d from thread t%d (tid=%d)\n",
             exit_code, g_sched.current,
             g_sched.count > 0 ? g_sched.threads[g_sched.current].tid : -1);
 
@@ -923,14 +1487,14 @@ static void sys_exit(Machine& m) {
         int exiting = g_sched.current;
         auto& t = g_sched.threads[exiting];
         int exit_code = m.template sysarg<int>(0);
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] thread tid=%d exit_code=%d, switching\n", t.tid, exit_code);
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[exit] thread tid=%d exit_code=%d, switching\n", t.tid, exit_code);
 
         // CLONE_CHILD_CLEARTID: write 0 to clear_child_tid and futex_wake it
         // This is how pthread_join detects thread completion.
         if (t.clear_child_tid != 0) {
             m.memory.template write<int32_t>(t.clear_child_tid, 0);
             g_sched.wake(t.clear_child_tid, 1);
-            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] cleared child_tid at 0x%lx\n", (long)t.clear_child_tid);
+            if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[exit] cleared child_tid at 0x%lx\n", (long)t.clear_child_tid);
         }
 
         // Remove this thread
@@ -955,6 +1519,15 @@ fork_child_exit:
         // fork_parent_restore(), because evicting execute segments inside
         // simulate() leaves its local decoder cache pointers dangling.
         g_fork().exit_status = m.template sysarg<int>(0);
+        fork_mark_child_exited(m);
+        dbg_fprintf(stderr,
+                "[fork-exit] child_pid=%d parent_pid=%d status=%d pc=0x%lx sp=0x%lx execve=%d\n",
+                g_fork().child_pid,
+                g_fork().parent_pid,
+                g_fork().exit_status,
+                (long)m.cpu.pc(),
+                (long)m.cpu.reg(riscv::REG_SP),
+                (int)g_fork().child_did_execve);
         g_process_model.push_event(
             ProcessEventKind::Exit,
             g_fork().child_pid,
@@ -962,12 +1535,11 @@ fork_child_exit:
             g_fork().child_pgid,
             g_fork().exit_status);
         g_process_model.mark_exited(g_fork().child_pid, g_fork().exit_status);
-        g_fork_child_exited = true;
         m.stop();
         return;
     }
     int exit_code = m.template sysarg<int>(0);
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[exit] main thread exit code=%d\n", exit_code);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[exit] main thread exit code=%d\n", exit_code);
     m.stop();
     m.set_result(exit_code);
 }
@@ -979,7 +1551,24 @@ fork_child_exit:
 // invalidated — evicting execute segments inside simulate() leaves its
 // local decoder pointers dangling (use-after-free on decoder cache).
 inline void fork_parent_restore(Machine& m) {
-    g_fork_child_exited = false;
+    if (!g_fork_active()) {
+        dbg_fprintf(stderr, "[fork-restore] no active fork state\n");
+        return;
+    }
+    if (fork_state() != ProcessState::ChildExited) {
+        expect_transition(fork_state(), ProcessState::ParentRestored, "restore", "restore parent context without child exit");
+    }
+    fork_set_state(m, ProcessState::ParentRestored, "restore", "restore parent context");
+    dbg_fprintf(stderr,
+            "[fork-restore] begin child_pid=%d parent_pid=%d exit_status=%d child_reaped=%d child_execve=%d current_pid=%d wait_child=%d wait_pid=%d state=%s\n",
+            g_fork().child_pid,
+            g_fork().parent_pid,
+            g_fork().exit_status,
+            (int)g_fork().child_reaped,
+            (int)g_fork().child_did_execve,
+            (int)g_process_model.current_pid,
+            (int)fork_parent_waiting(),
+            (int)g_wait_blocked_pid);
     g_fork().in_child = false;
 
     // Reload parent executable/interpreter text segments
@@ -1007,7 +1596,7 @@ inline void fork_parent_restore(Machine& m) {
                 }
             }
         } catch (const std::exception& e) {
-            fprintf(stderr, "[fork] parent segment reload failed: %s\n", e.what());
+            dbg_fprintf(stderr, "[fork] parent segment reload failed: %s\n", e.what());
         }
     }
 
@@ -1034,7 +1623,7 @@ inline void fork_parent_restore(Machine& m) {
             r.data.shrink_to_fit();
         }
     };
-    fprintf(stderr, "[fork-restore] exec=[0x%lx+0x%lx] interp=[0x%lx+0x%lx] "
+    dbg_fprintf(stderr, "[fork-restore] exec=[0x%lx+0x%lx] interp=[0x%lx+0x%lx] "
             "stack=[0x%lx+0x%lx] mmap=[0x%lx+0x%lx]\n",
             (long)g_fork().exec_data.addr, (long)g_fork().exec_data.size,
             (long)g_fork().interp_data.addr, (long)g_fork().interp_data.size,
@@ -1075,6 +1664,16 @@ inline void fork_parent_restore(Machine& m) {
     g_process_model.set_current(g_fork().parent_pid);
     m.cpu.jump(g_fork().pc);
     m.set_result(g_fork().child_pid);
+    dbg_fprintf(stderr,
+            "[fork-restore] resume parent_pid=%d child_pid=%d pc=0x%lx a0=%ld sp=0x%lx current_pid=%d mmap=0x%lx brk=0x%lx\n",
+            g_fork().parent_pid,
+            g_fork().child_pid,
+            (long)g_fork().pc,
+            (long)m.cpu.reg(10),
+            (long)m.cpu.reg(riscv::REG_SP),
+            (int)g_process_model.current_pid,
+            (long)m.memory.mmap_address(),
+            (long)g_exec_ctx.brk_current);
 
     // Pop this fork frame — parent is now the active context
     g_fork_stack.pop_back();
@@ -1142,7 +1741,7 @@ static void sys_clone(Machine& m) {
         int child_idx = g_sched.add_thread(tid);
         if (child_idx < 0) {
             // No thread slots — fall back to fake thread
-            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[clone] thread slots full, faking tid=%d\n", tid);
+            if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[clone] thread slots full, faking tid=%d\n", tid);
             m.set_result(tid);
             return;
         }
@@ -1175,7 +1774,7 @@ static void sys_clone(Machine& m) {
 
         static int thread_count = 0;
         if (++thread_count <= 10)
-            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[clone] thread #%d cooperative, tid=%d stack=0x%lx\n",
+            if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[clone] thread #%d cooperative, tid=%d stack=0x%lx\n",
                     thread_count, tid, (long)child_stack);
 
         // Return: execution continues as the child thread.
@@ -1185,7 +1784,7 @@ static void sys_clone(Machine& m) {
     }
 
     auto child_stack = m.sysarg(1);
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[clone] fork flags=0x%lx child_stack=0x%lx\n",
+    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[clone] fork flags=0x%lx child_stack=0x%lx\n",
             (long)flags, (long)child_stack);
 
     // Push a new fork frame (supports nested forks for pipes)
@@ -1287,13 +1886,14 @@ static void sys_clone(Machine& m) {
         arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
 
-    // Region 4: native heap + guest mmap allocations.
-    // Save from heap_start all the way to mmap_frontier to capture
-    // everything: native heap metadata, TLS, libc malloc pages.
-    if (g_exec_ctx.heap_start > 0) {
-        uint64_t mmap_region_start = g_exec_ctx.heap_start;
-        uint64_t mmap_frontier = m.memory.mmap_allocate(0);
-        fprintf(stderr, "[fork-save] regions: exec=[0x%lx,0x%lx) interp=[0x%lx,0x%lx) "
+    // Region 4: guest mmap allocations only.
+    // Avoid snapshotting the fixed native-heap reservation window on every
+    // fork+exec cycle; it dominates copy cost and is not needed for guest
+    // process isolation semantics.
+    {
+        uint64_t mmap_region_start = m.memory.mmap_start();
+        uint64_t mmap_frontier = std::max<uint64_t>(mmap_region_start, std::max(g_mmap_bump, m.memory.mmap_address()));
+        dbg_fprintf(stderr, "[fork-save] regions: exec=[0x%lx,0x%lx) interp=[0x%lx,0x%lx) "
                 "stack=[0x%lx,0x%lx) mmap=[0x%lx,0x%lx) mmap_addr=0x%lx\n",
                 (long)g_fork().exec_data.addr, (long)(g_fork().exec_data.addr + g_fork().exec_data.size),
                 (long)g_fork().interp_data.addr, (long)(g_fork().interp_data.addr + g_fork().interp_data.size),
@@ -1328,6 +1928,7 @@ static void sys_clone(Machine& m) {
     // with in_child still false, allowing the save to be retried.
     g_process_model.set_current(g_fork().child_pid);
     g_fork().in_child = true;
+    fork_mark_child_running(m);
     g_fork().child_reaped = false;
 
     // Return 0 = "you are the child"
@@ -1389,7 +1990,7 @@ static void sys_clone3(Machine& m) {
 
         int child_idx = g_sched.add_thread(tid);
         if (child_idx < 0) {
-            fprintf(stderr, "[clone3] thread slots full, faking tid=%d\n", tid);
+            dbg_fprintf(stderr, "[clone3] thread slots full, faking tid=%d\n", tid);
             m.set_result(tid);
             return;
         }
@@ -1414,7 +2015,7 @@ static void sys_clone3(Machine& m) {
 
         static int clone3_thread_count = 0;
         if (++clone3_thread_count <= 10)
-            fprintf(stderr, "[clone3] thread #%d cooperative, tid=%d stack=0x%lx+0x%lx\n",
+            dbg_fprintf(stderr, "[clone3] thread #%d cooperative, tid=%d stack=0x%lx+0x%lx\n",
                     clone3_thread_count, tid, (long)stack, (long)stack_size);
         return;
     }
@@ -1422,7 +2023,7 @@ static void sys_clone3(Machine& m) {
     // Fork path — push fork frame (supports nested forks for pipes)
     g_fork_stack.emplace_back();
 
-    fprintf(stderr, "[clone3] fork flags=0x%lx stack=0x%lx+0x%lx\n",
+    dbg_fprintf(stderr, "[clone3] fork flags=0x%lx stack=0x%lx+0x%lx\n",
             (long)flags, (long)stack, (long)stack_size);
 
     // Save parent registers BEFORE changing SP
@@ -1486,9 +2087,9 @@ static void sys_clone3(Machine& m) {
         r.data.resize(r.size);
         arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
-    if (g_exec_ctx.heap_start > 0) {
-        uint64_t mmap_region_start = g_exec_ctx.heap_start;
-        uint64_t mmap_frontier = m.memory.mmap_allocate(0);
+    {
+        uint64_t mmap_region_start = m.memory.mmap_start();
+        uint64_t mmap_frontier = std::max<uint64_t>(mmap_region_start, std::max(g_mmap_bump, m.memory.mmap_address()));
         if (mmap_frontier > mmap_region_start) {
             auto& r = g_fork().mmap_data;
             r.addr = mmap_region_start;
@@ -1508,6 +2109,7 @@ static void sys_clone3(Machine& m) {
     g_fork().has_exec_ctx = true;
 
     g_fork().in_child = true;
+    fork_mark_child_running(m);
     g_fork().child_reaped = false;
 
     // Set child stack AFTER saving parent state
@@ -1536,23 +2138,34 @@ static void sys_wait4(Machine& m) {
     const auto options = m.template sysarg<int>(2);
     constexpr int WAIT4_WNOHANG = 1;
     const pid_t parent = g_process_model.current_pid;
+    dbg_fprintf(stderr,
+            "[wait4] parent=%d wait_pid=%d options=0x%x fork_depth=%zu wait_child=%d blocked_pid=%d\n",
+            (int)parent,
+            (int)wait_pid,
+            options,
+            g_fork_stack.size(),
+            (int)fork_parent_waiting(),
+            (int)g_wait_blocked_pid);
 
     // Search process table for a waitable child.
     auto* child = g_process_model.find_waitable_child(parent, wait_pid);
     if (!child) {
+        dbg_fprintf(stderr, "[wait4] no child for parent=%d wait_pid=%d\n", (int)parent, (int)wait_pid);
         m.set_result(-10);  // -ECHILD
         return;
     }
 
     // Child still running.
-    if (child->state == ProcessState::Running) {
+    if (child->state == TaskState::Running) {
+        dbg_fprintf(stderr, "[wait4] child running pid=%d status=%d wnohang=%d\n",
+                (int)child->pid, child->exit_status, (options & WAIT4_WNOHANG) ? 1 : 0);
         if (options & WAIT4_WNOHANG) {
             m.set_result(0);
             return;
         }
         // Phase 2: yield to host instead of returning bogus -EAGAIN.
         // Rewind PC past the ecall so it re-executes on resume.
-        g_waiting_for_child = true;
+        fork_mark_parent_waiting(m);
         g_wait_blocked_pid = child->pid;
         g_process_model.push_event(
             ProcessEventKind::WaitBlocked,
@@ -1566,6 +2179,7 @@ static void sys_wait4(Machine& m) {
     // Child exited — reap it.
     pid_t reaped_pid = child->pid;
     int32_t exit_status = child->exit_status;
+    dbg_fprintf(stderr, "[wait4] reaping pid=%d status=%d\n", (int)reaped_pid, exit_status);
     auto wstatus_addr = m.sysarg(1);
     if (wstatus_addr != 0) {
         int32_t wstatus = (exit_status & 0xff) << 8;
@@ -1581,6 +2195,13 @@ static void sys_wait4(Machine& m) {
         if (f.child_pid == reaped_pid) {
             f.exit_status = exit_status;
             f.child_reaped = true;
+            const ProcessState state = fork_state();
+            if (state == ProcessState::ParentRestored
+                || state == ProcessState::ParentWaiting
+                || state == ProcessState::ParentSaved) {
+                fork_mark_child_reaped(m);
+                fork_set_state(m, ProcessState::ParentSaved, "wait4", "ready for next fork");
+            }
             break;
         }
     }
@@ -1623,10 +2244,10 @@ static std::vector<uint8_t> read_vfs_file(vfs::VirtualFS& fs, const std::string&
 }
 
 // Helper: search PATH for a command name, return full path or empty.
-static std::string search_path(vfs::VirtualFS& fs, const std::string& cmd) {
+static std::string search_path(vfs::VirtualFS& fs, const std::string& cmd, const std::vector<std::string>& env) {
     if (cmd.empty() || cmd[0] == '/') return cmd;
     std::string path_val = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    for (auto& e : g_exec_ctx.env) {
+    for (const auto& e : env) {
         if (e.substr(0, 5) == "PATH=") { path_val = e.substr(5); break; }
     }
     size_t pos = 0;
@@ -1646,6 +2267,45 @@ static std::string search_path(vfs::VirtualFS& fs, const std::string& cmd) {
     return "";
 }
 
+enum class AtPathStatus {
+    Ok,
+    Badf,
+    Notdir,
+};
+
+struct AtPathResult {
+    AtPathStatus status;
+    std::string path;
+};
+
+static AtPathResult resolve_at_path(vfs::VirtualFS& fs, int dirfd, const std::string& path) {
+    if (!path.empty() && path[0] == '/') {
+        return {AtPathStatus::Ok, path};
+    }
+    if (dirfd == AT_FDCWD) {
+        return {AtPathStatus::Ok, path};
+    }
+    auto entry = fs.get_entry(dirfd);
+    if (!entry) {
+        return {AtPathStatus::Badf, {}};
+    }
+    if (!entry->is_dir()) {
+        return {AtPathStatus::Notdir, {}};
+    }
+    std::string base = fs.get_path(dirfd);
+    if (base.empty()) base = "/";
+    if (base.back() == '/') return {AtPathStatus::Ok, base + path};
+    return {AtPathStatus::Ok, base + "/" + path};
+}
+
+static inline int at_path_errno(AtPathStatus st) {
+    switch (st) {
+        case AtPathStatus::Badf: return err::BADF;
+        case AtPathStatus::Notdir: return err::NOTDIR;
+        default: return 0;
+    }
+}
+
 // execve — replace current "process" with a new program.
 // Supports:
 //   - Busybox applets (same binary, just new argv)
@@ -1654,6 +2314,7 @@ static std::string search_path(vfs::VirtualFS& fs, const std::string& cmd) {
 static void sys_execve(Machine& m) {
     auto path_addr = m.sysarg(0);
     auto argv_addr = m.sysarg(1);
+    auto envp_addr = m.sysarg(2);
 
     if (g_exec_ctx.exec_binary.empty()) {
         m.set_result(-38);  // -ENOSYS
@@ -1692,6 +2353,24 @@ static void sys_execve(Machine& m) {
 
     if (args.empty()) {
         args.push_back(path);
+    }
+
+    // Read envp from guest memory. If envp is non-NULL, it fully defines the
+    // new process environment.
+    std::vector<std::string> exec_env = g_exec_ctx.env;
+    if (envp_addr != 0) {
+        std::vector<std::string> new_env;
+        try {
+            for (int i = 0; i < 4096; i++) {
+                uint64_t ptr = m.memory.template read<uint64_t>(envp_addr + i * 8);
+                if (ptr == 0) break;
+                new_env.push_back(m.memory.memstring(ptr));
+            }
+        } catch (...) {
+            m.set_result(-14);  // -EFAULT
+            return;
+        }
+        exec_env = std::move(new_env);
     }
 
     // Shebang handling: if the target file starts with "#!", parse the
@@ -1735,7 +2414,7 @@ static void sys_execve(Machine& m) {
                 // Handle /usr/bin/env: resolve command via PATH
                 if (interp_path == "/usr/bin/env" && args.size() >= 2) {
                     std::string cmd = args[1];
-                    std::string found = search_path(fs, cmd);
+                    std::string found = search_path(fs, cmd, exec_env);
                     if (!found.empty()) {
                         args[0] = found;
                         args.erase(args.begin() + 1);
@@ -1934,7 +2613,9 @@ static void sys_execve(Machine& m) {
                 // loaded separately and doesn't affect the brk region.
                 // This ensures brk(0) returns the same value in both direct
                 // and fork+exec paths.
-                uint64_t new_brk_base = (load_end + 4095) & ~4095ULL;
+                uint64_t writable_end = g_exec_ctx.exec_rw_end;
+                uint64_t new_brk_base = std::max(load_end, writable_end);
+                new_brk_base = (new_brk_base + 4095) & ~4095ULL;
                 g_exec_ctx.brk_base = new_brk_base;
                 g_exec_ctx.brk_current = new_brk_base;
                 g_exec_ctx.brk_overridden = true;
@@ -1971,6 +2652,8 @@ static void sys_execve(Machine& m) {
 
                 m.memory.mmap_address() = new_mmap_addr;
                 g_mmap_bump = new_mmap_addr;
+                g_exec_ctx.heap_start = new_brk_base + BRK_MAX;
+                g_exec_ctx.heap_size = 64ULL << 20;
             }
 
             // Place stack in the same location as the Machine constructor:
@@ -2011,6 +2694,7 @@ static void sys_execve(Machine& m) {
             g_posix_timers.clear();
 
             // Set up fresh stack
+            g_exec_ctx.env = exec_env;
             uint64_t sp = dynlink::setup_dynamic_stack(
                 m, exec_info, interp_base, args,
                 g_exec_ctx.env, new_stack_top);
@@ -2040,8 +2724,10 @@ static void sys_execve(Machine& m) {
                       << jump_target << std::dec << "\n";
 
             // Enable syscall tracing for new binary startup debugging
-            if (new_binary.size() > 10000000) {  // large binary like node
-                riscv::g_execve_trace_remaining_init = 200;
+            if (g_exec_ctx.exec_binary.size() > 10000000) {  // large binary like node
+                riscv::g_execve_trace_remaining_init = 2000;
+                dbg_fprintf(stderr, "[execve-trace] set remaining=%d trace=%d\n",
+                    riscv::g_execve_trace_remaining_init, (int)g_trace_syscalls);
             }
 
             // Mark the jump target page and surrounding code as executable.
@@ -2076,6 +2762,11 @@ static void sys_execve(Machine& m) {
             g_execve_restart = true;
             // Mark that child did execve so fork_parent_restore reloads text
             if (!g_fork_stack.empty()) g_fork().child_did_execve = true;
+            (void)fs.unlink("/proc/self/exe");
+            (void)fs.symlink(resolved, "/proc/self/exe");
+            if (g_fork_active() && g_fork().in_child) {
+                fork_mark_child_execd(m);
+            }
             m.stop();
             return;  // don't set_result — execve doesn't return on success
         } catch (const riscv::MachineException& e) {
@@ -2126,6 +2817,13 @@ static void sys_execve(Machine& m) {
 
     // Reset BRK to initial state
     g_exec_ctx.brk_current = g_exec_ctx.brk_base;
+    m.memory.set_heap_address(g_exec_ctx.brk_base);
+    {
+        constexpr uint64_t BRK_MAX = 16ULL << 20;
+        if (m.memory.mmap_address() < g_exec_ctx.brk_base + BRK_MAX) {
+            m.memory.mmap_address() = g_exec_ctx.brk_base + BRK_MAX;
+        }
+    }
 
     // Make BRK region writable
     if (g_exec_ctx.brk_base > 0) {
@@ -2137,7 +2835,8 @@ static void sys_execve(Machine& m) {
 
     uint64_t sp = dynlink::setup_dynamic_stack(
         m, g_exec_ctx.exec_info, g_exec_ctx.interp_base,
-        args, g_exec_ctx.env, g_exec_ctx.original_stack_top);
+        args, exec_env, g_exec_ctx.original_stack_top);
+    g_exec_ctx.env = std::move(exec_env);
 
     for (int i = 1; i < 32; i++) m.cpu.reg(i) = 0;
     m.cpu.reg(riscv::REG_SP) = sp;
@@ -2146,8 +2845,13 @@ static void sys_execve(Machine& m) {
     // Stop machine to break out of stale decoder context
     g_execve_restart = true;
     if (!g_fork_stack.empty()) g_fork().child_did_execve = true;
-    m.stop();
-}
+            (void)fs.unlink("/proc/self/exe");
+            (void)fs.symlink(resolved, "/proc/self/exe");
+            if (g_fork_active() && g_fork().in_child) {
+                fork_mark_child_execd(m);
+            }
+            m.stop();
+        }
 
 static void sys_openat(Machine& m) {
     auto& fs = get_fs(m);
@@ -2162,12 +2866,12 @@ static void sys_openat(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
-    // Linux: for absolute paths, dirfd is ignored.
-    // We only reject non-AT_FDCWD for relative paths (not yet implemented).
-    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
-        m.set_result(err::NOTSUP);
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
         return;
     }
+    path = std::move(at.path);
 
     // Virtual device files: create synthetic VFS entries on demand via open+O_CREAT
     if ((path == "/dev/urandom" || path == "/dev/random" || path == "/dev/null")
@@ -2189,6 +2893,10 @@ static void sys_openat(Machine& m) {
 #endif
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
+    if (g_trace_syscalls) {
+        fprintf(stderr, "[openat] dirfd=%d flags=0x%x path=%s => %d\n",
+            dirfd, flags, path.c_str(), fd);
+    }
     // Track /dev/tty and /dev/pts/* opens as tty fds for ioctl
     if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
                     || path.rfind("/dev/pts/", 0) == 0)) {
@@ -2231,12 +2939,12 @@ static void sys_openat2(Machine& m) {
     }
     int flags = static_cast<int>(flags64);
 
-    // Linux: for absolute paths, dirfd is ignored.
-    // We only reject non-AT_FDCWD for relative paths (not yet implemented).
-    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
-        m.set_result(err::NOTSUP);
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
         return;
     }
+    path = std::move(at.path);
 
     // Virtual device files: create synthetic VFS entries on demand via open+O_CREAT
     if ((path == "/dev/urandom" || path == "/dev/random" || path == "/dev/null")
@@ -2257,6 +2965,10 @@ static void sys_openat2(Machine& m) {
 #endif
 
     int fd = (flags & O_DIRECTORY) ? fs.opendir(path) : fs.open(path, flags);
+    if (g_trace_syscalls) {
+        fprintf(stderr, "[openat2] dirfd=%d flags=0x%x path=%s => %d\n",
+            dirfd, flags, path.c_str(), fd);
+    }
     if (fd >= 0 && (path == "/dev/tty" || path == "/dev/console"
                     || path.rfind("/dev/pts/", 0) == 0)) {
         g_tty_fds.insert(fd);
@@ -2272,7 +2984,7 @@ static void sys_close(Machine& m) {
     auto& fs = get_fs(m);
     int fd = m.template sysarg<int>(0);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] close(fd=%d) pc=0x%lx\n", fd, (long)m.cpu.pc());
+        dbg_fprintf(stderr, "[TRACE] close(fd=%d) pc=0x%lx\n", fd, (long)m.cpu.pc());
 
     bool is_stdio_valid = (fd >= 0 && fd <= 2 && g_stdio_open[fd]);
     bool is_valid = is_stdio_valid
@@ -2290,7 +3002,7 @@ static void sys_close(Machine& m) {
         int _vh = is_vh_fd(fd) ? 1 : 0;
         int _open = fs.is_open(fd) ? 1 : 0;
         int _stdio = (fd >= 0 && fd <= 2 && g_stdio_open[fd]) ? 1 : 0;
-        fprintf(stderr, "[close] INVALID fd=%d open=%d stdio=%d sock=%d ep=%d ev=%d vh=%d\n", fd, _open, _stdio, _sock, _ep, _ev, _vh);
+        dbg_fprintf(stderr, "[close] INVALID fd=%d open=%d stdio=%d sock=%d ep=%d ev=%d vh=%d\n", fd, _open, _stdio, _sock, _ep, _ev, _vh);
 #ifdef __EMSCRIPTEN__
         m.set_result(0);
 #else
@@ -2335,7 +3047,7 @@ static void sys_read(Machine& m) {
     auto buf_addr = m.sysarg(1);
     size_t count = m.sysarg(2);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] read(fd=%d, count=%zu) pc=0x%lx\n", fd, count, (long)m.cpu.pc());
+        dbg_fprintf(stderr, "[TRACE] read(fd=%d, count=%zu) pc=0x%lx\n", fd, count, (long)m.cpu.pc());
 
     // /dev/tty fds (other than 0/1/2) redirect reads to stdin
     if (fd > 2 && g_tty_fds.count(fd)) {
@@ -2486,7 +3198,7 @@ static void sys_read(Machine& m) {
             }
             return result.length;
         }, fd, (int)count, view.data());
-        fprintf(stderr, "[read-socket] fd=%d len=%zu bytes_read=%d\n", fd, count, bytes_read);
+        dbg_fprintf(stderr, "[read-socket] fd=%d len=%zu bytes_read=%d\n", fd, count, bytes_read);
         m.set_result(bytes_read > 0 ? bytes_read : -11 /*EAGAIN*/);
         return;
 #else
@@ -2568,7 +3280,7 @@ static void sys_write(Machine& m) {
                         g_sched.threads[i].waiting = false;
                         static int ewake = 0;
                         if (++ewake <= 20)
-                            fprintf(stderr, "[eventfd-wake] write fd=%d → wake t%d (epfd=%d)\n",
+                            dbg_fprintf(stderr, "[eventfd-wake] write fd=%d → wake t%d (epfd=%d)\n",
                                     fd, i, epfd);
                     }
                 }
@@ -2620,8 +3332,8 @@ static void sys_write(Machine& m) {
             // Trace stderr content for debugging Go runtime errors
             if (fd == 2 && count > 0 && count < 4096) {
                 std::string dbg(reinterpret_cast<const char*>(view.data()), count);
-                fprintf(stderr, "[guest-stderr] %s", dbg.c_str());
-                if (!dbg.empty() && dbg.back() != '\n') fprintf(stderr, "\n");
+                dbg_fprintf(stderr, "[guest-stderr] %s", dbg.c_str());
+                if (!dbg.empty() && dbg.back() != '\n') dbg_fprintf(stderr, "\n");
             }
             m.set_result(count);
         } catch (...) {
@@ -2907,7 +3619,7 @@ static void sys_newfstatat(Machine& m) {
         static int fstatat_badf_log = 0;
         if (fstatat_badf_log < 40) {
             fstatat_badf_log++;
-            fprintf(stderr, "[fstatat-empty] BADF dirfd=%d flags=0x%x\n", dirfd, flags);
+            dbg_fprintf(stderr, "[fstatat-empty] BADF dirfd=%d flags=0x%x\n", dirfd, flags);
         }
         m.set_result(err::BADF);
         return;
@@ -2920,11 +3632,12 @@ static void sys_newfstatat(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
-    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
-    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
-        m.set_result(err::NOTSUP);
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
         return;
     }
+    path = std::move(at.path);
 
     vfs::Entry entry;
     bool ok = (flags & AT_SYMLINK_NOFOLLOW) ? fs.lstat(path, entry) : fs.stat(path, entry);
@@ -2978,7 +3691,7 @@ static void sys_fstat(Machine& m) {
     static int fstat_badf_log = 0;
     if (fstat_badf_log < 80) {
         fstat_badf_log++;
-        fprintf(stderr, "[fstat] BADF fd=%d\n", fd);
+        dbg_fprintf(stderr, "[fstat] BADF fd=%d\n", fd);
     }
     m.set_result(err::BADF);
 }
@@ -2997,11 +3710,12 @@ static void sys_readlinkat(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
-    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
-    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
-        m.set_result(err::NOTSUP);
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
         return;
     }
+    path = std::move(at.path);
 
     std::vector<char> buf(bufsiz);
     ssize_t n = fs.readlink(path, buf.data(), bufsiz);
@@ -3048,11 +3762,12 @@ static void sys_faccessat(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
-    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
-    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
-        m.set_result(err::NOTSUP);
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
         return;
     }
+    path = std::move(at.path);
 
     vfs::Entry entry;
     const int rc = fs.stat(path, entry) ? 0 : err::NOENT;
@@ -3062,7 +3777,7 @@ static void sys_faccessat(Machine& m) {
 static void sys_getpid(Machine& m) {
     g_process_model.set_current(g_process_model.current_pid);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] getpid() => %d pc=0x%lx\n", (int)g_process_model.current_pid, (long)m.cpu.pc());
+        dbg_fprintf(stderr, "[TRACE] getpid() => %d pc=0x%lx\n", (int)g_process_model.current_pid, (long)m.cpu.pc());
     m.set_result(g_process_model.current_pid);
 }
 static void sys_getppid(Machine& m) {
@@ -3076,7 +3791,7 @@ static void sys_gettid(Machine& m) {
         tid = 1;
     }
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] gettid() => %d pc=0x%lx\n", tid, (long)m.cpu.pc());
+        dbg_fprintf(stderr, "[TRACE] gettid() => %d pc=0x%lx\n", tid, (long)m.cpu.pc());
     m.set_result(tid);
 }
 static void sys_getuid(Machine& m) { m.set_result(0); }
@@ -3088,8 +3803,12 @@ static void sys_set_tid_address(Machine& m) {
     // Store clear_child_tid for current thread (used on thread exit)
     if (g_sched.count > 0) {
         g_sched.threads[g_sched.current].clear_child_tid = tidptr;
-        m.set_result(g_sched.threads[g_sched.current].tid);
+        int tid = g_sched.threads[g_sched.current].tid;
+        dbg_fprintf(stderr, "[set_tid_address] count=%d current=%d tid=%d tidptr=0x%lx\n",
+                g_sched.count, g_sched.current, tid, (long)tidptr);
+        m.set_result(tid);
     } else {
+        dbg_fprintf(stderr, "[set_tid_address] count=0 → returning 1 tidptr=0x%lx\n", (long)tidptr);
         m.set_result(1);
     }
 }
@@ -3101,27 +3820,51 @@ static void sys_clock_gettime(Machine& m) {
 
     clockid_t host_clk = CLOCK_REALTIME;
     switch (clk_id) {
-        case 0: host_clk = CLOCK_REALTIME; break;
-        case 1: host_clk = CLOCK_MONOTONIC; break;
+        case 0: host_clk = CLOCK_REALTIME; break;   // CLOCK_REALTIME
+        case 1: host_clk = CLOCK_MONOTONIC; break;   // CLOCK_MONOTONIC
+        case 4: // CLOCK_MONOTONIC_RAW → fallback to MONOTONIC
 #ifdef CLOCK_MONOTONIC_RAW
-        case 4: host_clk = CLOCK_MONOTONIC_RAW; break;
+            host_clk = CLOCK_MONOTONIC_RAW; break;
+#else
+            host_clk = CLOCK_MONOTONIC; break;
 #endif
+        case 5: // CLOCK_REALTIME_COARSE → fallback to REALTIME
 #ifdef CLOCK_REALTIME_COARSE
-        case 5: host_clk = CLOCK_REALTIME_COARSE; break;
+            host_clk = CLOCK_REALTIME_COARSE; break;
+#else
+            host_clk = CLOCK_REALTIME; break;
 #endif
+        case 6: // CLOCK_MONOTONIC_COARSE → fallback to MONOTONIC
 #ifdef CLOCK_MONOTONIC_COARSE
-        case 6: host_clk = CLOCK_MONOTONIC_COARSE; break;
+            host_clk = CLOCK_MONOTONIC_COARSE; break;
+#else
+            host_clk = CLOCK_MONOTONIC; break;
 #endif
+        case 7: // CLOCK_BOOTTIME → fallback to MONOTONIC
 #ifdef CLOCK_BOOTTIME
-        case 7: host_clk = CLOCK_BOOTTIME; break;
+            host_clk = CLOCK_BOOTTIME; break;
+#else
+            host_clk = CLOCK_MONOTONIC; break;
 #endif
         default: host_clk = CLOCK_MONOTONIC; break;
     }
 
     struct timespec ts;
-    if (clock_gettime(host_clk, &ts) != 0) {
-        m.set_result(err::INVAL);
-        return;
+    int rc = clock_gettime(host_clk, &ts);
+    if (rc != 0) {
+        // Fallback: if the host rejects this clock, try CLOCK_MONOTONIC
+        if (host_clk != CLOCK_MONOTONIC && host_clk != CLOCK_REALTIME) {
+            rc = clock_gettime(CLOCK_MONOTONIC, &ts);
+        }
+        if (rc != 0) {
+            // Last resort: use CLOCK_REALTIME
+            rc = clock_gettime(CLOCK_REALTIME, &ts);
+        }
+        if (rc != 0) {
+            dbg_fprintf(stderr, "[clock_gettime] FAILED clk_id=%d host_clk=%d\n", clk_id, (int)host_clk);
+            m.set_result(err::INVAL);
+            return;
+        }
     }
 
     linux_timespec lts;
@@ -3131,7 +3874,7 @@ static void sys_clock_gettime(Machine& m) {
     m.set_result(0);
 
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[TRACE] clock_gettime(clk=%d=>host=%d) => %lld.%09lld pc=0x%lx\n", clk_id, (int)host_clk, (long long)lts.tv_sec, (long long)lts.tv_nsec, (long)m.cpu.pc());
+        dbg_fprintf(stderr, "[TRACE] clock_gettime(clk=%d=>host=%d) => %lld.%09lld pc=0x%lx\n", clk_id, (int)host_clk, (long long)lts.tv_sec, (long long)lts.tv_nsec, (long)m.cpu.pc());
 
     // Preemptive scheduling: yield to other threads periodically
     maybe_preempt(m);
@@ -3143,7 +3886,7 @@ static void sys_getrandom(Machine& m) {
     size_t count = m.sysarg(1);
     auto flags = m.template sysarg<unsigned int>(2);
 
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[getrandom] buf=0x%lx count=%zu flags=0x%x pc=0x%lx\n",
+    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[getrandom] buf=0x%lx count=%zu flags=0x%x pc=0x%lx\n",
             (long)buf_addr, count, flags, (long)m.cpu.pc());
 
     std::vector<uint8_t> buf(count);
@@ -3175,128 +3918,109 @@ static void sys_getrandom(Machine& m) {
 // because our VFS fds aren't in libriscv's fd table.
 inline Machine::syscall_t libriscv_mmap_handler = nullptr;
 
+struct MmapGuard {
+    uint64_t pc = 0;
+    uint64_t ra = 0;
+    uint64_t sp = 0;
+    uint8_t stack_canary[64] {};
+    bool armed = false;
+
+    void snapshot(const Machine& m) {
+        pc = m.cpu.pc();
+        ra = m.cpu.reg(riscv::REG_RA);
+        sp = m.cpu.reg(riscv::REG_SP);
+        if (sp == 0) return;
+        try {
+            m.memory.memcpy_out(stack_canary, sp, sizeof(stack_canary));
+            armed = true;
+        } catch (...) {
+            armed = false;
+        }
+    }
+
+    bool verify(const Machine& m) const {
+        if (!armed) return true;
+        if (m.cpu.reg(riscv::REG_RA) == 0 || m.cpu.reg(riscv::REG_RA) == pc) {
+            return false;
+        }
+        if (m.cpu.reg(riscv::REG_SP) != sp) return false;
+        if (sp == 0) return true;
+        uint8_t current[64] {};
+        try {
+            m.memory.memcpy_out(current, sp, sizeof(current));
+        } catch (...) {
+            return false;
+        }
+        return std::memcmp(stack_canary, current, sizeof(stack_canary)) == 0;
+    }
+};
+
 // mmap — intercept file-backed mappings, delegate anonymous to libriscv
 static void sys_mmap(Machine& m) {
+    const uint64_t pc = m.cpu.pc();
+    if (g_disable_custom_mmap_wrapper || (g_custom_mmap_bypass_pc != 0 && pc == g_custom_mmap_bypass_pc)) {
+        libriscv_mmap_handler(m);
+        return;
+    }
+    MmapGuard guard;
+    guard.snapshot(m);
+    auto assert_guard = [&guard, &m]() {
+        if (!guard.verify(m)) __builtin_trap();
+    };
+    const auto mmap_boundary_call_id = begin_mmap_boundary_probe(m);
+    auto dump_boundary = [mmap_boundary_call_id, &m](const char* phase) {
+        dump_mmap_boundary_phase(m, mmap_boundary_call_id, phase);
+        dump_mmap_boundary_decode_once(m, phase);
+        check_mmap_boundary_drift(m, mmap_boundary_call_id, phase);
+    };
+    dump_boundary("entry");
     auto* ctx = get_ctx(m);
     int vfd = m.template sysarg<int>(4);
 
     if (vfd == -1) {
-        // Anonymous mapping: fully custom bump allocator.
-        // We bypass libriscv's mmap handler entirely because it has
-        // internal state management (memdiscard, page attrs) that
-        // interferes with our bump pointer tracking, causing Go's
-        // PROT_NONE heap arena reservations to overlap with subsequent
-        // allocations and corrupt memory.
         auto addr_g = m.sysarg(0);
         auto length = m.sysarg(1);
         auto prot   = m.template sysarg<int>(2);
         auto flags  = m.template sysarg<int>(3);
         constexpr int MAP_FIXED = 0x10;
+        auto anon = alloc_anon_mapping(m, addr_g, length, flags);
+        if (anon.error != 0) {
+            rails_note_mmap_fail(m.cpu.pc());
+        if (anon.error == -12 && (flags & MAP_FIXED) && g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[mmap-FIXED-OOB] addr=0x%lx len=0x%lx limit=0x%lx ENOMEM\n",
+                    (long)addr_g, (long)length, (long)arena_limit());
+        m.set_result(uint64_t(anon.error));
+        assert_guard();
+        dump_boundary("anon-error");
+        return;
+    }
 
-        // Linux returns EINVAL for 0-length mmap
-        if (length == 0) {
-            m.set_result(uint64_t(-22));  // -EINVAL
-            return;
-        }
-        constexpr uint64_t ARENA_LIMIT = (1ULL << riscv::encompassing_Nbit_arena);
-
-        // Bump pointer for all allocations within the arena.
-        // Sync with mmap_address() in case file-backed mmaps advanced it.
-        uint64_t cur_mmap_addr = m.memory.mmap_address();
-        if (g_mmap_bump == 0 || g_mmap_bump < cur_mmap_addr) {
-            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-sync] g_mmap_bump=0x%lx -> mmap_address=0x%lx\n",
-                    (long)g_mmap_bump, (long)cur_mmap_addr);
-            g_mmap_bump = cur_mmap_addr;
-        }
-
-        uint64_t aligned_len = (length + 4095) & ~4095ULL;
-        uint64_t result;
-
-        if (flags & MAP_FIXED) {
-            // MAP_FIXED: use the exact address
-            if (addr_g + aligned_len > ARENA_LIMIT) {
-                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-FIXED-OOB] addr=0x%lx len=0x%lx limit=0x%lx ENOMEM\n",
-                        (long)addr_g, (long)length, (long)ARENA_LIMIT);
-                m.set_result(uint64_t(-12));  // -ENOMEM
-                return;
-            }
-            result = addr_g;
-        } else if (addr_g != 0 && addr_g >= ARENA_LIMIT && aligned_len >= (32ULL << 20)) {
-            // Large hint beyond arena (>= 4MB): return ENOMEM.
-            // Go allocates huge arenas with hints; returning a bump address
-            // wastes space because Go munmaps it and retries.
-            // Go's fallback path handles ENOMEM correctly.
-            static int hint_reject_count = 0;
-            if (++hint_reject_count <= 20)
-                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-hint-reject] hint=0x%lx len=0x%lx (large) ENOMEM\n",
-                        (long)addr_g, (long)length);
-            m.set_result(uint64_t(-12));  // -ENOMEM
-            return;
-        } else {
-            // No hint, hint within arena, or small hint beyond arena:
-            // allocate at bump pointer. V8 depends on small-hint allocations
-            // succeeding — its AllocatePages doesn't retry on ENOMEM.
-            if (addr_g != 0 && addr_g >= ARENA_LIMIT) {
-                static int hint_ignore_count = 0;
-                if (++hint_ignore_count <= 20)
-                    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-hint-ignore] hint=0x%lx -> bump, len=0x%lx\n",
-                            (long)addr_g, (long)length);
-            }
-            if (g_mmap_bump + aligned_len > ARENA_LIMIT) {
-                // For huge allocations (>= 64MB), clamp to what fits in the arena.
-                // snmalloc reserves 256GB+ of virtual space but only commits
-                // small pages within it via MAP_FIXED later. Clamping gives it
-                // a smaller but usable region. This also covers PROT_NONE
-                // reservations from Go and other runtimes.
-                if (aligned_len >= (64ULL << 20) && (ARENA_LIMIT > g_mmap_bump + (4ULL << 20))) {
-                    uint64_t clamped = (ARENA_LIMIT - g_mmap_bump) & ~4095ULL;
-                    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-clamp] len=0x%lx clamped to 0x%lx prot=%d\n",
-                            (long)length, (long)clamped, prot);
-                    aligned_len = clamped;
-                } else {
-                    m.set_result(uint64_t(-12));  // -ENOMEM
-                    static int oom_count = 0;
-                    if (++oom_count <= 10)
-                        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-OOM] len=0x%lx bump=0x%lx limit=0x%lx prot=%d\n",
-                                (long)length, (long)g_mmap_bump, (long)ARENA_LIMIT, prot);
-                    return;
-                }
-            }
-            result = g_mmap_bump;
-            g_mmap_bump += aligned_len;
-        }
-
-        // Keep libriscv's bump pointer in sync (needed for munmap etc.)
-        if (g_mmap_bump > m.memory.mmap_address()) {
-            m.memory.mmap_address() = g_mmap_bump;
-        }
-
-        // Zero-fill anonymous pages (MAP_ANONYMOUS contract).
-        // The mmap start was advanced past the interpreter, so all bump
-        // allocations are in clean arena memory. Zero-fill is still needed
-        // for correctness after munmap+re-allocate cycles.
-        if (!(flags & MAP_FIXED)) {
+        if (anon.from_reuse_cache || (flags & MAP_FIXED)) {
             if constexpr (riscv::encompassing_Nbit_arena != 0) {
                 auto* arena = (uint8_t*)m.memory.memory_arena_ptr();
-                if (arena && result + aligned_len <= m.memory.memory_arena_size()) {
-                    std::memset(arena + result, 0, aligned_len);
+                if (arena && anon.addr + anon.aligned_len <= m.memory.memory_arena_size()) {
+                    std::memset(arena + anon.addr, 0, anon.aligned_len);
                 } else {
-                    m.memory.memset(result, 0, aligned_len);
+                    m.memory.memset(anon.addr, 0, anon.aligned_len);
                 }
             } else {
-                m.memory.memset(result, 0, aligned_len);
+                m.memory.memset(anon.addr, 0, anon.aligned_len);
             }
         }
 
-        m.set_result(result);
+        m.set_result(anon.addr);
+        rails_note_mmap(m.cpu.pc(), m.cpu.reg(1), anon.aligned_len);
+        dump_boundary("anon-success");
+        assert_guard();
 
         static int anon_count = 0;
         ++anon_count;
         if (anon_count <= 20)
-            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mmap-anon] #%d addr=0x%lx len=0x%lx prot=%d flags=0x%x => 0x%lx (bump=0x%lx)\n",
-                    anon_count, (long)addr_g, (long)length, prot, flags, (long)result, (long)g_mmap_bump);
+            if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[mmap-anon] #%d addr=0x%lx len=0x%lx prot=%d flags=0x%x => 0x%lx (bump=0x%lx)\n",
+                    anon_count, (long)addr_g, (long)length, prot, flags, (long)anon.addr, (long)g_mmap_bump);
 
         maybe_preempt(m);
+        assert_guard();
+        dump_boundary("anon-return");
         return;
     }
 
@@ -3317,29 +4041,51 @@ static void sys_mmap(Machine& m) {
     constexpr int MAP_FIXED = 0x10;
     constexpr uint64_t PAGE_MASK = 4095;
 
-    // Page alignment check
-    if (addr_g % 4096 != 0) {
+    // Linux requires alignment for MAP_FIXED target and file offset.
+    // For non-fixed mappings, an unaligned hint should not fail the call.
+    if ((flags & MAP_FIXED) && (addr_g % 4096 != 0)) {
+        rails_note_mmap_fail(m.cpu.pc());
         m.set_result(uint64_t(-22));  // -EINVAL
+        assert_guard();
+        dump_boundary("file-fixed-align-error");
         return;
+    }
+    if (offset % 4096 != 0) {
+        rails_note_mmap_fail(m.cpu.pc());
+        m.set_result(uint64_t(-22));  // -EINVAL
+        assert_guard();
+        dump_boundary("file-offset-align-error");
+        return;
+    }
+    if (!(flags & MAP_FIXED) && (addr_g % 4096 != 0)) {
+        // Ignore misaligned hints to match Linux behavior.
+        addr_g = 0;
     }
     length = (length + PAGE_MASK) & ~PAGE_MASK;
 
     // Get VFS entry content
     auto entry = ctx->fs->get_entry(vfd);
     if (!entry || !entry->is_file()) {
+        rails_note_mmap_fail(m.cpu.pc());
         m.set_result(uint64_t(-9));  // -EBADF
+        assert_guard();
+        dump_boundary("file-bad-fd");
         return;
     }
 
     // Determine destination address (same logic as libriscv)
     auto& nextfree = m.memory.mmap_address();
+    const uint64_t nextfree_before = nextfree;
     uint64_t dst;
 
     if (addr_g == 0) {
         // No preferred address: allocate at nextfree
         if constexpr (riscv::encompassing_Nbit_arena > 0) {
             if (nextfree + length > riscv::encompassing_arena_mask) {
+                rails_note_mmap_fail(m.cpu.pc());
                 m.set_result(uint64_t(-12));  // -ENOMEM
+                assert_guard();
+                dump_boundary("file-nextfree-oob");
                 return;
             }
         }
@@ -3353,18 +4099,25 @@ static void sys_mmap(Machine& m) {
         dst = addr_g;
     } else if ((flags & MAP_FIXED) && addr_g >= m.memory.mmap_start()) {
         // Fixed mapping extending mmap arena
-        if constexpr (riscv::encompassing_Nbit_arena > 0) {
-            uint64_t needed_end = addr_g + length;
-            if (needed_end > riscv::encompassing_arena_mask) {
-                m.set_result(uint64_t(-12));  // -ENOMEM
-                return;
+            if constexpr (riscv::encompassing_Nbit_arena > 0) {
+                uint64_t needed_end = addr_g + length;
+                if (needed_end > riscv::encompassing_arena_mask) {
+                    rails_note_mmap_fail(m.cpu.pc());
+                    m.set_result(uint64_t(-12));  // -ENOMEM
+                    assert_guard();
+                    dump_boundary("file-fixed-oob");
+                    return;
+                }
             }
-        }
         if (addr_g + length > nextfree)
             nextfree = addr_g + length;
         dst = addr_g;
     } else {
         dst = addr_g;
+    }
+
+    if (flags & MAP_FIXED) {
+        invalidate_reuse_cache(m, dst, length);
     }
 
     // Make the area writable for the copy
@@ -3373,9 +4126,13 @@ static void sys_mmap(Machine& m) {
     rw_attr.write = true;
     m.memory.set_page_attr(dst, length, rw_attr);
 
-    // Zero the region first (like MAP_ANONYMOUS pages)
-
-    m.memory.memdiscard(dst, length, true);
+    // Zero existing mappings before reusing them. Fresh bump allocations in the
+    // encompassing arena already start zeroed, so avoid paying memdiscard on
+    // the common loader fast-path.
+    const bool reusing_existing_bytes = dst < nextfree_before;
+    if (reusing_existing_bytes) {
+        m.memory.memdiscard(dst, length, true);
+    }
 
 
     // Copy file data from VFS directly into guest memory
@@ -3394,6 +4151,9 @@ static void sys_mmap(Machine& m) {
     m.memory.set_page_attr(dst, length, attr);
 
     m.set_result(dst);
+    assert_guard();
+    rails_note_mmap(m.cpu.pc(), m.cpu.reg(1), length);
+    dump_boundary("file-success");
 
 #ifdef __EMSCRIPTEN__
     // JIT invalidation: MAP_FIXED overwrites existing pages, potentially
@@ -3410,6 +4170,8 @@ static void sys_mmap(Machine& m) {
 
     if (g_trace_syscalls && g_trace_countdown-- > 0) std::cerr << "[mmap] => 0x" << std::hex << dst << std::dec
               << " (nextfree=0x" << std::hex << nextfree << std::dec << ")\n";
+    assert_guard();
+    dump_boundary("file-return");
 }
 
 // mprotect — no-op during child execution to prevent RELRO from
@@ -3426,7 +4188,7 @@ static void sys_mprotect(Machine& m) {
 
     static int mprot_count = 0;
     if (++mprot_count <= 50)
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[mprotect] #%d addr=0x%lx len=0x%lx prot=%d pc=0x%lx\n",
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[mprotect] #%d addr=0x%lx len=0x%lx prot=%d pc=0x%lx\n",
                 mprot_count, (long)addr, (long)len, prot, (long)m.cpu.pc());
 
     // Apply page attributes for the mmap region (thread stacks, etc.).
@@ -3470,16 +4232,10 @@ static void sys_munmap(Machine& m) {
 
     static int munmap_count = 0;
     if (++munmap_count <= 50)
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[munmap] addr=0x%lx len=0x%lx pc=0x%lx\n",
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[munmap] addr=0x%lx len=0x%lx pc=0x%lx\n",
                 (long)addr, (long)aligned_len, (long)m.cpu.pc());
 
-    // Zero the region to prevent stale data (optional but safer)
-    if constexpr (riscv::encompassing_Nbit_arena != 0) {
-        auto* arena = (uint8_t*)m.memory.memory_arena_ptr();
-        if (arena && addr + aligned_len <= m.memory.memory_arena_size()) {
-            std::memset(arena + addr, 0, aligned_len);
-        }
-    }
+    custom_unmap_range(m, addr, aligned_len, m.cpu.pc(), munmap_return_ra(m));
 
 #ifdef __EMSCRIPTEN__
     // JIT invalidation: unmapped pages may have contained JIT-compiled code.
@@ -3616,7 +4372,7 @@ static void sys_getrlimit(Machine& m) {
         m.memory.template write<uint64_t>(rlim_addr, cur);
         m.memory.template write<uint64_t>(rlim_addr + 8, max);
     }
-    fprintf(stderr, "[getrlimit] resource=%u => cur=%llu max=%llu\n",
+    dbg_fprintf(stderr, "[getrlimit] resource=%u => cur=%llu max=%llu\n",
             resource,
             (unsigned long long)cur,
             (unsigned long long)max);
@@ -3771,7 +4527,7 @@ static void sys_ioctl(Machine& m) {
     }
 
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[ioctl] fd=%d request=0x%lx => -ENOTSUP\n", fd, (long)request);
+        dbg_fprintf(stderr, "[ioctl] fd=%d request=0x%lx => -ENOTSUP\n", fd, (long)request);
     m.set_result(err::NOTSUP);
 }
 
@@ -3803,7 +4559,7 @@ static void sys_fcntl(Machine& m) {
     bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd) || net_is_socket_fd(fd)
                  || g_epoll_instances.count(fd) || g_eventfd_counters.count(fd);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[fcntl] fd=%d cmd=%d valid=%d\n", fd, cmd, (int)valid);
+        dbg_fprintf(stderr, "[fcntl] fd=%d cmd=%d valid=%d\n", fd, cmd, (int)valid);
     if (!valid) {
         m.set_result(err::BADF);
         return;
@@ -3833,7 +4589,7 @@ static void sys_fcntl(Machine& m) {
                 g_fd_cloexec_flags[newfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : g_fd_cloexec_flags[fd];
                 g_fd_status_flags[newfd] = g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd);
                 if (g_trace_syscalls && g_trace_countdown-- > 0)
-                    fprintf(stderr, "[fcntl] F_DUPFD epoll fd=%d -> newfd=%d\n", fd, newfd);
+                    dbg_fprintf(stderr, "[fcntl] F_DUPFD epoll fd=%d -> newfd=%d\n", fd, newfd);
                 m.set_result(newfd);
                 return;
             }
@@ -3989,7 +4745,7 @@ static void sys_pipe2(Machine& m) {
 
     int32_t fds[2] = { read_fd, write_fd };
     m.memory.memcpy(pipefd_addr, fds, sizeof(fds));
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[pipe2] flags=0x%x => read=%d write=%d\n", flags, read_fd, write_fd);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[pipe2] flags=0x%x => read=%d write=%d\n", flags, read_fd, write_fd);
     m.set_result(0);
 }
 
@@ -4160,14 +4916,15 @@ static void sys_mkdirat(Machine& m) {
     auto path_addr = m.sysarg(1);
     uint32_t mode = m.template sysarg<uint32_t>(2);
 
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string path;
     try { path = m.memory.memstring(path_addr); }
     catch (...) { m.set_result(err::INVAL); return; }
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
+        return;
+    }
+    path = std::move(at.path);
 
     m.set_result(fs.mkdir(path, mode));
 }
@@ -4178,14 +4935,15 @@ static void sys_unlinkat(Machine& m) {
     auto path_addr = m.sysarg(1);
     int flags = m.template sysarg<int>(2);
 
-    if (dirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string path;
     try { path = m.memory.memstring(path_addr); }
     catch (...) { m.set_result(err::INVAL); return; }
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
+        return;
+    }
+    path = std::move(at.path);
 
     m.set_result(fs.unlink(path, flags));
 }
@@ -4196,16 +4954,17 @@ static void sys_symlinkat(Machine& m) {
     int newdirfd = m.template sysarg<int>(1);
     auto linkpath_addr = m.sysarg(2);
 
-    if (newdirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string target, linkpath;
     try {
         target = m.memory.memstring(target_addr);
         linkpath = m.memory.memstring(linkpath_addr);
     } catch (...) { m.set_result(err::INVAL); return; }
+    auto at = resolve_at_path(fs, newdirfd, linkpath);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
+        return;
+    }
+    linkpath = std::move(at.path);
 
     m.set_result(fs.symlink(target, linkpath));
 }
@@ -4217,16 +4976,23 @@ static void sys_linkat(Machine& m) {
     int newdirfd = m.template sysarg<int>(2);
     auto newpath_addr = m.sysarg(3);
 
-    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string oldpath, newpath;
     try {
         oldpath = m.memory.memstring(oldpath_addr);
         newpath = m.memory.memstring(newpath_addr);
     } catch (...) { m.set_result(err::INVAL); return; }
+    auto old_at = resolve_at_path(fs, olddirfd, oldpath);
+    if (old_at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(old_at.status));
+        return;
+    }
+    auto new_at = resolve_at_path(fs, newdirfd, newpath);
+    if (new_at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(new_at.status));
+        return;
+    }
+    oldpath = std::move(old_at.path);
+    newpath = std::move(new_at.path);
 
     m.set_result(fs.link(oldpath, newpath));
 }
@@ -4238,16 +5004,23 @@ static void sys_renameat(Machine& m) {
     int newdirfd = m.template sysarg<int>(2);
     auto newpath_addr = m.sysarg(3);
 
-    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     std::string oldpath, newpath;
     try {
         oldpath = m.memory.memstring(oldpath_addr);
         newpath = m.memory.memstring(newpath_addr);
     } catch (...) { m.set_result(err::INVAL); return; }
+    auto old_at = resolve_at_path(fs, olddirfd, oldpath);
+    if (old_at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(old_at.status));
+        return;
+    }
+    auto new_at = resolve_at_path(fs, newdirfd, newpath);
+    if (new_at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(new_at.status));
+        return;
+    }
+    oldpath = std::move(old_at.path);
+    newpath = std::move(new_at.path);
 
     m.set_result(fs.rename(oldpath, newpath));
 }
@@ -4260,11 +5033,6 @@ static void sys_renameat2(Machine& m) {
     auto newpath_addr = m.sysarg(3);
     uint32_t flags = m.template sysarg<uint32_t>(4);
 
-    if (olddirfd != AT_FDCWD || newdirfd != AT_FDCWD) {
-        m.set_result(err::NOTSUP);
-        return;
-    }
-
     // Common case used by Node CLIs.
     if (flags != 0) {
         m.set_result(err::NOTSUP);
@@ -4276,6 +5044,18 @@ static void sys_renameat2(Machine& m) {
         oldpath = m.memory.memstring(oldpath_addr);
         newpath = m.memory.memstring(newpath_addr);
     } catch (...) { m.set_result(err::INVAL); return; }
+    auto old_at = resolve_at_path(fs, olddirfd, oldpath);
+    if (old_at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(old_at.status));
+        return;
+    }
+    auto new_at = resolve_at_path(fs, newdirfd, newpath);
+    if (new_at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(new_at.status));
+        return;
+    }
+    oldpath = std::move(old_at.path);
+    newpath = std::move(new_at.path);
 
     m.set_result(fs.rename(oldpath, newpath));
 }
@@ -4616,7 +5396,7 @@ static void sys_ppoll(Machine& m) {
 static void sys_epoll_create1(Machine& m) {
     int fd = g_next_epoll_fd++;
     g_epoll_instances[fd] = EpollInstance{};
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll_create1] => fd=%d\n", fd);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[epoll_create1] => fd=%d\n", fd);
     m.set_result(fd);
 }
 
@@ -4641,7 +5421,7 @@ static void sys_epoll_ctl(Machine& m) {
         uint32_t events = m.memory.template read<uint32_t>(event_addr);
         uint64_t data   = m.memory.template read<uint64_t>(event_addr + 8);
         it->second.interests[fd] = EpollInterest{events, data};
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll_ctl] %s epfd=%d fd=%d events=0x%x data=0x%lx\n",
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[epoll_ctl] %s epfd=%d fd=%d events=0x%x data=0x%lx\n",
                 op == 1 ? "ADD" : "MOD", epfd, fd, events, (unsigned long)data);
         m.set_result(0);
     } else if (op == EPOLL_CTL_DEL) {
@@ -4675,12 +5455,12 @@ static void sys_epoll_pwait(Machine& m) {
     static int epoll_log_count = 0;
     if (epoll_log_count < 40) {
         epoll_log_count++;
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll] epfd=%d timeout=%d maxev=%d interests:", epfd, timeout, maxevents);
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[epoll] epfd=%d timeout=%d maxev=%d interests:", epfd, timeout, maxevents);
         for (auto& [fd2, int2] : it->second.interests) {
             bool is_sock = net_is_socket_fd && net_is_socket_fd(fd2);
-            fprintf(stderr, " fd=%d(ev=0x%x,d=0x%lx%s)", fd2, int2.events, (unsigned long)int2.data, is_sock ? ",sock" : "");
+            dbg_fprintf(stderr, " fd=%d(ev=0x%x,d=0x%lx%s)", fd2, int2.events, (unsigned long)int2.data, is_sock ? ",sock" : "");
         }
-        fprintf(stderr, "\n");
+        dbg_fprintf(stderr, "\n");
     }
 #endif
 
@@ -4792,7 +5572,7 @@ epoll_check_revents:
             ready++;
 #ifdef __EMSCRIPTEN__
             if (epoll_log_count <= 40) {
-                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll-ev] fd=%d revents=0x%x data=0x%lx\n", fd, revents, (unsigned long)interest.data);
+                if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[epoll-ev] fd=%d revents=0x%x data=0x%lx\n", fd, revents, (unsigned long)interest.data);
             }
 #endif
         }
@@ -4800,7 +5580,7 @@ epoll_check_revents:
 
 #ifdef __EMSCRIPTEN__
     if (epoll_log_count <= 40) {
-        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[epoll] result: ready=%d socket_waiting=%d\n", ready, (int)socket_waiting_for_data);
+        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[epoll] result: ready=%d socket_waiting=%d\n", ready, (int)socket_waiting_for_data);
     }
 #endif
 
@@ -4999,7 +5779,7 @@ static void sys_futex(Machine& m) {
             if (next >= 0) {
                 static int switch_count = 0;
                 if (++switch_count <= 50)
-                    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] WAIT switch t%d->t%d addr=0x%lx exp=0x%x\n",
+                    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[futex] WAIT switch t%d->t%d addr=0x%lx exp=0x%x\n",
                             g_sched.current, next, (long)uaddr, (unsigned)expected);
                 switch_to_thread(m, next);
                 return;
@@ -5012,7 +5792,7 @@ static void sys_futex(Machine& m) {
                     g_sched.threads[i].waiting = false;
                     static int deadlock_count = 0;
                     if (++deadlock_count <= 50)
-                        if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] deadlock-break: force-wake t%d, switch from t%d\n",
+                        if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[futex] deadlock-break: force-wake t%d, switch from t%d\n",
                                 i, g_sched.current);
                     switch_to_thread(m, i);
                     return;
@@ -5029,7 +5809,7 @@ static void sys_futex(Machine& m) {
         // from any glibc state disruption this may cause.
         static int futex_wait_count = 0;
         if (++futex_wait_count <= 50) {
-            if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] WAIT fallback addr=0x%lx exp=0x%x actual=0x%x count=%d pc=0x%lx\n",
+            if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[futex] WAIT fallback addr=0x%lx exp=0x%x actual=0x%x count=%d pc=0x%lx\n",
                     (long)uaddr, (unsigned)expected, (unsigned)actual,
                     g_sched.count, (long)m.cpu.pc());
         }
@@ -5044,7 +5824,7 @@ static void sys_futex(Machine& m) {
         if (woken > 0) {
             static int wake_count = 0;
             if (++wake_count <= 20)
-                if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[futex] WAKE addr=0x%lx woke=%d\n",
+                if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[futex] WAKE addr=0x%lx woke=%d\n",
                         (long)uaddr, woken);
         }
         m.set_result(woken);
@@ -5119,11 +5899,12 @@ static void sys_statx(Machine& m) {
     }
 
 
-    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
-    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
-        m.set_result(err::NOTSUP);
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
         return;
     }
+    path = std::move(at.path);
 
     // AT_EMPTY_PATH with empty string means fstat on dirfd — not supported
     if (path.empty()) {
@@ -5266,15 +6047,46 @@ static void sys_madvise(Machine& m) {
     auto len = m.sysarg(1);
     auto advice = m.template sysarg<int>(2);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
-        fprintf(stderr, "[madvise] addr=0x%lx len=0x%lx advice=%d pc=0x%lx\n",
+        dbg_fprintf(stderr, "[madvise] addr=0x%lx len=0x%lx advice=%d pc=0x%lx\n",
                 (long)addr, (long)len, advice, (long)m.cpu.pc());
-    m.set_result(0);
+    constexpr int MADV_NORMAL = 0;
+    constexpr int MADV_RANDOM = 1;
+    constexpr int MADV_SEQUENTIAL = 2;
+    constexpr int MADV_WILLNEED = 3;
+    constexpr int MADV_DONTNEED = 4;
+    constexpr int MADV_FREE = 8;
+    constexpr int MADV_HUGEPAGE = 14;
+    constexpr int MADV_NOHUGEPAGE = 15;
+    switch (advice) {
+        case MADV_NORMAL:
+        case MADV_RANDOM:
+        case MADV_SEQUENTIAL:
+        case MADV_WILLNEED:
+        case MADV_DONTNEED:
+        case MADV_FREE:
+        case MADV_HUGEPAGE:
+        case MADV_NOHUGEPAGE:
+            m.set_result(0);
+            return;
+        default:
+            // Compatibility-first stub: accept unknown advice as no-op.
+            m.set_result(0);
+            return;
+    }
 }
 static void sys_prctl(Machine& m) { m.set_result(0); }
 static void sys_mremap(Machine& m) {
     auto old_addr = m.sysarg(0);
     auto old_size = m.sysarg(1);
     auto new_size = m.sysarg(2);
+    auto flags = m.template sysarg<int>(3);
+    auto requested_new_addr = m.sysarg(4);
+    (void)requested_new_addr;
+
+    if (old_size == 0) {
+        m.set_result(uint64_t(-22));  // -EINVAL
+        return;
+    }
 
     // Validate address is within the arena. QEMU returns EFAULT (-14) for
     // addresses outside valid mappings, and musl uses this as a stop signal
@@ -5286,9 +6098,75 @@ static void sys_mremap(Machine& m) {
         return;
     }
 
-    // For valid addresses, return ENOMEM to force musl fallback to
-    // mmap+memcpy+munmap. This matches QEMU behavior.
-    m.set_result(uint64_t(-12));  // -ENOMEM
+    // mremap only applies to mmap()ed regions. In this runtime, get_pageno()
+    // cannot be used for mappedness checks because missing pages resolve to a
+    // synthetic CoW zero page. Use mmap arena bounds instead.
+    const uint64_t mmap_start = m.memory.mmap_start();
+    const uint64_t mmap_top = std::max<uint64_t>(g_mmap_bump, m.memory.mmap_address());
+    if (old_addr < mmap_start || old_addr + old_size > mmap_top) {
+        m.set_result(uint64_t(-14));  // -EFAULT
+        return;
+    }
+
+    // Shrink / same-size remap: keep address stable and report success.
+    if (new_size <= old_size) {
+        m.set_result(old_addr);
+        return;
+    }
+
+    // Grow path: keep the custom anonymous allocator behavior coherent with
+    // sys_mmap/sys_munmap so accounting, cache invalidation and hint policy
+    // all stay aligned.
+    constexpr int MREMAP_MAYMOVE = 1;
+    if ((flags & MREMAP_MAYMOVE) == 0) {
+        m.set_result(uint64_t(-12));  // -ENOMEM
+        return;
+    }
+
+    const uint64_t aligned_old = (old_size + 4095) & ~4095ULL;
+    const uint64_t aligned_new = (new_size + 4095) & ~4095ULL;
+    sync_mmap_bump(m);
+
+    if (old_addr + aligned_old == g_mmap_bump && old_addr + aligned_new <= ARENA_LIMIT) {
+        g_mmap_bump = old_addr + aligned_new;
+        publish_mmap_bump(m);
+        if (aligned_new > aligned_old) {
+            riscv::PageAttributes rw;
+            rw.read = true;
+            rw.write = true;
+            m.memory.set_page_attr(old_addr + aligned_old, aligned_new - aligned_old, rw);
+            rails_note_mmap(m.cpu.pc(), m.cpu.reg(1), aligned_new - aligned_old);
+        }
+        m.set_result(old_addr);
+        return;
+    }
+
+    auto anon = alloc_anon_mapping(m, 0, new_size, 0);
+    if (anon.error != 0 || anon.addr == 0 || anon.addr == ~0ULL) {
+        if (anon.error != 0) rails_note_mmap_fail(m.cpu.pc());
+        m.set_result(uint64_t(-12));  // -ENOMEM
+        return;
+    }
+    const uint64_t new_addr = anon.addr;
+
+    try {
+        uint64_t i = 0;
+        for (; i + 8 <= old_size; i += 8) {
+            const uint64_t v = m.memory.template read<uint64_t>(old_addr + i);
+            m.memory.template write<uint64_t>(new_addr + i, v);
+        }
+        for (; i < old_size; i++) {
+            const uint8_t v = m.memory.template read<uint8_t>(old_addr + i);
+            m.memory.template write<uint8_t>(new_addr + i, v);
+        }
+    } catch (...) {
+        m.set_result(uint64_t(-14));  // -EFAULT
+        return;
+    }
+
+    rails_note_mmap(m.cpu.pc(), m.cpu.reg(1), anon.aligned_len);
+    custom_unmap_range(m, old_addr, aligned_old, m.cpu.pc(), m.cpu.reg(1));
+    m.set_result(new_addr);
 }
 
 static void sys_eventfd2(Machine& m) {
@@ -5309,7 +6187,7 @@ static void sys_eventfd2(Machine& m) {
         entry->content.resize(8);
         memcpy(entry->content.data(), &initval, sizeof(initval));
     }
-    if (g_trace_syscalls && g_trace_countdown-- > 0) fprintf(stderr, "[eventfd2] => fd=%d initval=%u\n", fd, initval);
+    if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[eventfd2] => fd=%d initval=%u\n", fd, initval);
     m.set_result(fd);
 }
 // timerfd_create(clockid, flags) → fd
@@ -5424,7 +6302,19 @@ static void sys_timerfd_gettime(Machine& m) {
 }
 
 static void sys_io_uring_setup(Machine& m) { m.set_result(err::NOSYS); }
-static void sys_capget(Machine& m) { m.set_result(-1); }  // -EPERM
+static void sys_capget(Machine& m) {
+    // Node.js calls capget during initialization to check capabilities.
+    // Two-call protocol: first call gets header version, second gets data.
+    // We zero the data buffer and return success (no capabilities).
+    auto header_addr = m.sysarg(0);
+    auto data_addr = m.sysarg(1);
+    if (data_addr != 0) {
+        // Zero the cap_user_data_t struct (3 x __u32 = 12 bytes, or 2 structs = 24 bytes)
+        uint8_t zeros[24] = {};
+        try { m.memory.memcpy(data_addr, zeros, sizeof(zeros)); } catch (...) {}
+    }
+    m.set_result(0);
+}
 
 static void sys_sched_getscheduler(Machine& m) {
     m.set_result(0);  // SCHED_OTHER
@@ -5538,11 +6428,12 @@ static void sys_faccessat2(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
-    // Linux: absolute paths ignore dirfd; relative paths require AT_FDCWD here.
-    if (dirfd != AT_FDCWD && (path.empty() || path[0] != '/')) {
-        m.set_result(err::NOTSUP);
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) {
+        m.set_result(at_path_errno(at.status));
         return;
     }
+    path = std::move(at.path);
 
     auto entry = fs.resolve(path);
     const int rc = entry ? 0 : err::NOENT;
@@ -5626,11 +6517,12 @@ static void sys_fchmodat(Machine& m) {
     int dirfd = m.template sysarg<int>(0);
     auto path_addr = m.sysarg(1);
     uint32_t mode = m.template sysarg<uint32_t>(2);
-    if (dirfd != AT_FDCWD) { m.set_result(err::NOTSUP); return; }
-
     std::string path;
     try { path = m.memory.memstring(path_addr); }
     catch (...) { m.set_result(err::INVAL); return; }
+    auto at = resolve_at_path(fs, dirfd, path);
+    if (at.status != AtPathStatus::Ok) { m.set_result(at_path_errno(at.status)); return; }
+    path = std::move(at.path);
 
     auto entry = fs.resolve(path);
     if (!entry) { m.set_result(err::NOENT); return; }
@@ -5671,14 +6563,37 @@ static void sys_tkill(Machine& m) {
     int sig = m.template sysarg<int>(1);
     if (sig == 6) { // SIGABRT
 #ifdef __EMSCRIPTEN__
-        // During browser checkpoint export we need to keep progressing until the
-        // stdin-wait checkpoint point. Some guest abort paths intentionally emit
-        // EBREAK after tkill(SIGABRT); skip that by returning directly to caller.
+        // Intercept SIGABRT: the subsequent ebreak will throw an exception
+        // that JSPI can't propagate. Handle it here instead.
         if (g_checkpoint_on_stdin) {
             uint64_t ra = m.cpu.reg(1);
-            fprintf(stderr, "[ABORT] Intercept SIGABRT in checkpoint mode: jump RA=0x%lx\n", (long)ra);
+            dbg_fprintf(stderr, "[ABORT] Intercept SIGABRT in checkpoint mode: jump RA=0x%lx\n", (long)ra);
             m.cpu.jump(ra);
             m.set_result(0);
+            return;
+        }
+        if (g_fork_active()) {
+            dbg_fprintf(stderr, "[ABORT] SIGABRT in fork child — forcing exit(127)\n");
+            // Dump syscall ring to diagnose what node was doing before abort
+            dbg_fprintf(stderr, "[ABORT-child] ring_idx=%d, Last 32 syscalls:\n", riscv::g_syscall_ring_idx);
+            for (int j = 0; j < 32; j++) {
+                int idx = (riscv::g_syscall_ring_idx - 32 + j + 1024) % 32;
+                auto& entry = riscv::g_syscall_ring[idx];
+                if (entry.pc != 0 || entry.sysnum != 0)
+                    dbg_fprintf(stderr, "  [%d] sys#%zu a0=0x%lx a1=0x%lx a2=0x%lx ret=%ld pc=0x%lx\n",
+                            j, entry.sysnum, (long)entry.a0, (long)entry.a1, (long)entry.a2,
+                            (long)entry.result, (long)entry.pc);
+            }
+            dbg_fprintf(stderr, "[ABORT-child] PC=0x%lx RA=0x%lx SP=0x%lx a7=%ld\n",
+                    (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2), (long)m.cpu.reg(17));
+            g_fork().exit_status = 127;
+            g_process_model.push_event(
+                ProcessEventKind::Exit,
+                g_fork().child_pid, g_fork().parent_pid,
+                g_fork().child_pgid, 127);
+            g_process_model.mark_exited(g_fork().child_pid, 127);
+            fork_mark_child_exited(m);
+            m.stop();
             return;
         }
 #endif
@@ -5686,24 +6601,24 @@ static void sys_tkill(Machine& m) {
         static bool dumped = false;
         if (!dumped) {
             dumped = true;
-            fprintf(stderr, "[ABORT] tkill(SIGABRT) received. Node.js or guest app is aborting.\n");
+            dbg_fprintf(stderr, "[ABORT] tkill(SIGABRT) received. Node.js or guest app is aborting.\n");
             // Dump syscall ring buffer
-            fprintf(stderr, "[ABORT] ring_idx=%d, Last 32 syscalls:\n", riscv::g_syscall_ring_idx);
+            dbg_fprintf(stderr, "[ABORT] ring_idx=%d, Last 32 syscalls:\n", riscv::g_syscall_ring_idx);
             for (int j = 0; j < 32; j++) {
                 int idx = (riscv::g_syscall_ring_idx - 32 + j + 1024) % 32;
                 auto& e = riscv::g_syscall_ring[idx];
-                fprintf(stderr, "  [%d] idx=%d sys#%zu a0=0x%lx a1=0x%lx ret=%ld pc=0x%lx\n",
+                dbg_fprintf(stderr, "  [%d] idx=%d sys#%zu a0=0x%lx a1=0x%lx ret=%ld pc=0x%lx\n",
                         j, idx, e.sysnum, (long)e.a0, (long)e.a1, (long)e.a2, (long)e.result, (long)e.pc);
             }
         }
-        fprintf(stderr, "[ABORT] tkill(SIGABRT)! PC=0x%lx RA=0x%lx SP=0x%lx\n",
+        dbg_fprintf(stderr, "[ABORT] tkill(SIGABRT)! PC=0x%lx RA=0x%lx SP=0x%lx\n",
                 (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2));
         // Dump all non-zero registers
         for (int r = 0; r < 32; r++) {
             if (m.cpu.reg(r) != 0)
-                fprintf(stderr, "  x%d=0x%lx", r, (long)m.cpu.reg(r));
+                dbg_fprintf(stderr, "  x%d=0x%lx", r, (long)m.cpu.reg(r));
         }
-        fprintf(stderr, "\n");
+        dbg_fprintf(stderr, "\n");
         // Try to read strings from registers that might be message pointers.
         // IMPORTANT: sanitize to printable ASCII before fprintf("%s") so
         // Emscripten's UTF-8 decoding never aborts on arbitrary guest bytes.
@@ -5718,34 +6633,63 @@ static void sys_tkill(Machine& m) {
                         // Keep printable ASCII; replace everything else.
                         buf[i] = (ch >= 32 && ch <= 126) ? static_cast<char>(ch) : '?';
                     }
-                    if (buf[0]) fprintf(stderr, "  x%d string: \"%s\"\n", r, buf);
+                    if (buf[0]) dbg_fprintf(stderr, "  x%d string: \"%s\"\n", r, buf);
                 } catch (...) {}
             }
         }
         // Walk stack for return addresses
         uint64_t sp = m.cpu.reg(2);
-        fprintf(stderr, "[ABORT] Stack words near SP:\n");
+        dbg_fprintf(stderr, "[ABORT] Stack words near SP:\n");
         for (int i = 0; i < 32; i++) {
             try {
                 uint64_t val = m.memory.template read<uint64_t>(sp + i * 8);
                 if (val > 0x40000 && val < 0x1FFFFFFF)
-                    fprintf(stderr, "  SP+%d: 0x%lx", i*8, (long)val);
+                    dbg_fprintf(stderr, "  SP+%d: 0x%lx", i*8, (long)val);
             } catch (...) { break; }
         }
-        fprintf(stderr, "\n");
+        dbg_fprintf(stderr, "\n");
         // FP chain walk
         uint64_t fp = m.cpu.reg(8); // s0/fp
-        fprintf(stderr, "[ABORT] FP chain:\n");
+        dbg_fprintf(stderr, "[ABORT] FP chain:\n");
         for (int i = 0; i < 20 && fp > 0x40000 && fp < 0x1FFFFFFF; i++) {
             try {
                 uint64_t saved_ra = m.memory.template read<uint64_t>(fp - 8);
                 uint64_t saved_fp = m.memory.template read<uint64_t>(fp - 16);
-                fprintf(stderr, "  [%d] RA=0x%lx FP=0x%lx\n", i, (long)saved_ra, (long)saved_fp);
+                dbg_fprintf(stderr, "  [%d] RA=0x%lx FP=0x%lx\n", i, (long)saved_ra, (long)saved_fp);
                 fp = saved_fp;
             } catch (...) { break; }
         }
     }
     m.set_result(0);
+}
+
+// Custom EBREAK handler: do NOT throw (JSPI breaks wasm exception propagation).
+// Instead, handle abort recovery inline — mirrors what the catch block in
+// friscy_resume() was supposed to do.
+static void sys_ebreak(Machine& m) {
+    dbg_fprintf(stderr, "[ebreak-handler] PC=0x%lx RA=0x%lx SP=0x%lx\n",
+            (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2));
+    if (g_fork_active()) {
+        dbg_fprintf(stderr, "[ebreak-handler] In fork child — forcing exit(127)\n");
+        g_fork().exit_status = 127;
+        g_process_model.push_event(
+            ProcessEventKind::Exit,
+            g_fork().child_pid, g_fork().parent_pid,
+            g_fork().child_pgid, 127);
+        g_process_model.mark_exited(g_fork().child_pid, 127);
+        fork_mark_child_exited(m);
+        m.stop();
+        return;
+    }
+    // Jump to RA to skip past the trap (abort/assert/stack_chk_fail)
+    uint64_t ra = m.cpu.reg(1);
+    if (ra > 0x1000) {
+        m.cpu.jump(ra);
+    } else {
+        // RA is garbage — just stop
+        dbg_fprintf(stderr, "[ebreak-handler] RA=0x%lx looks invalid, stopping\n", (long)ra);
+        m.stop();
+    }
 }
 
 static void sys_sched_yield(Machine& m) {
@@ -6406,6 +7350,10 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
 
     // Custom hypercalls (500+)
     machine.install_syscall_handler(500, sys_host_fetch);
+
+    // EBREAK: override libriscv's default handler which throws (broken under JSPI).
+    // Must be installed LAST to override the libriscv linux handler.
+    machine.install_syscall_handler(riscv::SYSCALL_EBREAK, sys_ebreak);
 }
 
 }  // namespace syscalls

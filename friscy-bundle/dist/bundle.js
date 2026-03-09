@@ -13948,92 +13948,6 @@ void main() {
     }
   };
 
-  // friscy-bundle/network_bridge.js
-  var NetworkBridge = class {
-    constructor(proxyUrl, options = {}) {
-      this.proxyUrl = proxyUrl;
-      this.certHash = options.certHash || null;
-      this.transport = null;
-      this.sockets = /* @__PURE__ */ new Map();
-      this.nextFd = 1e3;
-    }
-    async connect() {
-      if (this.transport) return;
-      let transportOptions = void 0;
-      if (this.certHash) {
-        const hashB64 = this.certHash.replace(/\s+/g, "");
-        let decoded;
-        try {
-          decoded = atob(hashB64);
-        } catch {
-          throw new Error("Invalid proxycert hash (expected base64 sha256)");
-        }
-        const bytes = new Uint8Array(decoded.length);
-        for (let i8 = 0; i8 < decoded.length; i8++) bytes[i8] = decoded.charCodeAt(i8);
-        transportOptions = {
-          serverCertificateHashes: [
-            { algorithm: "sha-256", value: bytes }
-          ]
-        };
-      }
-      this.transport = new WebTransport(this.proxyUrl, transportOptions);
-      await this.transport.ready;
-      console.log("[net] WebTransport connected");
-    }
-    async socketCreate(fd, domain, type) {
-      console.log(`[net] socketCreate fd=${fd} domain=${domain} type=${type}`);
-      this.sockets.set(fd, { fd, domain, type, stream: null, writer: null, reader: null });
-      return 0;
-    }
-    async socketConnect(fd, addrData) {
-      const socket = this.sockets.get(fd);
-      if (!socket) return -9;
-      try {
-        const stream = await this.transport.createBidirectionalStream();
-        socket.stream = stream;
-        socket.writer = stream.writable.getWriter();
-        socket.reader = stream.readable.getReader();
-        await socket.writer.write(new Uint8Array([1, ...addrData]));
-        return 0;
-      } catch (e) {
-        console.error("[net] connect failed:", e);
-        return -1;
-      }
-    }
-    async socketSend(fd, data) {
-      const socket = this.sockets.get(fd);
-      if (!socket || !socket.writer) return -9;
-      try {
-        await socket.writer.write(data);
-        return data.length;
-      } catch (e) {
-        console.error("[net] send failed:", e);
-        return -1;
-      }
-    }
-    async socketRecv(fd, maxLen) {
-      const socket = this.sockets.get(fd);
-      if (!socket || !socket.reader) return -9;
-      try {
-        const { value, done } = await socket.reader.read();
-        if (done) return 0;
-        return value.subarray(0, maxLen);
-      } catch (e) {
-        console.error("[net] recv failed:", e);
-        return null;
-      }
-    }
-    async socketClose(fd) {
-      const socket = this.sockets.get(fd);
-      if (socket) {
-        if (socket.writer) await socket.writer.close();
-        if (socket.reader) await socket.reader.cancel();
-        this.sockets.delete(fd);
-      }
-      return 0;
-    }
-  };
-
   // friscy-bundle/app.ts
   var FRISCY_THEME = {
     background: "#0a0e14",
@@ -14177,6 +14091,7 @@ void main() {
   var CMD_STDIN_REQUEST = 2;
   var CMD_STDIN_READY = 3;
   var CMD_EXIT = 4;
+  var CMD_EXPORT_CHECKPOINT = 9;
   var stdinQueue = [];
   var term2 = null;
   var fitAddon2 = null;
@@ -14185,6 +14100,58 @@ void main() {
   window.__friscyJitStats = null;
   window.__friscyProcessEvents = [];
   window.__friscyProcessEventLog = [];
+  window._friscyAwaitStdinRequest = async (timeoutMs = 6e4) => {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (controlView && Atomics.load(controlView, 0) === CMD_STDIN_REQUEST) return true;
+      await new Promise((r11) => setTimeout(r11, 50));
+    }
+    return false;
+  };
+  async function exportLiveCheckpointUpload(filename = "friscy-live.ckpt") {
+    if (!worker) throw new Error("Worker not initialized");
+    return await new Promise((resolve, reject) => {
+      const w4 = worker;
+      let settled = false;
+      const onMsg = async (e) => {
+        if (e.data?.type === "checkpoint-exported-live") {
+          settled = true;
+          w4.removeEventListener("message", onMsg);
+          try {
+            const resp = await fetch("/__upload_checkpoint/" + encodeURIComponent(filename), {
+              method: "POST",
+              body: e.data.data
+            });
+            const json = await resp.json();
+            if (!resp.ok || !json.ok) throw new Error(json.error || `upload failed ${resp.status}`);
+            resolve(json);
+          } catch (err) {
+            reject(err);
+          }
+        } else if (e.data?.type === "checkpoint-export-error") {
+          settled = true;
+          w4.removeEventListener("message", onMsg);
+          reject(new Error(e.data.message || "checkpoint export failed"));
+        }
+      };
+      w4.addEventListener("message", onMsg);
+      if (controlView) {
+        Atomics.store(controlView, 0, CMD_EXPORT_CHECKPOINT);
+        Atomics.notify(controlView, 0);
+        setTimeout(() => {
+          if (!settled) w4.postMessage({ type: "export-checkpoint-live" });
+        }, 15e3);
+      } else {
+        w4.postMessage({ type: "export-checkpoint-live" });
+      }
+      setTimeout(() => {
+        settled = true;
+        w4.removeEventListener("message", onMsg);
+        reject(new Error("checkpoint export timeout"));
+      }, 6e5);
+    });
+  }
+  window._friscyExportLiveCheckpointUpload = exportLiveCheckpointUpload;
   var jitWarmupHudEl = document.getElementById("jit-warmup-hud");
   var jitHudCompiledEl = document.getElementById("jit-hud-compiled");
   var jitHudQueueEl = document.getElementById("jit-hud-queue");
@@ -14877,6 +14844,19 @@ void main() {
     } else {
       rootfs = await fetchWithProgress(rootfsUrl);
     }
+    let checkpointData = null;
+    const checkpointUrl = exampleCfg.checkpoint;
+    if (checkpointUrl) {
+      try {
+        const resp = await fetch(checkpointUrl);
+        if (resp.ok) {
+          checkpointData = await resp.arrayBuffer();
+          console.log(`[friscy] Checkpoint loaded: ${(checkpointData.byteLength / 1048576).toFixed(1)} MB`);
+        }
+      } catch (e) {
+        console.warn("[friscy] Checkpoint load failed:", e);
+      }
+    }
     setProgress(-1, "Initializing runtime...", void 0);
     const isDual = activeExample === "server";
     const primaryTermEl = isDual ? document.getElementById("terminal-server") : terminalEl;
@@ -14915,6 +14895,7 @@ void main() {
       screenReaderMode: false
     };
     term = new import_xterm.Terminal(termOptions);
+    window._friscyTerm = term;
     fitAddon = new o();
     term.loadAddon(fitAddon);
     try {
@@ -14995,7 +14976,12 @@ void main() {
       snapshotBtn.addEventListener("click", () => {
         if (!machineRunning || !worker) return;
         if (statusEl) statusEl.textContent = "Saving memory snapshot...";
-        worker.postMessage({ type: "export-checkpoint-live" });
+        if (controlView) {
+          Atomics.store(controlView, 0, CMD_EXPORT_CHECKPOINT);
+          Atomics.notify(controlView, 0);
+        } else {
+          worker.postMessage({ type: "export-checkpoint-live" });
+        }
       });
     }
     const exportEventsBtn = document.getElementById("export-events-btn");
@@ -15022,6 +15008,7 @@ void main() {
     controlView = new Int32Array(controlSab);
     stdoutView = new Int32Array(stdoutSab);
     stdoutBytes = new Uint8Array(stdoutSab);
+    window._friscyControlView = controlView;
     setProgress(-1, "Starting worker...", void 0);
     worker = new Worker("./worker.js", { type: "module" });
     const workerReady = new Promise((resolve, reject) => {
@@ -15042,6 +15029,8 @@ void main() {
     });
     const runtimeParams = new URLSearchParams(location.search);
     const jitCfg = readJitRuntimeConfig(runtimeParams);
+    const allowNetwork = runtimeParams.get("allowNetwork") !== "0";
+    const hostFetchProxy = runtimeParams.get("hostFetchProxy") || `${window.location.origin}/__host_fetch`;
     jitHudEnabled = jitCfg.jitHudEnabled;
     if (!jitHudEnabled && jitWarmupHudEl) {
       jitWarmupHudEl.classList.remove("visible");
@@ -15065,26 +15054,13 @@ void main() {
       jitPredictConfidence: jitCfg.jitPredictConfidence,
       jitMarkovEnabled: jitCfg.jitMarkovEnabled,
       jitTripletEnabled: jitCfg.jitTripletEnabled,
-      jitAwaitCompiler: jitCfg.jitAwaitCompiler
+      jitAwaitCompiler: jitCfg.jitAwaitCompiler,
+      allowNetwork,
+      hostFetchProxy
     });
     await workerReady;
     installWorkerRuntimeHandler();
-    let proxyUrl = runtimeParams.get("proxy") || "https://127.0.0.1:4433/connect";
-    let proxyCertHash = runtimeParams.get("certHash") || "420495844b05bced48fec238e550597011e64ef41df1d9fa8eaf3f7430be0d4b";
-    let netBridge = null;
-    if (activeExample === "server") {
-      updateNetStatus("connecting to WebTransport proxy...");
-      netBridge = new NetworkBridge(proxyUrl, { certHash: proxyCertHash });
-      worker.postMessage({
-        type: "net_proxy",
-        proxyUrl,
-        certHash: proxyCertHash
-      });
-      term.writeln("\\x1b[32mNetwork: WebTransport Proxy via " + proxyUrl + "\\x1b[0m");
-      updateNetStatus("WebTransport Connected");
-    } else {
-      updateNetStatus("connected JSPI");
-    }
+    updateNetStatus("connected JSPI");
     overlayEl?.classList.add("hidden");
     if (isDual) {
       document.getElementById("dual-terminal-container")?.classList.add("active");
@@ -15221,6 +15197,8 @@ void main() {
       const k4 = e.split("=")[0];
       envMap.set(k4, e);
     }
+    const hostFetchBridge = `${window.location.protocol}//127.0.0.1:${window.location.port || "80"}/__host_fetch`;
+    envMap.set("FRISCY_HOST_FETCH", `FRISCY_HOST_FETCH=${hostFetchBridge}`);
     const envVars = [...envMap.values()];
     const envArgs = envVars.flatMap((e) => ["--env", e]);
     const args = [...envArgs, "--rootfs", "/rootfs.tar", ...guestCmd];
@@ -15229,11 +15207,18 @@ void main() {
     await new Promise((resolve) => requestAnimationFrame(resolve));
     machineRunning = true;
     const rootfsArray = new Uint8Array(rootfs);
-    worker.postMessage({
+    const msg = {
       type: "run",
       args,
       rootfsData: rootfsArray.buffer
-    }, [rootfsArray.buffer]);
+    };
+    const transfers = [rootfsArray.buffer];
+    if (checkpointData) {
+      const ckptArray = new Uint8Array(checkpointData);
+      msg.checkpointData = ckptArray.buffer;
+      transfers.push(ckptArray.buffer);
+    }
+    worker.postMessage(msg, transfers);
     setTimeout(() => {
       if (overlayEl) overlayEl.style.display = "none";
       primaryTermEl.style.display = "block";

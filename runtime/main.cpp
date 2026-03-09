@@ -23,11 +23,31 @@
 #include "checkpoint.hpp"
 
 #include <iostream>
+
+// Reuse dbg_fprintf from syscalls.hpp (defined when FRISCY_QUIET)
+#ifndef dbg_fprintf
+#ifdef FRISCY_QUIET
+#define dbg_fprintf(...) ((void)0)
+#else
+#define dbg_fprintf fprintf
+#endif
+#endif
+// Stream-based debug macros: compiler strips dead code in unreachable branch
+#ifdef FRISCY_QUIET
+#define dbg_cerr if(1) {} else std::cerr
+#define dbg_cout if(1) {} else std::cout
+#else
+#define dbg_cerr std::cerr
+#define dbg_cout std::cout
+#endif
 #include <fstream>
 #include <vector>
 #include <string>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #else
@@ -36,7 +56,7 @@
 static void segfault_handler(int sig) {
     void* bt[32];
     int n = backtrace(bt, 32);
-    fprintf(stderr, "\n=== SIGSEGV caught ===\n");
+    dbg_fprintf(stderr, "\n=== SIGSEGV caught ===\n");
     backtrace_symbols_fd(bt, n, 2);
     _exit(139);
 }
@@ -45,7 +65,7 @@ static void segfault_handler(int sig) {
 using Machine = riscv::Machine<riscv::RISCV64>;
 
 // Configuration
-static constexpr uint64_t MAX_INSTRUCTIONS = 10'000'000'000'000ULL;  // 10 trillion
+static constexpr uint64_t MAX_INSTRUCTIONS = UINT64_MAX;  // no limit
 static constexpr uint32_t HEAP_SYSCALLS_BASE = 480;
 static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 
@@ -76,6 +96,28 @@ static uint32_t g_last_fault_kind = FRISCY_FAULT_NONE;
 static uint32_t g_last_fault_pc = 0;
 static uint32_t g_last_fault_data = 0;
 
+static inline void enforce_fork_state_invariant(const char* where) {
+    if (syscalls::fork_child_exited() && !syscalls::fork_parent_context_restored()) {
+        dbg_cerr << "[friscy] FATAL: ChildExited observed before parent restore (" << where << ")\n";
+        __builtin_trap();
+    }
+}
+
+static std::string format_callsite_symbol(const Machine& machine, uint64_t pc) {
+    try {
+        auto call = machine.memory.lookup(pc);
+        if (call.name.empty() || call.name == "(null)") {
+            return "(unknown)";
+        }
+        if (call.offset == 0) {
+            return call.name;
+        }
+        return call.name + "+" + std::to_string((unsigned long long)call.offset);
+    } catch (...) {
+        return "(unknown)";
+    }
+}
+
 #ifdef __EMSCRIPTEN__
 static Machine* g_machine = nullptr;
 #ifdef __EMSCRIPTEN__
@@ -88,7 +130,7 @@ extern "C" {
 // Uses g_waiting_for_stdin flag (set by syscall handlers) to distinguish
 // stdin-wait from program exit (both call machine.stop()).
 EMSCRIPTEN_KEEPALIVE int friscy_stopped() {
-    return (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch || syscalls::g_waiting_for_child) ? 1 : 0;
+    return (syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch || syscalls::fork_parent_waiting()) ? 1 : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_fault_kind() {
@@ -136,17 +178,22 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
     static constexpr uint64_t YIELD_CHUNK = 2'000'000;
     static int resume_log_count = 0;
     for (int retries = 0; retries < 8; retries++) {
+        enforce_fork_state_invariant("friscy_resume-loop");
         try {
             while (true) {
+                enforce_fork_state_invariant("friscy_resume-step");
                 g_machine->resume<false>(YIELD_CHUNK);
                 if (syscalls::g_waiting_for_stdin) break;
                 if (syscalls::g_waiting_for_host_fetch) break;
-                if (syscalls::g_waiting_for_child) break;
+                if (syscalls::fork_parent_waiting()) break;
                 if (syscalls::g_execve_restart) break;
-                if (syscalls::g_fork_child_exited) break;
+                if (syscalls::fork_child_exited()) break;
                 if (!g_machine->instruction_limit_reached()) break;
             }
-            if (syscalls::g_fork_child_exited) {
+            if (syscalls::fork_child_exited()) {
+                if (!syscalls::fork_parent_restoring()) {
+                    __builtin_trap();
+                }
                 syscalls::fork_parent_restore(*g_machine);
                 retries = -1;
                 continue;
@@ -159,43 +206,77 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             resume_log_count++;
             if (resume_log_count <= 10 || resume_log_count % 500 == 0) {
                 auto [instr, _] = g_machine->get_counters();
-                fprintf(stderr, "[resume] #%d instructions=%lu stopped=%d\n",
+                dbg_fprintf(stderr, "[resume] #%d instructions=%lu stopped=%d\n",
                         resume_log_count, (unsigned long)instr, friscy_stopped());
             }
             return friscy_stopped();
         } catch (const riscv::MachineException& e) {
             uint64_t fault_addr = e.data();
+            const std::string what = e.what();
+            const bool is_ebreak = what.find("EBREAK") != std::string::npos;
+            const bool is_sigill = what.find("SIGILL") != std::string::npos || what.find("Illegal instruction") != std::string::npos;
             g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
             g_last_fault_pc = (uint32_t)g_machine->cpu.pc();
             g_last_fault_data = (uint32_t)fault_addr;
-            std::cerr << "[resume] MachineException: " << e.what()
+            dbg_cerr << "[resume] MachineException: " << e.what()
                       << " data=0x" << std::hex << fault_addr
                       << " pc=0x" << g_machine->cpu.pc() << std::dec << "\n";
+            if (is_ebreak || is_sigill) {
+                auto ra = g_machine->cpu.reg(riscv::REG_RA);
+                auto fault_symbol = format_callsite_symbol(*g_machine, g_machine->cpu.pc());
+                auto ra_symbol = format_callsite_symbol(*g_machine, ra);
+                if (is_sigill) {
+                    dbg_cerr << "[resume] SIGILL ("
+                              << fault_symbol << ") at pc=0x" << std::hex
+                              << g_machine->cpu.pc() << std::dec
+                              << " RA=0x" << std::hex << ra << " ("
+                              << ra_symbol << std::dec << ")\n";
+                    g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
+                    return 1;
+                }
+                dbg_cerr << "[resume] EBREAK ("
+                          << fault_symbol << ") at pc=0x" << std::hex
+                          << g_machine->cpu.pc() << std::dec
+                          << " RA suggests " << ra_symbol << "\n";
+            }
             // EBREAK from abort()/__stack_chk_fail: skip by returning from
             // the current function (set PC = RA). Common after fork child cleanup.
-            if (std::string(e.what()).find("EBREAK") != std::string::npos) {
+            if (is_ebreak) {
                 g_last_fault_kind = FRISCY_FAULT_EBREAK;
                 if (syscalls::g_fork_active()) {
-                    std::cerr << "[resume] EBREAK in fork child — forcing child exit\n";
+                    dbg_cerr << "[resume] EBREAK in fork child — forcing child exit\n";
+                    // Dump last 32 syscalls for debugging
+                    dbg_cerr << "[syscall-ring] last 32 syscalls before crash:\n";
+                    for (int j = 0; j < 32; j++) {
+                        int idx = (riscv::g_syscall_ring_idx - 32 + j + 1024) % 32;
+                        auto& e = riscv::g_syscall_ring[idx];
+                        if (e.pc != 0)
+                            dbg_cerr << "  [" << j << "] sys#" << e.sysnum
+                                      << " a0=0x" << std::hex << e.a0
+                                      << " a1=0x" << e.a1
+                                      << " a2=0x" << e.a2
+                                      << " => " << std::dec << e.result
+                                      << " pc=0x" << std::hex << e.pc << std::dec << "\n";
+                    }
                     syscalls::g_fork().exit_status = 127;
                     syscalls::g_process_model.push_event(
                         syscalls::ProcessEventKind::Exit,
                         syscalls::g_fork().child_pid, syscalls::g_fork().parent_pid,
                         syscalls::g_fork().child_pgid, 127);
                     syscalls::g_process_model.mark_exited(syscalls::g_fork().child_pid, 127);
-                    syscalls::g_fork_child_exited = true;
+                    syscalls::fork_mark_child_exited(*g_machine);
                     g_machine->stop();
                     continue;
                 }
                 if (friscy_stopped()) {
-                    std::cerr << "[resume] EBREAK after stop: treating as completed run\n";
+                    dbg_cerr << "[resume] EBREAK after stop: treating as completed run\n";
                     return 0;
                 }
-                uint64_t ra = g_machine->cpu.reg(1);
-                std::cerr << "[resume] EBREAK: branch-entered, PC=0x"
+                uint64_t ra = g_machine->cpu.reg(riscv::REG_RA);
+                dbg_cerr << "[resume] EBREAK: branch-entered, PC=0x"
                           << std::hex << g_machine->cpu.pc()
                           << " RA=0x" << ra
-                          << " SP=0x" << g_machine->cpu.reg(2)
+                          << " SP=0x" << g_machine->cpu.reg(riscv::REG_SP)
                           << std::dec << "\n";
                 g_machine->cpu.jump(ra);
                 continue;
@@ -227,6 +308,18 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 continue;  // retry
             }
             // Give up — report to terminal
+            if (syscalls::g_fork_active()) {
+                dbg_cerr << "[resume] MachineException in fork child (retries exhausted) — forcing child exit\n";
+                syscalls::g_fork().exit_status = 127;
+                syscalls::g_process_model.push_event(
+                    syscalls::ProcessEventKind::Exit,
+                    syscalls::g_fork().child_pid, syscalls::g_fork().parent_pid,
+                    syscalls::g_fork().child_pgid, 127);
+                syscalls::g_process_model.mark_exited(syscalls::g_fork().child_pid, 127);
+                syscalls::fork_mark_child_exited(*g_machine);
+                g_machine->stop();
+                continue;
+            }
             EM_ASM({
                 if (typeof Module._termWrite === 'function') {
                     Module._termWrite('\r\n\x1b[31m[friscy] Machine exception: ' +
@@ -236,6 +329,18 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
             }, e.what(), (uint32_t)e.data(), (uint32_t)g_machine->cpu.pc());
             return 0;
         } catch (const std::exception& e) {
+            if (syscalls::g_fork_active()) {
+                dbg_cerr << "[resume] std::exception in fork child — forcing child exit: " << e.what() << "\n";
+                syscalls::g_fork().exit_status = 127;
+                syscalls::g_process_model.push_event(
+                    syscalls::ProcessEventKind::Exit,
+                    syscalls::g_fork().child_pid, syscalls::g_fork().parent_pid,
+                    syscalls::g_fork().child_pgid, 127);
+                syscalls::g_process_model.mark_exited(syscalls::g_fork().child_pid, 127);
+                syscalls::fork_mark_child_exited(*g_machine);
+                g_machine->stop();
+                continue;
+            }
             EM_ASM({
                 if (typeof Module._termWrite === 'function') {
                     Module._termWrite('\r\n\x1b[31m[friscy] Error: ' +
@@ -288,7 +393,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t friscy_stop_reason() {
     uint32_t mask = syscalls::STOP_REASON_NONE;
     if (syscalls::g_waiting_for_stdin)      mask |= syscalls::STOP_REASON_STDIN;
     if (syscalls::g_waiting_for_host_fetch) mask |= syscalls::STOP_REASON_HOST_FETCH;
-    if (syscalls::g_waiting_for_child)      mask |= syscalls::STOP_REASON_WAIT_CHILD;
+    if (syscalls::fork_parent_waiting())     mask |= syscalls::STOP_REASON_WAIT_CHILD;
     return mask;
 }
 
@@ -299,7 +404,10 @@ EMSCRIPTEN_KEEPALIVE void friscy_notify_child_exit(int32_t pid, int32_t status) 
     }
     // Clear wait-blocked flag: either matching pid or unconditional if pid==0
     if (pid == 0 || syscalls::g_wait_blocked_pid == pid) {
-        syscalls::g_waiting_for_child = false;
+        if (g_machine && syscalls::g_fork_active() && syscalls::fork_parent_waiting()) {
+            syscalls::fork_set_state(*g_machine, syscalls::ProcessState::ParentSaved,
+                    "notify", "child exit unblocks wait");
+        }
         syscalls::g_wait_blocked_pid = 0;
     }
 }
@@ -627,6 +735,15 @@ static void setup_virtual_files() {
     // /proc/sys/vm/overcommit_memory — V8 checks this
     g_vfs.add_virtual_file("/proc/sys/vm/overcommit_memory", "0\n");
 
+    // /sys/kernel/mm/transparent_hugepage/hpage_pmd_size — Go runtime reads this
+    // to determine physHugePageSize. Return "0" to disable hugepage alignment
+    // requirements, which cause crashes on our flat 2GB arena.
+    g_vfs.mkdir("/sys", 0755);
+    g_vfs.mkdir("/sys/kernel", 0755);
+    g_vfs.mkdir("/sys/kernel/mm", 0755);
+    g_vfs.mkdir("/sys/kernel/mm/transparent_hugepage", 0755);
+    g_vfs.add_virtual_file("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", "0\n");
+
     // /tmp directory and NODE_COMPILE_CACHE directory
     // Node.js will create cache files here; persist via --export-tar
     g_vfs.mkdir("/tmp", 0777);
@@ -691,15 +808,47 @@ extern "C" uint8_t* friscy_save_live_checkpoint(uint32_t* out_size) {
 
 // Print usage
 static void usage(const char* argv0) {
-    std::cerr << "friscy - Docker container runner via libriscv\n\n";
-    std::cerr << "Usage:\n";
-    std::cerr << "  " << argv0 << " <riscv64-elf-binary> [args...]\n";
-    std::cerr << "  " << argv0 << " --rootfs <rootfs.tar> [host-options...] <entry-binary> [args...]\n";
-    std::cerr << "  " << argv0 << " [host-options...] -- <entry-binary> [args...]\n";
-    std::cerr << "\nExamples:\n";
-    std::cerr << "  " << argv0 << " ./hello                    # Run standalone binary\n";
-    std::cerr << "  " << argv0 << " --rootfs alpine.tar /bin/busybox ls -la\n";
-    std::cerr << "  " << argv0 << " --rootfs myapp.tar /app/server --port 8080\n";
+    dbg_cerr << "friscy - Docker container runner via libriscv\n\n";
+    dbg_cerr << "Usage:\n";
+    dbg_cerr << "  " << argv0 << " <riscv64-elf-binary> [args...]\n";
+    dbg_cerr << "  " << argv0 << " --rootfs <rootfs.tar> [host-options...] <entry-binary> [args...]\n";
+    dbg_cerr << "  " << argv0 << " [host-options...] -- <entry-binary> [args...]\n";
+    dbg_cerr << "Host options:\n";
+    dbg_cerr << "  --strace          Enable syscall trace logs.\n";
+    dbg_cerr << "  --perf-stats      Enable compact mmap/munmap perf counters.\n";
+    dbg_cerr << "  --perf-json FILE  Write perf stats as JSON to FILE.\n";
+    dbg_cerr << "  --safe-mode       Disable translation/cache and use libriscv mmap wrapper.\n";
+    dbg_cerr << "  --differential-syscall-trace\n";
+    dbg_cerr << "                    Enable post-syscall register diff tracing.\n";
+    dbg_cerr << "\nExamples:\n";
+    dbg_cerr << "  " << argv0 << " ./hello                    # Run standalone binary\n";
+    dbg_cerr << "  " << argv0 << " --rootfs alpine.tar /bin/busybox ls -la\n";
+    dbg_cerr << "  " << argv0 << " --rootfs myapp.tar /app/server --port 8080\n";
+}
+
+static std::string json_escape(const std::string& value) {
+    std::ostringstream out;
+    out << '"';
+    for (unsigned char c : value) {
+        switch (c) {
+        case '\\': out << "\\\\"; break;
+        case '"': out << "\\\""; break;
+        case '\b': out << "\\b"; break;
+        case '\f': out << "\\f"; break;
+        case '\n': out << "\\n"; break;
+        case '\r': out << "\\r"; break;
+        case '\t': out << "\\t"; break;
+        default:
+            if (c < 0x20) {
+                out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                    << static_cast<int>(c) << std::dec;
+            } else {
+                out << c;
+            }
+        }
+    }
+    out << '"';
+    return out.str();
 }
 
 int main(int argc, char** argv) {
@@ -719,6 +868,9 @@ int main(int argc, char** argv) {
     std::vector<std::string> guest_args;
     std::vector<std::string> extra_env;
     bool container_mode = false;
+    bool perf_stats = false;
+    bool differential_trace = false;
+    std::string perf_json_path;
 
     // Parse arguments
     int i = 1;
@@ -732,42 +884,60 @@ int main(int argc, char** argv) {
 
         if (!parsing_guest_args && strcmp(argv[i], "--rootfs") == 0) {
             if (i + 1 >= argc) {
-                std::cerr << "Error: --rootfs requires <tarfile>\n";
+                dbg_cerr << "Error: --rootfs requires <tarfile>\n";
                 return 1;
             }
             container_mode = true;
             rootfs_path = argv[++i];
         } else if (!parsing_guest_args && strcmp(argv[i], "--env") == 0) {
             if (i + 1 >= argc) {
-                std::cerr << "Error: --env requires KEY=VALUE\n";
+                dbg_cerr << "Error: --env requires KEY=VALUE\n";
                 return 1;
             }
             extra_env.push_back(argv[++i]);
         } else if (!parsing_guest_args && strcmp(argv[i], "--export-tar") == 0) {
             if (i + 1 >= argc) {
-                std::cerr << "Error: --export-tar requires <path>\n";
+                dbg_cerr << "Error: --export-tar requires <path>\n";
                 return 1;
             }
             export_tar_path = argv[++i];
         } else if (!parsing_guest_args && strcmp(argv[i], "--export-checkpoint") == 0) {
             if (i + 1 >= argc) {
-                std::cerr << "Error: --export-checkpoint requires <path>\n";
+                dbg_cerr << "Error: --export-checkpoint requires <path>\n";
                 return 1;
             }
             export_checkpoint_path = argv[++i];
         } else if (!parsing_guest_args && strcmp(argv[i], "--load-checkpoint") == 0) {
             if (i + 1 >= argc) {
-                std::cerr << "Error: --load-checkpoint requires <path>\n";
+                dbg_cerr << "Error: --load-checkpoint requires <path>\n";
                 return 1;
             }
             load_checkpoint_path = argv[++i];
+        } else if (!parsing_guest_args && strcmp(argv[i], "--strace") == 0) {
+            syscalls::g_trace_syscalls = true;
+            syscalls::g_trace_countdown = 50000;
+        } else if (!parsing_guest_args && strcmp(argv[i], "--safe-mode") == 0) {
+            syscalls::g_safe_mode = true;
+            syscalls::g_disable_custom_mmap_wrapper = true;
+            syscalls::g_custom_mmap_bypass_pc = 0;
+        } else if (!parsing_guest_args && strcmp(argv[i], "--differential-syscall-trace") == 0) {
+            differential_trace = true;
+        } else if (!parsing_guest_args && strcmp(argv[i], "--perf-stats") == 0) {
+            perf_stats = true;
+        } else if (!parsing_guest_args && strcmp(argv[i], "--perf-json") == 0) {
+            if (i + 1 >= argc) {
+                dbg_cerr << "Error: --perf-json requires <path>\n";
+                return 1;
+            }
+            perf_json_path = argv[++i];
+            perf_stats = true;
         } else if (!parsing_guest_args && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
             usage(argv[0]);
             return 0;
         } else {
             if (entry_path.empty()) {
                 if (argv[i][0] == '-') {
-                    std::cerr << "Error: Unknown host option: " << argv[i]
+                    dbg_cerr << "Error: Unknown host option: " << argv[i]
                               << "\nHint: use '--' before guest command/args if needed.\n";
                     return 1;
                 }
@@ -780,12 +950,91 @@ int main(int argc, char** argv) {
     }
 
     if (entry_path.empty()) {
-        std::cerr << "Error: No entry binary specified\n";
+        dbg_cerr << "Error: No entry binary specified\n";
         return 1;
     }
 
+    syscalls::g_perf_stats = perf_stats;
+    riscv::g_trace_differential_syscalls = differential_trace;
+    if (perf_stats) {
+        syscalls::reset_mmap_rails();
+    }
+
     static std::unique_ptr<Machine> machine_ptr;
+    auto run_started_at = std::chrono::steady_clock::now();
+    auto emit_perf_metrics = [&](Machine* m, int exit_code, bool completed, const char* status) {
+        if (!perf_stats && perf_json_path.empty()) return;
+
+        const auto run_finished_at = std::chrono::steady_clock::now();
+        const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            run_finished_at - run_started_at).count();
+
+        uint64_t instructions = 0;
+        if (m) {
+            instructions = m->get_counters().first;
+        }
+
+        auto& rails = syscalls::g_mmap_rails;
+        const uint64_t live_bytes = rails.live_bytes;
+        const uint64_t peak_live_bytes = rails.peak_live_bytes;
+        const uint64_t mmap_bytes = rails.mmap_bytes;
+        const uint64_t munmap_bytes = rails.munmap_bytes;
+
+        if (perf_stats) {
+            dbg_cerr << "[perf-stats] status=" << status
+                     << " wall_ms=" << wall_ms
+                     << " instructions=" << instructions
+                     << " exit=" << exit_code
+                     << " mmap_ops=" << rails.mmap_ops
+                     << " munmap_ops=" << rails.munmap_ops
+                     << " mmap_fail=" << rails.mmap_fails
+                     << " mmap_bytes=" << mmap_bytes
+                     << " munmap_bytes=" << munmap_bytes
+                     << " live_bytes=" << live_bytes
+                     << " peak_live_bytes=" << peak_live_bytes << "\n";
+        }
+
+        if (perf_json_path.empty()) return;
+        std::ofstream json_out(perf_json_path);
+        if (!json_out) {
+            dbg_cerr << "Error: Unable to write perf json to: " << perf_json_path << "\n";
+            return;
+        }
+        const auto argv0 = std::string(argv[0]);
+        json_out << "{\n";
+        json_out << "  \"argv0\": " << json_escape(argv0) << ",\n";
+        json_out << "  \"entry\": " << json_escape(entry_path) << ",\n";
+        json_out << "  \"guestArgs\": [";
+        for (size_t i = 0; i < guest_args.size(); i++) {
+            if (i > 0) json_out << ", ";
+            json_out << json_escape(guest_args[i]);
+        }
+        json_out << "],\n";
+        json_out << "  \"rootfs\": " << json_escape(rootfs_path.empty() ? std::string() : rootfs_path) << ",\n";
+        json_out << "  \"containerMode\": " << (container_mode ? "true" : "false") << ",\n";
+        json_out << "  \"status\": " << json_escape(status) << ",\n";
+        json_out << "  \"completed\": " << (completed ? "true" : "false") << ",\n";
+        json_out << "  \"exitCode\": " << exit_code << ",\n";
+        json_out << "  \"wallMilliseconds\": " << wall_ms << ",\n";
+        json_out << "  \"instructions\": " << instructions << ",\n";
+        json_out << "  \"mmap\": {\n";
+        json_out << "    \"ops\": " << rails.mmap_ops << ",\n";
+        json_out << "    \"munmapOps\": " << rails.munmap_ops << ",\n";
+        json_out << "    \"failures\": " << rails.mmap_fails << ",\n";
+        json_out << "    \"bytes\": " << mmap_bytes << ",\n";
+        json_out << "    \"munmapBytes\": " << munmap_bytes << ",\n";
+        json_out << "    \"liveBytes\": " << live_bytes << ",\n";
+        json_out << "    \"peakLiveBytes\": " << peak_live_bytes << "\n";
+        json_out << "  },\n";
+        json_out << "  \"syscall\": {\n";
+        json_out << "    \"perfStats\": " << (perf_stats ? "true" : "false") << ",\n";
+        json_out << "    \"strace\": " << (syscalls::g_trace_syscalls ? "true" : "false") << "\n";
+        json_out << "  }\n";
+        json_out << "}\n";
+    };
+
     try {
+
         std::vector<uint8_t> binary;
 
 #ifdef FRISCY_WIZER
@@ -795,36 +1044,37 @@ int main(int argc, char** argv) {
             binary = g_wizer_binary;
             entry_path = g_wizer_entry;
             container_mode = true;  // VFS is already loaded
-            std::cout << "[friscy] Using wizer pre-initialized snapshot\n";
-            std::cout << "[friscy] Entry point: " << entry_path << "\n";
-            std::cout << "[friscy] Binary size: " << binary.size() << " bytes\n";
+            dbg_cout << "[friscy] Using wizer pre-initialized snapshot\n";
+            dbg_cout << "[friscy] Entry point: " << entry_path << "\n";
+            dbg_cout << "[friscy] Binary size: " << binary.size() << " bytes\n";
         } else
 #endif
         if (container_mode) {
-            std::cout << "[friscy] Loading rootfs: " << rootfs_path << "\n";
+            dbg_cout << "[friscy] Loading rootfs: " << rootfs_path << "\n";
 
             // Load tar into VFS
             auto tar_data = load_file(rootfs_path);
             if (!g_vfs.load_tar(tar_data.data(), tar_data.size())) {
-                std::cerr << "Error: Failed to parse rootfs tar\n";
+                dbg_cerr << "Error: Failed to parse rootfs tar\n";
                 return 1;
             }
 
             // Setup virtual files
             setup_virtual_files();
 
-            // Update /proc/self/exe
-            g_vfs.add_virtual_file("/proc/self/exe", entry_path);
+            // /proc/self/exe must be a symlink to the running image.
+            (void)g_vfs.unlink("/proc/self/exe");
+            (void)g_vfs.symlink(entry_path, "/proc/self/exe");
 
-            std::cout << "[friscy] Entry point: " << entry_path << "\n";
+            dbg_cout << "[friscy] Entry point: " << entry_path << "\n";
 
             // Load binary from VFS
             binary = load_from_vfs(entry_path);
 
-            std::cout << "[friscy] Binary size: " << binary.size() << " bytes\n";
+            dbg_cout << "[friscy] Binary size: " << binary.size() << " bytes\n";
         } else {
             // Standalone mode - load binary from host filesystem
-            std::cout << "[friscy] Loading binary: " << entry_path << "\n";
+            dbg_cout << "[friscy] Loading binary: " << entry_path << "\n";
             binary = load_file(entry_path);
 
             // Still set up minimal VFS for /proc, /dev
@@ -844,7 +1094,7 @@ int main(int argc, char** argv) {
             size_t start = shebang.find_first_not_of(" \t");
             if (start != std::string::npos) shebang = shebang.substr(start);
 
-            std::cout << "[friscy] Shebang detected: #!" << shebang << "\n";
+            dbg_cout << "[friscy] Shebang detected: #!" << shebang << "\n";
 
             // Parse interpreter and optional arg: "interpreter [arg]"
             std::string interp_path, interp_arg;
@@ -881,12 +1131,12 @@ int main(int argc, char** argv) {
                     } catch (...) {}
                 }
                 if (resolved.empty()) {
-                    std::cerr << "Error: Could not resolve '" << cmd << "' from shebang\n";
+                    dbg_cerr << "Error: Could not resolve '" << cmd << "' from shebang\n";
                     return 1;
                 }
                 interp_path = resolved;
                 interp_arg.clear();  // env consumed the arg
-                std::cout << "[friscy] Resolved env " << cmd << " -> " << resolved << "\n";
+                dbg_cout << "[friscy] Resolved env " << cmd << " -> " << resolved << "\n";
             }
 
             // Rewrite: entry becomes the interpreter, script becomes first arg
@@ -905,35 +1155,35 @@ int main(int argc, char** argv) {
 
             // Reload binary (now the actual ELF interpreter)
             binary = load_from_vfs(entry_path);
-            std::cout << "[friscy] Reloaded interpreter: " << entry_path
+            dbg_cout << "[friscy] Reloaded interpreter: " << entry_path
                       << " (" << binary.size() << " bytes)\n";
         }
 
         // Verify it's a RISC-V ELF
         if (binary.size() < 64 ||
             binary[0] != 0x7f || binary[1] != 'E' || binary[2] != 'L' || binary[3] != 'F') {
-            std::cerr << "Error: Not a valid ELF file\n";
+            dbg_cerr << "Error: Not a valid ELF file\n";
             return 1;
         }
 
         // Check architecture (e_machine at offset 18-19, should be 0xF3 for RISC-V)
         uint16_t e_machine = binary[18] | (binary[19] << 8);
         if (e_machine != 0xF3) {
-            std::cerr << "Error: Not a RISC-V binary (e_machine=" << e_machine << ")\n";
+            dbg_cerr << "Error: Not a RISC-V binary (e_machine=" << e_machine << ")\n";
             return 1;
         }
 
         // Check class (64-bit)
         if (binary[4] != 2) {
-            std::cerr << "Error: Not a 64-bit ELF (only RV64 supported)\n";
+            dbg_cerr << "Error: Not a 64-bit ELF (only RV64 supported)\n";
             return 1;
         }
 
-        std::cout << "[friscy] Valid RV64 ELF detected\n";
+        dbg_cout << "[friscy] Valid RV64 ELF detected\n";
 
         // Parse ELF to check for dynamic linking
         elf::ElfInfo exec_info = elf::parse_elf(binary);
-        std::cout << "[friscy] ELF type: " << (exec_info.type == elf::ET_DYN ? "PIE/shared" : "executable") << "\n";
+        dbg_cout << "[friscy] ELF type: " << (exec_info.type == elf::ET_DYN ? "PIE/shared" : "executable") << "\n";
 
         std::vector<uint8_t> interp_binary;
         elf::ElfInfo interp_info;
@@ -941,34 +1191,42 @@ int main(int argc, char** argv) {
         bool use_dynamic_linker = false;
 
         if (exec_info.is_dynamic && container_mode) {
-            std::cout << "[friscy] Dynamic binary detected\n";
-            std::cout << "[friscy] Interpreter: " << exec_info.interpreter << "\n";
+            dbg_cout << "[friscy] Dynamic binary detected\n";
+            dbg_cout << "[friscy] Interpreter: " << exec_info.interpreter << "\n";
 
             // Load the dynamic linker from VFS
             try {
                 interp_binary = load_from_vfs(exec_info.interpreter);
                 interp_info = elf::parse_elf(interp_binary);
                 use_dynamic_linker = true;
-                std::cout << "[friscy] Loaded interpreter: " << interp_binary.size() << " bytes\n";
+                dbg_cout << "[friscy] Loaded interpreter: " << interp_binary.size() << " bytes\n";
             } catch (const std::exception& e) {
-                std::cerr << "[friscy] Warning: Could not load interpreter: " << e.what() << "\n";
-                std::cerr << "[friscy] Trying to run as static binary...\n";
+                dbg_cerr << "[friscy] Warning: Could not load interpreter: " << e.what() << "\n";
+                dbg_cerr << "[friscy] Trying to run as static binary...\n";
             }
         }
 
         // Create machine with main executable.
         // Use static unique_ptr so machine survives after main() returns,
         // allowing JS to call friscy_resume() for stdin polling.
-        std::cout << "[friscy-debug] Constructing Machine (binary bytes="
+        dbg_cout << "[friscy-debug] Constructing Machine (binary bytes="
                   << binary.size() << ")\n";
 #if defined(FRISCY_EXPERIMENT_EMPTY_MACHINE)
         riscv::MachineOptions<riscv::RISCV64> machine_opts{};
         machine_opts.use_shared_execute_segments = false;
+        if (syscalls::g_safe_mode) {
+            machine_opts.use_shared_execute_segments = false;
+#ifdef RISCV_BINARY_TRANSLATION
+            machine_opts.translate_enabled = false;
+            machine_opts.translate_cache = false;
+            machine_opts.translate_future_segments = false;
+#endif
+        }
 #if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
         machine_opts.use_memory_arena = false;
         machine_opts.memory_max = 1024ULL << 20; // 1GiB page-backed budget
 #endif
-        std::cout << "[friscy-debug] Machine options: empty_machine"
+        dbg_cout << "[friscy-debug] Machine options: empty_machine"
 #if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
                   << " no_arena"
 #endif
@@ -978,6 +1236,14 @@ int main(int argc, char** argv) {
 #elif defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD) || defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
         riscv::MachineOptions<riscv::RISCV64> machine_opts{};
         machine_opts.use_shared_execute_segments = false;
+        if (syscalls::g_safe_mode) {
+            machine_opts.use_shared_execute_segments = false;
+#ifdef RISCV_BINARY_TRANSLATION
+            machine_opts.translate_enabled = false;
+            machine_opts.translation_cache = false;
+            machine_opts.translate_future_segments = false;
+#endif
+        }
 #if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
         machine_opts.load_program = false;
 #endif
@@ -985,7 +1251,7 @@ int main(int argc, char** argv) {
         machine_opts.use_memory_arena = false;
         machine_opts.memory_max = 1024ULL << 20; // 1GiB page-backed budget
 #endif
-        std::cout << "[friscy-debug] Machine options:"
+        dbg_cout << "[friscy-debug] Machine options:"
 #if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
                   << " no_program_load"
 #endif
@@ -999,12 +1265,20 @@ int main(int argc, char** argv) {
         {
             auto opts_ptr = std::make_shared<riscv::MachineOptions<riscv::RISCV64>>();
             opts_ptr->use_shared_execute_segments = false;
+            if (syscalls::g_safe_mode) {
+                opts_ptr->use_shared_execute_segments = false;
+#ifdef RISCV_BINARY_TRANSLATION
+                opts_ptr->translate_enabled = false;
+                opts_ptr->translation_cache = false;
+                opts_ptr->translate_future_segments = false;
+#endif
+            }
             machine_ptr = std::make_unique<Machine>(binary, *opts_ptr);
             machine_ptr->set_options(opts_ptr);
         }
 #endif
         auto& machine = *machine_ptr;
-        std::cout << "[friscy-debug] Machine constructed (pc=0x"
+        dbg_cout << "[friscy-debug] Machine constructed (pc=0x"
                   << std::hex << machine.cpu.pc() << std::dec << ")\n";
 
         // If dynamic, also load the interpreter at a high address
@@ -1013,7 +1287,7 @@ int main(int argc, char** argv) {
             // Place at 384MB mark, above heap/mmap but within arena.
             interp_base = 0x18000000;
 
-            std::cout << "[friscy] Loading interpreter at 0x" << std::hex << interp_base << std::dec << "\n";
+            dbg_cout << "[friscy] Loading interpreter at 0x" << std::hex << interp_base << std::dec << "\n";
 
             // Load interpreter segments
             dynlink::load_elf_segments(machine, interp_binary, interp_base);
@@ -1026,7 +1300,7 @@ int main(int argc, char** argv) {
                 interp_entry = interp_info.entry_point - lo + interp_base;
             }
 
-            std::cout << "[friscy] Interpreter entry: 0x" << std::hex << interp_entry << std::dec << "\n";
+            dbg_cout << "[friscy] Interpreter entry: 0x" << std::hex << interp_entry << std::dec << "\n";
 
             // Calculate the base address where libriscv loaded the main executable.
             // For PIE (ET_DYN), libriscv loads at DYLINK_BASE (0x40000).
@@ -1036,7 +1310,7 @@ int main(int argc, char** argv) {
                 uint64_t exec_base = actual_entry - exec_info.entry_point;
                 exec_info.phdr_addr += exec_base;
                 exec_info.entry_point = actual_entry;
-                std::cout << "[friscy] PIE base: 0x" << std::hex << exec_base << std::dec << "\n";
+                dbg_cout << "[friscy] PIE base: 0x" << std::hex << exec_base << std::dec << "\n";
 
                 // Save PIE base for execve: load_elf_segments needs the
                 // address where the first segment starts (exec_base + lo)
@@ -1055,7 +1329,7 @@ int main(int argc, char** argv) {
             auto [interp_lo, interp_hi] = elf::get_load_range(interp_binary);
             uint64_t interp_end_page = (interp_base + interp_hi + 0xFFF) & ~0xFFFULL;
             if (machine.memory.mmap_address() < interp_end_page) {
-                std::cout << "[friscy] Advancing mmap past interpreter: 0x"
+                dbg_cout << "[friscy] Advancing mmap past interpreter: 0x"
                           << std::hex << machine.memory.mmap_address()
                           << " -> 0x" << interp_end_page << std::dec << "\n";
                 machine.memory.mmap_address() = interp_end_page;
@@ -1091,7 +1365,7 @@ int main(int argc, char** argv) {
         syscalls::g_exec_ctx.brk_base = machine.memory.heap_address();
         syscalls::g_exec_ctx.brk_current = syscalls::g_exec_ctx.brk_base;
         syscalls::g_exec_ctx.brk_overridden = false;
-        std::cout << "[friscy] Heap area: 0x" << std::hex << heap_area << std::dec
+        dbg_cout << "[friscy] Heap area: 0x" << std::hex << heap_area << std::dec
                   << " (" << (64ULL << 20) / (1024*1024) << "MB)\n";
         machine.setup_native_memory(MEMORY_SYSCALLS_BASE);
 
@@ -1112,7 +1386,7 @@ int main(int argc, char** argv) {
             }
         }
         vh::setup_vh_harness(machine, enable_vh_stage2);
-        std::cout << "[friscy] VectorHeart Stage 2 startup: "
+        dbg_cout << "[friscy] VectorHeart Stage 2 startup: "
                   << (enable_vh_stage2 ? "enabled" : "deferred")
                   << "\n";
 
@@ -1147,8 +1421,9 @@ int main(int argc, char** argv) {
             "LANG=C.UTF-8",
             "HOSTNAME=friscy",
             "TZ=UTC",
-            "NODE_OPTIONS=--jitless --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js",
+            "NODE_OPTIONS=--jitless --v8-pool-size=0 --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js",
             "NODE_COMPILE_CACHE=/tmp/node-compile-cache",
+            "UV_THREADPOOL_SIZE=1",
         };
         // Apply --env overrides: if KEY matches an existing var, replace it
         for (const auto& e : extra_env) {
@@ -1183,12 +1458,12 @@ int main(int argc, char** argv) {
         // Set up program arguments and environment
         if (use_dynamic_linker) {
             // For dynamic linking, set up stack with aux vector
-            std::cout << "[friscy] Setting up aux vector for dynamic linker\n";
+            dbg_cout << "[friscy] Setting up aux vector for dynamic linker\n";
 
             // Use the machine's actual stack pointer (set by Machine constructor)
             uint64_t stack_top = machine.cpu.reg(riscv::REG_SP);
             syscalls::g_exec_ctx.original_stack_top = stack_top;
-            std::cout << "[friscy] Machine stack top: 0x" << std::hex << stack_top << std::dec << "\n";
+            dbg_cout << "[friscy] Machine stack top: 0x" << std::hex << stack_top << std::dec << "\n";
 
             uint64_t sp = dynlink::setup_dynamic_stack(
                 machine,
@@ -1202,7 +1477,7 @@ int main(int argc, char** argv) {
             // Set stack pointer
             machine.cpu.reg(riscv::REG_SP) = sp;
 
-            std::cout << "[friscy] Stack pointer: 0x" << std::hex << sp << std::dec << "\n";
+            dbg_cout << "[friscy] Stack pointer: 0x" << std::hex << sp << std::dec << "\n";
         } else {
             // Static binary — still need aux vector (Go runtime reads AT_PAGESZ)
             uint64_t stack_top = machine.cpu.reg(riscv::REG_SP);
@@ -1241,6 +1516,22 @@ int main(int argc, char** argv) {
         machine.set_printer([](const auto&, const char* data, size_t len) {
             std::cout.write(data, len);
             std::cout.flush();
+            // Checkpoint trigger: detect CLI ready output
+            if (syscalls::g_checkpoint_on_stdin && len > 0) {
+                static std::string output_buf;
+                output_buf.append(data, len);
+                // Keep only last 4KB to limit memory
+                if (output_buf.size() > 4096) output_buf = output_buf.substr(output_buf.size() - 4096);
+                // Log progress every 256 bytes of output
+                static size_t total_output = 0;
+                total_output += len;
+                static size_t last_log = 0;
+                if (total_output - last_log >= 256) {
+                    last_log = total_output;
+                    dbg_fprintf(stderr, "[checkpoint-watch] output=%zu bytes, tail: %.80s\n",
+                            total_output, output_buf.substr(output_buf.size() > 80 ? output_buf.size() - 80 : 0).c_str());
+                }
+            }
         });
 #endif
 
@@ -1279,7 +1570,7 @@ int main(int argc, char** argv) {
             };
             auto it = names.find(nr);
             const char* name = it != names.end() ? it->second : "???";
-            std::cerr << "[syscall] UNHANDLED #" << nr << " (" << name << ")"
+            dbg_cerr << "[syscall] UNHANDLED #" << nr << " (" << name << ")"
                       << " a0=" << m.cpu.reg(10)
                       << " a1=" << m.cpu.reg(11) << "\n";
             m.set_result(-38);  // ENOSYS
@@ -1293,9 +1584,9 @@ int main(int argc, char** argv) {
 
         // --- Checkpoint load: restore full machine state, skip straight to resume ---
         if (!load_checkpoint_path.empty()) {
-            fprintf(stderr, "[friscy] Loading checkpoint from: %s\n", load_checkpoint_path.c_str());
+            dbg_fprintf(stderr, "[friscy] Loading checkpoint from: %s\n", load_checkpoint_path.c_str());
             checkpoint::load_checkpoint_file(machine, load_checkpoint_path);
-            fprintf(stderr, "[friscy] Checkpoint loaded, machine ready at stdin wait.\n");
+            dbg_fprintf(stderr, "[friscy] Checkpoint loaded, machine ready at stdin wait.\n");
 #ifdef __EMSCRIPTEN__
             g_machine = &machine;
             // Return to JS — friscy_resume() will drive further execution.
@@ -1314,15 +1605,15 @@ int main(int argc, char** argv) {
                 syscalls::g_sched.threads[0].waiting = false;
             }
             syscalls::g_waiting_for_stdin = false;
-            std::cout << "[friscy] Resuming from checkpoint...\n";
-            std::cout << "----------------------------------------\n";
+            dbg_cout << "[friscy] Resuming from checkpoint...\n";
+            dbg_cout << "----------------------------------------\n";
             // Skip the initial simulate — go straight to the loop
             goto simulate_loop;
 #endif
         }
 
-        std::cout << "[friscy] Starting execution...\n";
-        std::cout << "----------------------------------------\n";
+        dbg_cout << "[friscy] Starting execution...\n";
+        dbg_cout << "----------------------------------------\n";
 
 #ifdef __EMSCRIPTEN__
         g_machine = &machine;
@@ -1334,6 +1625,7 @@ int main(int argc, char** argv) {
         // 4. Page fault (MachineException — retry after fixing permissions)
         simulate_loop:
         for (int retries = 0; retries < 8; retries++) {
+            enforce_fork_state_invariant("simulate_loop");
             try {
 #ifdef __EMSCRIPTEN__
                 // Chunked execution: simulate in chunks of YIELD_CHUNK instructions.
@@ -1341,19 +1633,23 @@ int main(int argc, char** argv) {
                 // Use simulate<false>() to return normally on limit (not throw).
                 static constexpr uint64_t YIELD_CHUNK = 2'000'000;
                 while (true) {
+                    enforce_fork_state_invariant("simulate_loop-step");
                     // Use resume<false>() to accumulate instruction counter
                     // across chunks (simulate<false> resets counter to 0 each call)
                     machine.resume<false>(YIELD_CHUNK);
                     if (syscalls::g_waiting_for_stdin) break;
                     if (syscalls::g_waiting_for_host_fetch) break;
-                    if (syscalls::g_waiting_for_child) break;
+                    if (syscalls::fork_parent_waiting()) break;
                     if (syscalls::g_execve_restart) break;
-                    if (syscalls::g_fork_child_exited) break;
+                    if (syscalls::fork_child_exited()) break;
                     if (!machine.instruction_limit_reached()) break;
                     // No yield needed — Worker thread doesn't block UI
                 }
                 // Fork child exited: restore parent state outside simulate()
-                if (syscalls::g_fork_child_exited) {
+                if (syscalls::fork_child_exited()) {
+                    if (!syscalls::fork_parent_restoring()) {
+                        __builtin_trap();
+                    }
                     syscalls::fork_parent_restore(machine);
                     retries = -1;
                     continue;
@@ -1368,19 +1664,23 @@ int main(int argc, char** argv) {
                 machine.simulate(MAX_INSTRUCTIONS);
                 // Checkpoint export: save state when machine first waits for stdin
                 if (syscalls::g_waiting_for_stdin && !export_checkpoint_path.empty()) {
-                    fprintf(stderr, "[friscy] Saving checkpoint at stdin wait point...\n");
+                    dbg_fprintf(stderr, "[friscy] Saving checkpoint at stdin wait point...\n");
                     auto [instr, _] = machine.get_counters();
-                    fprintf(stderr, "[friscy] Instructions executed: %lu\n", (unsigned long)instr);
+                    dbg_fprintf(stderr, "[friscy] Instructions executed: %lu\n", (unsigned long)instr);
                     auto data = checkpoint::save_checkpoint(machine);
 #ifdef __EMSCRIPTEN__
                     g_last_checkpoint_export = data;
 #endif
                     checkpoint::save_checkpoint_file(data, export_checkpoint_path);
-                    fprintf(stderr, "[friscy] Checkpoint saved, exiting.\n");
+                    dbg_fprintf(stderr, "[friscy] Checkpoint saved, exiting.\n");
+                    emit_perf_metrics(&machine, 0, false, "checkpoint-saved");
                     return 0;
                 }
                 // Fork child exited: restore parent state outside simulate()
-                if (syscalls::g_fork_child_exited) {
+                if (syscalls::fork_child_exited()) {
+                    if (!syscalls::fork_parent_restoring()) {
+                        __builtin_trap();
+                    }
                     syscalls::fork_parent_restore(machine);
                     retries = -1;
                     continue;
@@ -1397,7 +1697,7 @@ int main(int argc, char** argv) {
                 // Perform the HTTP request on the host side using curl, then resume.
                 if (syscalls::g_waiting_for_host_fetch) {
                     syscalls::g_waiting_for_host_fetch = false;
-                    std::cerr << "[host-fetch] Request: " << syscalls::g_host_fetch_request.substr(0, 200) << "\n";
+                    dbg_cerr << "[host-fetch] Request: " << syscalls::g_host_fetch_request.substr(0, 200) << "\n";
                     // Parse URL from JSON request
                     auto& req = syscalls::g_host_fetch_request;
                     std::string url;
@@ -1464,7 +1764,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     cmd += " '" + url + "' 2>/tmp/friscy_fetch_err.txt";
-                    std::cerr << "[host-fetch] curl: " << cmd.substr(0, 300) << "\n";
+                    dbg_cerr << "[host-fetch] curl: " << cmd.substr(0, 300) << "\n";
                     // Execute curl
                     FILE* pipe = popen(cmd.c_str(), "r");
                     std::string response_body;
@@ -1501,13 +1801,13 @@ int main(int argc, char** argv) {
                         + ",\"body\":\"" + escaped + "\"}";
                     syscalls::g_host_fetch_response = json_resp;
                     syscalls::g_host_fetch_response_ready = true;
-                    std::cerr << "[host-fetch] Response: status=" << http_status
+                    dbg_cerr << "[host-fetch] Response: status=" << http_status
                               << " body_len=" << response_body.size() << "\n";
                     retries = 0;
                     continue;  // Resume machine execution
                 }
 #endif
-                std::cerr << "[friscy] simulate() returned normally, retries=" << retries
+                dbg_cerr << "[friscy] simulate() returned normally, retries=" << retries
                           << " instructions=" << machine.instruction_counter()
                           << " exit_code=" << machine.return_value()
                           << " pc=0x" << std::hex << machine.cpu.pc() << std::dec
@@ -1519,17 +1819,20 @@ int main(int argc, char** argv) {
             } catch (const riscv::MachineException& e) {
                 uint64_t fault_addr = e.data();
                 uint64_t crash_pc = machine.cpu.pc();
+                const std::string what = e.what();
+                const bool is_ebreak = what.find("EBREAK") != std::string::npos;
+                const bool is_sigill = what.find("SIGILL") != std::string::npos || what.find("Illegal instruction") != std::string::npos;
                 g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
                 g_last_fault_pc = (uint32_t)crash_pc;
                 g_last_fault_data = (uint32_t)fault_addr;
-                std::cerr << "[friscy] MachineException: " << e.what()
+                dbg_cerr << "[friscy] MachineException: " << e.what()
                           << " data=0x" << std::hex << fault_addr
                           << " pc=0x" << crash_pc << std::dec
                           << " retry=" << retries << "\n";
 
                 // Check if this is an instruction limit, not a page fault
                 if (machine.instruction_limit_reached()) {
-                    std::cerr << "[friscy] Instruction limit reached after "
+                    dbg_cerr << "[friscy] Instruction limit reached after "
                               << machine.get_counters().first << " instructions\n";
                     break;  // Exit cleanly instead of retrying
                 }
@@ -1537,12 +1840,26 @@ int main(int argc, char** argv) {
                 // EBREAK from abort()/__stack_chk_fail: skip by returning from
                 // the current function (set PC = RA). This is safe in single-threaded
                 // emulation where futex force-unlock may trigger false positives.
-                if (std::string(e.what()).find("EBREAK") != std::string::npos) {
+                if (is_ebreak || is_sigill) {
+                    auto ra = machine.cpu.reg(riscv::REG_RA);
+                    auto fault_symbol = format_callsite_symbol(machine, crash_pc);
+                    auto ra_symbol = format_callsite_symbol(machine, ra);
+                    if (is_sigill) {
+                        dbg_cerr << "[friscy] SIGILL: " << fault_symbol
+                                  << " (pc=0x" << std::hex << crash_pc << std::dec
+                                  << ") RA=0x" << std::hex << ra << " (" << ra_symbol << std::dec << ")\n";
+                        throw;
+                    }
+                    dbg_cerr << "[friscy] EBREAK: " << fault_symbol
+                              << " (pc=0x" << std::hex << crash_pc << std::dec
+                              << "), RA suggests " << ra_symbol << "\n";
+                }
+                if (is_ebreak) {
                     g_last_fault_kind = FRISCY_FAULT_EBREAK;
                     // Diagnostic: check actual memory at the reported PC
                     {   static bool once = true;
                         if (once) {
-                            fprintf(stderr, "[bc-ids] SYSCALL=%d SYSTEM=%d STOP=%d\n",
+                            dbg_fprintf(stderr, "[bc-ids] SYSCALL=%d SYSTEM=%d STOP=%d\n",
                                     riscv::RV32I_BC_SYSCALL, riscv::RV32I_BC_SYSTEM, riscv::RV32I_BC_STOP);
                             once = false;
                         }
@@ -1554,7 +1871,7 @@ int main(int argc, char** argv) {
                         // SHIFT is 1 for compressed, 2 for non-compressed
                         constexpr unsigned SHIFT = 1; // compressed enabled
                         auto& dentry = dcache[epc >> SHIFT];
-                        fprintf(stderr, "[EBREAK-diag] pc=0x%lx mem=0x%08x decoder_bc=%d decoder_instr=0x%08x"
+                        dbg_fprintf(stderr, "[EBREAK-diag] pc=0x%lx mem=0x%08x decoder_bc=%d decoder_instr=0x%08x"
                                 " seg=[0x%lx,0x%lx) a7=%ld(0x%lx)\n",
                                 (long)epc, mem_instr, dentry.get_bytecode(), dentry.instr,
                                 (long)seg.exec_begin(), (long)seg.exec_end(),
@@ -1562,7 +1879,7 @@ int main(int argc, char** argv) {
                     }
                     if (syscalls::g_fork_active()) {
                         // Treat EBREAK in fork child as child crash → exit(127)
-                        std::cerr << "[friscy] EBREAK in fork child (pc=0x"
+                        dbg_cerr << "[friscy] EBREAK in fork child (pc=0x"
                                   << std::hex << machine.cpu.pc() << std::dec
                                   << ") — forcing child exit\n";
                         syscalls::g_fork().exit_status = 127;
@@ -1571,21 +1888,21 @@ int main(int argc, char** argv) {
                             syscalls::g_fork().child_pid, syscalls::g_fork().parent_pid,
                             syscalls::g_fork().child_pgid, 127);
                         syscalls::g_process_model.mark_exited(syscalls::g_fork().child_pid, 127);
-                        syscalls::g_fork_child_exited = true;
-                        machine.stop();
-                        // Don't retry — go to fork_parent_restore
-                        retries = -1;
-                        continue;
+                    syscalls::fork_mark_child_exited(machine);
+                    machine.stop();
+                    // Don't retry — go to fork_parent_restore
+                    retries = -1;
+                    continue;
                     }
                     if (machine.stopped()) {
-                        std::cerr << "[friscy] EBREAK after stop: treating as graceful completion\n";
+                        dbg_cerr << "[friscy] EBREAK after stop: treating as graceful completion\n";
                         break;
                     }
-                    uint64_t ra = machine.cpu.reg(1);  // x1 = return address
-                    std::cerr << "[friscy] EBREAK (abort): branch-entered, PC=0x"
+                    uint64_t ra = machine.cpu.reg(riscv::REG_RA);  // x1 = return address
+                    dbg_cerr << "[friscy] EBREAK (abort): branch-entered, PC=0x"
                               << std::hex << machine.cpu.pc()
                               << " RA=0x" << ra
-                              << " SP=0x" << machine.cpu.reg(2)
+                              << " SP=0x" << machine.cpu.reg(riscv::REG_SP)
                               << std::dec << "\n";
                     machine.cpu.jump(ra);
                     continue;
@@ -1622,13 +1939,13 @@ int main(int argc, char** argv) {
                             ', pc: 0x' + ($2).toString(16) + ')\x1b[0m\r\n');
                     }
                 }, e.what(), (uint32_t)e.data(), (uint32_t)machine.cpu.pc());
-                std::cerr << "[friscy] Fatal exception, exiting with code 1\n";
+                dbg_cerr << "[friscy] Fatal exception, exiting with code 1\n";
                 return 1;
 #else
                 throw;
 #endif
             } catch (const std::exception& e) {
-                std::cerr << "[friscy] std::exception: " << e.what()
+                dbg_cerr << "[friscy] std::exception: " << e.what()
                           << " pc=0x" << std::hex << machine.cpu.pc() << std::dec << "\n";
                 return 1;
             }
@@ -1642,49 +1959,74 @@ int main(int argc, char** argv) {
         }
 #endif
 
-        std::cout << "----------------------------------------\n";
+        dbg_cout << "----------------------------------------\n";
 
         // Report results
         auto [instructions, _] = machine.get_counters();
         auto exit_code = machine.return_value();
 
-        std::cout << "[friscy] Execution complete\n";
-        std::cout << "[friscy] Instructions: " << instructions << "\n";
-        std::cout << "[friscy] Exit code: " << exit_code << "\n";
+        dbg_cout << "[friscy] Execution complete\n";
+        dbg_cout << "[friscy] Instructions: " << instructions << "\n";
+        dbg_cout << "[friscy] Exit code: " << exit_code << "\n";
 
         // Export VFS as tar if requested
         if (!export_tar_path.empty()) {
-            std::cout << "[friscy] Exporting VFS to tar: " << export_tar_path << "\n";
+            dbg_cout << "[friscy] Exporting VFS to tar: " << export_tar_path << "\n";
             auto tar_data = g_vfs.save_tar();
             std::ofstream out(export_tar_path, std::ios::binary);
             if (!out) {
-                std::cerr << "Error: Could not open export tar path: " << export_tar_path << "\n";
+                dbg_cerr << "Error: Could not open export tar path: " << export_tar_path << "\n";
+                emit_perf_metrics(&machine, 1, false, "tar-export-failed");
                 return 1;
             }
             out.write(reinterpret_cast<const char*>(tar_data.data()), tar_data.size());
-            std::cout << "[friscy] Exported " << tar_data.size() << " bytes\n";
+            dbg_cout << "[friscy] Exported " << tar_data.size() << " bytes\n";
         }
 
+        emit_perf_metrics(&machine, static_cast<int>(exit_code), true, "completed");
         return static_cast<int>(exit_code);
 
     } catch (const riscv::MachineException& e) {
-        std::cerr << "\n[friscy] Machine exception: " << e.what();
+        const std::string what = e.what();
+        const bool is_ebreak = what.find("EBREAK") != std::string::npos;
+        const bool is_sigill = what.find("SIGILL") != std::string::npos || what.find("Illegal instruction") != std::string::npos;
+        dbg_cerr << "\n[friscy] Machine exception: " << e.what();
+        if (!machine_ptr) {
+            dbg_cerr << "\n[friscy] Machine not initialized (construction failed)\n";
+            return 1;
+        }
         if (e.data() != 0) {
-            std::cerr << " (data: 0x" << std::hex << e.data() << std::dec << ")";
+            dbg_cerr << " (data: 0x" << std::hex << e.data() << std::dec << ")";
         }
         auto crash_pc = machine_ptr->cpu.pc();
-        std::cerr << "\n  PC=0x" << std::hex << crash_pc << std::dec << "\n";
+        dbg_cerr << "\n  PC=0x" << std::hex << crash_pc << std::dec << "\n";
+        if (is_ebreak || is_sigill) {
+            auto ra = machine_ptr->cpu.reg(riscv::REG_RA);
+            dbg_cerr << "  Symbolized: " << (is_ebreak ? "EBREAK" : "SIGILL")
+                     << " @ " << format_callsite_symbol(*machine_ptr, crash_pc)
+                     << " RA=" << std::hex << ra << " ("
+                     << format_callsite_symbol(*machine_ptr, ra) << std::dec << ")\n";
+        }
         // Try to read the actual memory at PC
         try {
             uint32_t mem_at_pc = machine_ptr->memory.template read<uint32_t>(crash_pc);
-            std::cerr << "  Memory at PC: 0x" << std::hex << mem_at_pc << std::dec << "\n";
+            dbg_cerr << "  Memory at PC: 0x" << std::hex << mem_at_pc << std::dec << "\n";
         } catch (...) {
-            std::cerr << "  Memory at PC: UNREADABLE (protection fault)\n";
+            dbg_cerr << "  Memory at PC: UNREADABLE (protection fault)\n";
         }
         // Print non-zero registers for context
         for (int r = 0; r < 32; r++) {
             if (machine_ptr->cpu.reg(r) != 0)
-                std::cerr << "  x" << r << "=0x" << std::hex << machine_ptr->cpu.reg(r) << std::dec << "\n";
+                dbg_cerr << "  x" << r << "=0x" << std::hex << machine_ptr->cpu.reg(r) << std::dec << "\n";
+        }
+        if (machine_ptr) {
+            emit_perf_metrics(machine_ptr.get(), 1, false, "machine-exception");
+        } else if (!perf_json_path.empty() || perf_stats) {
+            // Minimal fallback to avoid silent loss when machine construction failed.
+            std::ofstream json_out(perf_json_path);
+            if (json_out) {
+                json_out << "{\"status\":\"machine-exception\",\"completed\":false,\"exitCode\":1}\n";
+            }
         }
         // Try to read strings from registers that might be string pointers
         for (int r : {6, 10, 11, 13}) {
@@ -1697,13 +2039,21 @@ int main(int argc, char** argv) {
                         if (buf[i] == 0) break;
                         if (buf[i] < 32 && buf[i] != '\n' && buf[i] != '\t') { buf[i] = 0; break; }
                     }
-                    if (buf[0]) std::cerr << "  x" << r << " string: \"" << buf << "\"\n";
+                    if (buf[0]) dbg_cerr << "  x" << r << " string: \"" << buf << "\"\n";
                 } catch (...) {}
             }
         }
         return 1;
     } catch (const std::exception& e) {
-        std::cerr << "\n[friscy] Error: " << e.what() << "\n";
+        dbg_cerr << "\n[friscy] Error: " << e.what() << "\n";
+        if (machine_ptr) {
+            emit_perf_metrics(machine_ptr.get(), 1, false, "std-exception");
+        } else if (!perf_json_path.empty() || perf_stats) {
+            std::ofstream json_out(perf_json_path);
+            if (json_out) {
+                json_out << "{\"status\":\"std-exception\",\"completed\":false,\"exitCode\":1}\n";
+            }
+        }
         return 1;
     }
 }

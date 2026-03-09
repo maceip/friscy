@@ -8,16 +8,13 @@ FROM --platform=linux/riscv64 alpine:edge
 # Install Node.js, npm, build tools (tree-sitter needs C++ compiler)
 RUN apk add --no-cache nodejs nodejs-dev npm curl bash python3 make g++
 
-# Install Gemini CLI globally via npm
-RUN npm install -g @google/gemini-cli
-
-# Build hostfetch syscall addon for guest Node preload (/etc/https-hostfetch-preload.js).
-COPY tools/node_hostfetch_napi.c /tmp/node_hostfetch_napi.c
-RUN mkdir -p /usr/local/lib && \
-    gcc -shared -fPIC -O2 -o /usr/local/lib/hostfetch.node \
-      /tmp/node_hostfetch_napi.c \
-      -I/usr/include/node && \
-    rm -f /tmp/node_hostfetch_napi.c
+# Install Gemini CLI globally via npm with retries for flaky registry connectivity.
+RUN npm config set fetch-retries 6 && \
+    npm config set fetch-retry-factor 2 && \
+    npm config set fetch-retry-mintimeout 10000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 300000 && \
+    for i in 1 2 3 4 5; do npm install -g @google/gemini-cli && break; echo "retry gemini-cli install ($i)"; sleep 5; done
 
 # Strip non-riscv64 prebuilds (saves ~80MB)
 RUN find /usr/local/lib/node_modules/@google/gemini-cli -path "*/prebuilds/darwin-*" -exec rm -rf {} + 2>/dev/null; \
@@ -35,11 +32,6 @@ RUN find /usr/local/lib/node_modules/@google/gemini-cli -path "*/prebuilds/darwi
 
 # Clean up build tools to reduce image size
 RUN apk del python3 make g++ nodejs-dev && rm -rf /root/.npm /tmp/*
-
-# Add deterministic command-loop runners used by browser checkpoint ladders.
-COPY runtime/claude-repl.js /usr/local/bin/claude-repl.js
-COPY runtime/gemini-repl.js /usr/local/bin/gemini-repl.js
-RUN chmod +x /usr/local/bin/claude-repl.js /usr/local/bin/gemini-repl.js
 
 # Default shell
 CMD ["/bin/sh"]

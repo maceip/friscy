@@ -146,10 +146,8 @@ while (true) {
 
 INSTRUCTION(RV32I_BC_SYSTEM, rv32i_system) {
 	VIEW_INSTR();
-	if (instr.Itype.imm == 1) {
-		fprintf(stderr, "[SYSTEM-EBREAK] dispatch pc=0x%lx decoder_instr=0x%08x\n",
-				(long)pc, decoder->instr);
-	}
+	// CSR/SYSTEM instruction — suppress logging (fires millions of times for V8)
+	(void)0;
 	// Make the current PC visible
 	REGISTERS().pc = pc;
 	// Make the instruction counters visible

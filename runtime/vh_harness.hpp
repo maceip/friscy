@@ -19,6 +19,14 @@
 #include <libriscv/machine.hpp>
 #include <cstring>
 #include <iostream>
+
+#ifndef dbg_cerr
+#ifdef FRISCY_QUIET
+#define dbg_cerr if(1) {} else std::cerr
+#else
+#define dbg_cerr std::cerr
+#endif
+#endif
 #include <cstdint>
 #include <sys/time.h>
 
@@ -63,7 +71,7 @@ extern "C" {
 #else
 // Native stubs
 #include <time.h>
-static long js_opfs_io(int, void*, size_t, int, long) { return -38; }
+static long js_opfs_io(int, void*, size_t, int, long) { return -9; } // EBADF: trigger fallback
 static long js_net_proxy(int, const char*, int, int, void*, size_t) { return -38; }
 static long js_dns_resolve(const char*, size_t, char*, size_t, int) { return -38; }
 static long js_compute_offload(int, void*, size_t, void*, size_t) { return -38; }
@@ -217,30 +225,45 @@ inline void install_stage2_async_handlers(Machine& machine) {
         m.set_result(js_opfs_io(0, (void*)path.c_str(), path.size(), 600, 0));
     });
 
+    // VH ecalls fall back to normal syscall handlers for non-VH fds.
+    // We store function pointers to avoid namespace lookup issues in lambdas.
+    static auto* fallback_write = Machine::syscall_handlers.at(64);   // sys_write
+    static auto* fallback_read = Machine::syscall_handlers.at(63);    // sys_read
+    static auto* fallback_close = Machine::syscall_handlers.at(57);   // sys_close
+    static auto* fallback_pread = Machine::syscall_handlers.at(67);   // sys_pread64
+
     // 601: write(fd, buf_ptr, count) -> bytes_written
     machine.install_syscall_handler(601, [](Machine& m) {
         auto [fd, buf_addr, len] = m.sysargs<int, addr_t, size_t>();
         auto* buf = m.memory.memarray<uint8_t>(buf_addr, len);
-        m.set_result(js_opfs_io(fd, buf, len, 601, 0));
+        auto rc = js_opfs_io(fd, buf, len, 601, 0);
+        if (rc == -9 && fallback_write) { fallback_write(m); return; }
+        m.set_result(rc);
     });
 
     // 602: read(fd, buf_ptr, count) -> bytes_read
     machine.install_syscall_handler(602, [](Machine& m) {
         auto [fd, buf_addr, len] = m.sysargs<int, addr_t, size_t>();
         auto* buf = m.memory.memarray<uint8_t>(buf_addr, len);
-        m.set_result(js_opfs_io(fd, buf, len, 602, 0));
+        auto rc = js_opfs_io(fd, buf, len, 602, 0);
+        if (rc == -9 && fallback_read) { fallback_read(m); return; }
+        m.set_result(rc);
     });
 
     // 603: close(fd) -> 0
     machine.install_syscall_handler(603, [](Machine& m) {
-        m.set_result(js_opfs_io(m.sysarg<int>(0), nullptr, 0, 603, 0));
+        auto rc = js_opfs_io(m.sysarg<int>(0), nullptr, 0, 603, 0);
+        if (rc == -9 && fallback_close) { fallback_close(m); return; }
+        m.set_result(rc);
     });
 
     // 604: pread(fd, buf_ptr, count, offset) -> bytes_read
     machine.install_syscall_handler(604, [](Machine& m) {
         auto [fd, buf_addr, len, off] = m.sysargs<int, addr_t, size_t, long>();
         auto* buf = m.memory.memarray<uint8_t>(buf_addr, len);
-        m.set_result(js_opfs_io(fd, buf, len, 604, off));
+        auto rc = js_opfs_io(fd, buf, len, 604, off);
+        if (rc == -9 && fallback_pread) { fallback_pread(m); return; }
+        m.set_result(rc);
     });
 
     // ------------------------------------------------------------------
@@ -312,7 +335,7 @@ inline void activate_stage2(Machine& machine) {
     install_stage2_async_handlers(machine);
     g_stage = Stage::Stage2AsyncEnabled;
     g_caps = VH_CAP_SYNC | VH_CAP_ASYNC;
-    std::cerr << "[vh] Stage 2 active (async paths enabled)\n";
+    dbg_cerr << "[vh] Stage 2 active (async paths enabled)\n";
 }
 
 // Registration entrypoint:
@@ -323,13 +346,13 @@ inline void setup_vh_harness(Machine& machine, bool enable_stage2 = true) {
     install_stage1_sync_handlers(machine);
     g_stage = Stage::Stage1SyncOnly;
     g_caps = VH_CAP_SYNC;
-    std::cerr << "[vh] Stage 1 active (sync-only)\n";
+    dbg_cerr << "[vh] Stage 1 active (sync-only)\n";
     if (enable_stage2) {
         activate_stage2(machine);
     } else {
-        std::cerr << "[vh] Stage 2 deferred (async paths disabled)\n";
+        dbg_cerr << "[vh] Stage 2 deferred (async paths disabled)\n";
     }
-    std::cerr << "[vh] VectorHeart harness ready (ecalls 600-803, 610)\n";
+    dbg_cerr << "[vh] VectorHeart harness ready (ecalls 600-803, 610)\n";
 }
 
 }  // namespace vh

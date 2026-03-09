@@ -6,20 +6,15 @@
 FROM --platform=linux/riscv64 alpine:edge
 
 # Keep image deterministic and small for repeated checkpoint runs.
-RUN apk add --no-cache nodejs nodejs-dev npm bash curl ca-certificates gcc musl-dev
+RUN apk add --no-cache nodejs npm bash curl ca-certificates
 
-# Deterministic command-loop runner used by browser ladders.
-COPY runtime/codex-repl.js /usr/local/bin/codex-repl.js
-RUN chmod +x /usr/local/bin/codex-repl.js
-
-# Build hostfetch syscall addon for guest Node preload (/etc/https-hostfetch-preload.js).
-COPY tools/node_hostfetch_napi.c /tmp/node_hostfetch_napi.c
-RUN mkdir -p /usr/local/lib && \
-    gcc -shared -fPIC -O2 -o /usr/local/lib/hostfetch.node \
-      /tmp/node_hostfetch_napi.c \
-      -I/usr/include/node && \
-    rm -f /tmp/node_hostfetch_napi.c && \
-    apk del gcc musl-dev nodejs-dev
+# Install Codex CLI globally so `codex` is present in interactive shells.
+RUN npm config set fetch-retries 6 && \
+    npm config set fetch-retry-factor 2 && \
+    npm config set fetch-retry-mintimeout 10000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 300000 && \
+    for i in 1 2 3 4 5; do npm install -g @openai/codex && break; echo "retry codex install ($i)"; sleep 5; done
 
 WORKDIR /root
 CMD ["/bin/sh"]

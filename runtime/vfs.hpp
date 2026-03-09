@@ -354,6 +354,9 @@ public:
         auto& fh = it->second;
         if (fh->entry->is_dir()) return -21;  // EISDIR
 
+        if (fh->offset >= fh->entry->content.size()) {
+            return 0;  // EOF
+        }
         size_t available = fh->entry->content.size() - fh->offset;
         size_t to_read = std::min(count, available);
 
@@ -844,11 +847,51 @@ private:
         return val;
     }
 
+    static std::string normalize_path_lexical(const std::string& path) {
+        if (path.empty()) return "/";
+
+        std::string abs_path = path;
+        if (!abs_path.starts_with("/")) abs_path = "/" + abs_path;
+
+        std::vector<std::string> parts;
+        size_t start = 1;
+        while (start < abs_path.size()) {
+            size_t end = abs_path.find('/', start);
+            if (end == std::string::npos) end = abs_path.size();
+            if (end > start) {
+                auto part = abs_path.substr(start, end - start);
+                if (part == ".") {
+                    // ignore
+                } else if (part == "..") {
+                    if (!parts.empty()) parts.pop_back();
+                } else {
+                    parts.push_back(std::move(part));
+                }
+            }
+            start = end + 1;
+        }
+
+        if (parts.empty()) return "/";
+        std::string out;
+        for (const auto& part : parts) {
+            out += "/";
+            out += part;
+        }
+        return out;
+    }
+
     std::string make_absolute(const std::string& path) {
-        if (path.empty()) return cwd_;
-        if (path[0] == '/') return path;
-        if (cwd_ == "/") return "/" + path;
-        return cwd_ + "/" + path;
+        std::string abs_path;
+        if (path.empty()) {
+            abs_path = cwd_;
+        } else if (path[0] == '/') {
+            abs_path = path;
+        } else if (cwd_ == "/") {
+            abs_path = "/" + path;
+        } else {
+            abs_path = cwd_ + "/" + path;
+        }
+        return normalize_path_lexical(abs_path);
     }
 
     std::shared_ptr<Entry> resolve_no_symlink(const std::string& path) {
@@ -887,13 +930,7 @@ private:
     }
 
     void insert_entry(const std::string& path, std::shared_ptr<Entry> entry) {
-        std::string abs_path = path;
-        if (!abs_path.starts_with("/")) abs_path = "/" + abs_path;
-
-        // Remove trailing slash
-        while (abs_path.size() > 1 && abs_path.back() == '/') {
-            abs_path.pop_back();
-        }
+        std::string abs_path = normalize_path_lexical(path);
 
         // Split into parent path and name
         size_t last_slash = abs_path.rfind('/');

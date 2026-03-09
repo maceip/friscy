@@ -18,6 +18,14 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#ifndef dbg_fprintf
+#ifdef FRISCY_QUIET
+#define dbg_fprintf(...) ((void)0)
+#else
+#define dbg_fprintf fprintf
+#endif
+#endif
 #include <string>
 
 namespace checkpoint {
@@ -167,7 +175,7 @@ inline std::vector<uint8_t> save_checkpoint(Machine& machine) {
     for (auto pn : exec_pages) {
         emit_val<uint64_t>(out, pn);
     }
-    fprintf(stderr, "[checkpoint] Saved %zu exec pages\n", exec_pages.size());
+    dbg_fprintf(stderr, "[checkpoint] Saved %zu exec pages\n", exec_pages.size());
 
     // --- Sparse arena data ---
     auto* arena = reinterpret_cast<const uint8_t*>(machine.memory.memory_arena_ptr());
@@ -220,7 +228,7 @@ inline std::vector<uint8_t> save_checkpoint(Machine& machine) {
     emit_val<uint64_t>(out, SENTINEL_ADDR);
     emit_val<uint64_t>(out, 0);
 
-    fprintf(stderr, "[checkpoint] Saved: %zu non-zero chunks, %zu bytes arena data, %zu bytes total\n",
+    dbg_fprintf(stderr, "[checkpoint] Saved: %zu non-zero chunks, %zu bytes arena data, %zu bytes total\n",
             chunks_written, total_data, out.size());
 
     return out;
@@ -235,7 +243,7 @@ inline void save_checkpoint_file(const std::vector<uint8_t>& data, const std::st
     size_t written = fwrite(data.data(), 1, data.size(), f);
     fclose(f);
     if (written != data.size()) throw std::runtime_error("checkpoint: write failed");
-    fprintf(stderr, "[checkpoint] Written %zu bytes to %s\n", data.size(), path.c_str());
+    dbg_fprintf(stderr, "[checkpoint] Written %zu bytes to %s\n", data.size(), path.c_str());
 }
 
 inline void save_checkpoint_file(Machine& machine, const std::string& path) {
@@ -316,7 +324,7 @@ inline void load_checkpoint(Machine& machine, const uint8_t* data, size_t size) 
                 inst.interests[fd] = {events, data};
             }
         }
-        fprintf(stderr, "[checkpoint] Restored %u epoll instances\n", num_epoll);
+        dbg_fprintf(stderr, "[checkpoint] Restored %u epoll instances\n", num_epoll);
     }
 
     // --- Eventfd counters ---
@@ -328,7 +336,7 @@ inline void load_checkpoint(Machine& machine, const uint8_t* data, size_t size) 
             uint64_t counter = r.read<uint64_t>();
             syscalls::g_eventfd_counters[fd] = counter;
         }
-        fprintf(stderr, "[checkpoint] Restored %u eventfd counters\n", num_eventfd);
+        dbg_fprintf(stderr, "[checkpoint] Restored %u eventfd counters\n", num_eventfd);
     }
 
     // --- Executable page list ---
@@ -358,7 +366,7 @@ inline void load_checkpoint(Machine& machine, const uint8_t* data, size_t size) 
         if (guest_addr == SENTINEL_ADDR) break;  // end of arena data
 
         if (guest_addr + len > arena_size) {
-            fprintf(stderr, "[checkpoint] WARNING: chunk at 0x%lx+%lu exceeds arena size %zu, skipping\n",
+            dbg_fprintf(stderr, "[checkpoint] WARNING: chunk at 0x%lx+%lu exceeds arena size %zu, skipping\n",
                     (unsigned long)guest_addr, (unsigned long)len, arena_size);
             // Skip this chunk's data
             if (r.remaining() >= len) r.p += len;
@@ -378,7 +386,7 @@ inline void load_checkpoint(Machine& machine, const uint8_t* data, size_t size) 
     for (auto pageno : exec_pages) {
         machine.memory.set_pageno_attr(pageno, exec_attr);
     }
-    fprintf(stderr, "[checkpoint] Restored %zu exec pages\n", exec_pages.size());
+    dbg_fprintf(stderr, "[checkpoint] Restored %zu exec pages\n", exec_pages.size());
 
     // --- Restore CPU state ---
     for (int i = 0; i < 32; i++)
@@ -410,9 +418,9 @@ inline void load_checkpoint(Machine& machine, const uint8_t* data, size_t size) 
     // --- Set stdin-wait flag so the main loop knows we're restored ---
     syscalls::g_waiting_for_stdin = true;
 
-    fprintf(stderr, "[checkpoint] Loaded: %zu chunks, %zu bytes arena data, pc=0x%lx\n",
+    dbg_fprintf(stderr, "[checkpoint] Loaded: %zu chunks, %zu bytes arena data, pc=0x%lx\n",
             chunks_read, total_data, (unsigned long)pc);
-    fprintf(stderr, "[checkpoint] mmap=0x%lx brk=0x%lx..0x%lx sched.count=%d\n",
+    dbg_fprintf(stderr, "[checkpoint] mmap=0x%lx brk=0x%lx..0x%lx sched.count=%d\n",
             (unsigned long)mmap_addr, (unsigned long)brk_base, (unsigned long)brk_current,
             syscalls::g_sched.count);
 }
@@ -430,7 +438,7 @@ inline void load_checkpoint_file(Machine& machine, const std::string& path) {
     size_t rd = fread(data.data(), 1, sz, f);
     fclose(f);
     if (static_cast<long>(rd) != sz) throw std::runtime_error("checkpoint: read failed");
-    fprintf(stderr, "[checkpoint] Read %ld bytes from %s\n", sz, path.c_str());
+    dbg_fprintf(stderr, "[checkpoint] Read %ld bytes from %s\n", sz, path.c_str());
     load_checkpoint(machine, data.data(), data.size());
 }
 

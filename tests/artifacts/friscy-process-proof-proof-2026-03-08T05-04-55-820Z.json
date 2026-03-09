@@ -1,0 +1,75 @@
+{
+  "ts": "2026-03-08T05:04:55.815Z",
+  "url": "http://127.0.0.1:9010/?example=gemini-tui&procdebug&nosw&cmd=(%2Fbin%2Fecho%20BOOTOK)%26%20wait",
+  "boot": {
+    "status": "Exited (0)",
+    "overlayHidden": true,
+    "terminalVisible": true,
+    "hasRows": true
+  },
+  "terminalText": "docker-in-browserfriscy fast risc-v runtime for the browser & wasmImage: friscy-alpine (436.2 MB)Network: VectorHeart (JSPI)Type 'sixel' to display a Sixel image./bin/sh: can't open '/dev/null': No such file or directoryProcess exited (code 0) ",
+  "processEventOverlayVisible": true,
+  "processEventOverlayText": "6:02:29 AM spawn pid=100 ppid=1 pgid=100 status=06:02:30 AM exit pid=100 ppid=1 pgid=100 status=26:02:31 AM wait_wakeup pid=100 ppid=1 pgid=100 status=2",
+  "processEvents": [
+    {
+      "kind": 1,
+      "kindName": "spawn",
+      "pid": 100,
+      "ppid": 1,
+      "pgid": 100,
+      "status": 0
+    },
+    {
+      "kind": 2,
+      "kindName": "exit",
+      "pid": 100,
+      "ppid": 1,
+      "pgid": 100,
+      "status": 2
+    },
+    {
+      "kind": 3,
+      "kindName": "wait_wakeup",
+      "pid": 100,
+      "ppid": 1,
+      "pgid": 100,
+      "status": 2
+    }
+  ],
+  "processEventsLive": [
+    {
+      "kind": 3,
+      "kindName": "wait_wakeup",
+      "pid": 100,
+      "ppid": 1,
+      "pgid": 100,
+      "status": 2
+    }
+  ],
+  "statusText": "Exited (0)",
+  "browserWindow": {
+    "hasStdinQueue": true,
+    "hasProcessLog": true,
+    "hasProcessEvents": true,
+    "jitStatsExists": true
+  },
+  "expectation": {
+    "command": "GEMINI_API_KEY=\"AIzaSyBJJMDH_1cOgRsc3YY2Efus-5Y304KB4us\" env | grep GEMINI_API_KEY; GEMINI_API_KEY=\"AIzaSyBJJMDH_1cOgRsc3YY2Efus-5Y304KB4us\" gemini -p \"Reply with exactly: GEMINI_OK\"; rc=$?; echo hi; echo RC:$rc",
+    "sawCommandOutput": false,
+    "sawProcessEvents": true,
+    "sawProcessEventFields": true,
+    "waitWakeStatuses": [
+      2
+    ],
+    "waitWakeStatusOk": false,
+    "devNullOpenErrorSeen": true,
+    "commandInjectionUsedQueue": true,
+    "boot": {
+      "status": "fast risc-v runtime for the browser & wasmnet: off",
+      "overlayHidden": true,
+      "terminalVisible": true,
+      "hasRows": true
+    },
+    "waitMs": 180000
+  }
+}

@@ -84,6 +84,19 @@ struct SyscallTrace {
 inline SyscallTrace g_syscall_ring[32] = {};
 inline int g_syscall_ring_idx = 0;
 inline int g_execve_trace_remaining_init = 0;
+inline uint64_t g_hot_mmap_trace_counter = 0;
+inline uint64_t g_hot_munmap_trace_counter = 0;
+inline bool g_trace_differential_syscalls = false;
+
+template <int W>
+static inline uint64_t hash_register_file(const Machine<W>& machine) {
+	uint64_t h = 1469598103934665603ull;
+	for (int i = 0; i < 32; i++) {
+		h ^= static_cast<uint64_t>(machine.cpu.reg(i));
+		h *= 1099511628211ull;
+	}
+	return h;
+}
 
 template <int W>
 inline void Machine<W>::system_call(size_t sysnum)
@@ -94,6 +107,26 @@ inline void Machine<W>::system_call(size_t sysnum)
 	entry.a1 = cpu.reg(REG_ARG0 + 1);
 	entry.a2 = cpu.reg(REG_ARG0 + 2);
 	entry.pc = cpu.pc();
+	const auto a3 = cpu.reg(REG_ARG0 + 3);
+	const auto a4 = cpu.reg(REG_ARG0 + 4);
+	const auto a5 = cpu.reg(REG_ARG0 + 5);
+	const auto pre_call_hash = g_trace_differential_syscalls ? hash_register_file(*this) : 0;
+
+	bool tracing = g_execve_trace_remaining_init > 0;
+	// Hot-loop trace sampling:
+	// musl mmap/munmap wrappers can execute in very tight allocator loops.
+	// Printing every syscall here dominates runtime and obscures real stalls.
+	if (tracing && sysnum == 222 && cpu.pc() == 0x18035938ULL) {
+		if ((++g_hot_mmap_trace_counter % 256) != 1) tracing = false;
+	}
+	if (tracing && sysnum == 215 && cpu.pc() == 0x18035a8aULL) {
+		if ((++g_hot_munmap_trace_counter % 256) != 1) tracing = false;
+	}
+	if (tracing) {
+		g_execve_trace_remaining_init--;
+		fprintf(stderr, "sys#%zu(0x%lx,0x%lx,0x%lx) pc=0x%lx",
+			sysnum, (long)entry.a0, (long)entry.a1, (long)entry.a2, (long)cpu.pc());
+	}
 
 	if (LIKELY(sysnum < syscall_handlers.size())) {
 		auto& handler = Machine::syscall_handlers[RISCV_SPECSAFE(sysnum)];
@@ -112,6 +145,25 @@ inline void Machine<W>::system_call(size_t sysnum)
 		on_unhandled_syscall(*this, sysnum);
 	}
 	entry.result = (int64_t)cpu.reg(REG_ARG0);
+	const auto post_call_hash = g_trace_differential_syscalls ? hash_register_file(*this) : 0;
+	if (g_trace_differential_syscalls) {
+		fprintf(stderr,
+			"[DIFF] sys=%zu pc=0x%lx a0=0x%lx a1=0x%lx a2=0x%lx a3=0x%lx a4=0x%lx a5=0x%lx ret=0x%llx pre_hash=0x%016llx post_hash=0x%016llx\n",
+			sysnum,
+			(long)entry.pc,
+			(long)entry.a0,
+			(long)entry.a1,
+			(long)entry.a2,
+			(long)a3,
+			(long)a4,
+			(long)a5,
+			(long long)entry.result,
+			(unsigned long long)pre_call_hash,
+			(unsigned long long)post_call_hash);
+	}
+	if (tracing) {
+		fprintf(stderr, " = %ld\n", (long)entry.result);
+	}
 	g_syscall_ring_idx++;
 }
 

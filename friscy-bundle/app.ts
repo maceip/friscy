@@ -5,7 +5,6 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { SearchAddon } from '@xterm/addon-search';
 import { ImageAddon } from '@xterm/addon-image';
 import { WebglAddon } from '@xterm/addon-webgl';
-import { FriscyNetworkBridge } from './network_bridge.js';
 
 // WebTransport bridge removed — VectorHeart hypercalls handle networking via JSPI
 // Go proxy server code retained in repo for reference
@@ -192,6 +191,7 @@ const CMD_IDLE = 0;
 const CMD_STDIN_REQUEST = 2;
 const CMD_STDIN_READY = 3;
 const CMD_EXIT = 4;
+const CMD_EXPORT_CHECKPOINT = 9;
 
 // Pending stdin bytes from terminal input
 const stdinQueue: number[] = [];
@@ -209,6 +209,63 @@ const stdinQueue2: number[] = [];
 (window as any).__friscyJitStats = null;
 (window as any).__friscyProcessEvents = [];
 (window as any).__friscyProcessEventLog = [];
+(window as any)._friscyAwaitStdinRequest = async (timeoutMs = 60000) => {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        if (controlView && Atomics.load(controlView, 0) === CMD_STDIN_REQUEST) return true;
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    return false;
+};
+
+async function exportLiveCheckpointUpload(filename = 'friscy-live.ckpt') {
+    if (!worker) throw new Error('Worker not initialized');
+    return await new Promise((resolve, reject) => {
+        const w = worker;
+        let settled = false;
+        const onMsg = async (e) => {
+            if (e.data?.type === 'checkpoint-exported-live') {
+                settled = true;
+                w.removeEventListener('message', onMsg);
+                try {
+                    const resp = await fetch('/__upload_checkpoint/' + encodeURIComponent(filename), {
+                        method: 'POST',
+                        body: e.data.data,
+                    });
+                    const json = await resp.json();
+                    if (!resp.ok || !json.ok) throw new Error(json.error || `upload failed ${resp.status}`);
+                    resolve(json);
+                } catch (err: any) {
+                    reject(err);
+                }
+            } else if (e.data?.type === 'checkpoint-export-error') {
+                settled = true;
+                w.removeEventListener('message', onMsg);
+                reject(new Error(e.data.message || 'checkpoint export failed'));
+            }
+        };
+        w.addEventListener('message', onMsg);
+
+        if (controlView) {
+            Atomics.store(controlView, 0, CMD_EXPORT_CHECKPOINT);
+            Atomics.notify(controlView, 0);
+            // Fallback: if resume loop is wedged, message path can still export.
+            setTimeout(() => {
+                if (!settled) w.postMessage({ type: 'export-checkpoint-live' });
+            }, 15000);
+        } else {
+            w.postMessage({ type: 'export-checkpoint-live' });
+        }
+
+        setTimeout(() => {
+            settled = true;
+            w.removeEventListener('message', onMsg);
+            reject(new Error('checkpoint export timeout'));
+        }, 600000);
+    });
+}
+
+(window as any)._friscyExportLiveCheckpointUpload = exportLiveCheckpointUpload;
 
 const jitWarmupHudEl = document.getElementById('jit-warmup-hud');
 const jitHudCompiledEl = document.getElementById('jit-hud-compiled');
@@ -1043,6 +1100,21 @@ async function main() {
         rootfs = await fetchWithProgress(rootfsUrl);
     }
 
+    // Load checkpoint if specified in manifest
+    let checkpointData: ArrayBuffer | null = null;
+    const checkpointUrl = exampleCfg.checkpoint;
+    if (checkpointUrl) {
+        try {
+            const resp = await fetch(checkpointUrl);
+            if (resp.ok) {
+                checkpointData = await resp.arrayBuffer();
+                console.log(`[friscy] Checkpoint loaded: ${(checkpointData.byteLength / 1048576).toFixed(1)} MB`);
+            }
+        } catch (e) {
+            console.warn('[friscy] Checkpoint load failed:', e);
+        }
+    }
+
     // Initialize runtime (indeterminate)
     setProgress(-1, 'Initializing runtime...', undefined);
 
@@ -1090,6 +1162,7 @@ async function main() {
         screenReaderMode: false,
     };
     term = new Terminal(termOptions as any);
+    (window as any)._friscyTerm = term;
     fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
 
@@ -1186,7 +1259,12 @@ async function main() {
         snapshotBtn.addEventListener('click', () => {
             if (!machineRunning || !worker) return;
             if (statusEl) statusEl.textContent = 'Saving memory snapshot...';
-            worker.postMessage({ type: 'export-checkpoint-live' });
+            if (controlView) {
+                Atomics.store(controlView, 0, CMD_EXPORT_CHECKPOINT);
+                Atomics.notify(controlView, 0);
+            } else {
+                worker.postMessage({ type: 'export-checkpoint-live' });
+            }
         });
     }
 
@@ -1217,6 +1295,7 @@ async function main() {
     controlView = new Int32Array(controlSab);
     stdoutView = new Int32Array(stdoutSab);
     stdoutBytes = new Uint8Array(stdoutSab);
+    (window as any)._friscyControlView = controlView;
 
     // Spawn Worker
     setProgress(-1, 'Starting worker...', undefined);
@@ -1239,6 +1318,8 @@ async function main() {
 
     const runtimeParams = new URLSearchParams(location.search);
     const jitCfg = readJitRuntimeConfig(runtimeParams);
+    const allowNetwork = runtimeParams.get('allowNetwork') !== '0';
+    const hostFetchProxy = runtimeParams.get('hostFetchProxy') || `${window.location.origin}/__host_fetch`;
     jitHudEnabled = jitCfg.jitHudEnabled;
     if (!jitHudEnabled && jitWarmupHudEl) {
         jitWarmupHudEl.classList.remove('visible');
@@ -1265,35 +1346,16 @@ async function main() {
         jitMarkovEnabled: jitCfg.jitMarkovEnabled,
         jitTripletEnabled: jitCfg.jitTripletEnabled,
         jitAwaitCompiler: jitCfg.jitAwaitCompiler,
+        allowNetwork,
+        hostFetchProxy,
     });
 
     await workerReady;
     installWorkerRuntimeHandler();
 
-    let proxyUrl = runtimeParams.get('proxy') || 'https://127.0.0.1:4433/connect';
-    let proxyCertHash = runtimeParams.get('certHash') || '420495844b05bced48fec238e550597011e64ef41df1d9fa8eaf3f7430be0d4b';
-    let netBridge = null;
-
-    if (activeExample === 'server') {
-        updateNetStatus('connecting to WebTransport proxy...');
-        netBridge = new FriscyNetworkBridge(proxyUrl, { certHash: proxyCertHash });
-        
-        // Let the worker interact with the net bridge by forwarding messages
-        // (netSab is already wired, but sometimes net_lane_worker handles it differently,
-        // we'll pass proxy info downstream just in case).
-        worker.postMessage({
-            type: 'net_proxy',
-            proxyUrl,
-            certHash: proxyCertHash
-        });
-
-        // The JSPI approach is overridden by the bridge when 'server' is used
-        term.writeln('\\x1b[32mNetwork: WebTransport Proxy via ' + proxyUrl + '\\x1b[0m');
-        updateNetStatus('WebTransport Connected');
-    } else {
-        // Network: VectorHeart hypercalls handle networking via JSPI (no proxy needed)
-        updateNetStatus('connected JSPI');
-    }
+    // Network: VectorHeart host hypercalls handle networking via JSPI.
+    // WebTransport proxy path is disabled.
+    updateNetStatus('connected JSPI');
 
     // Transition: hide overlay FIRST, then show + open terminals
     overlayEl?.classList.add('hidden');
@@ -1436,6 +1498,8 @@ async function main() {
     const envMap = new Map();
     for (const e of defaultEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
     for (const e of exampleEnv) { const k = e.split('=')[0]; envMap.set(k, e); }
+    const hostFetchBridge = `${window.location.protocol}//127.0.0.1:${window.location.port || '80'}/__host_fetch`;
+    envMap.set('FRISCY_HOST_FETCH', `FRISCY_HOST_FETCH=${hostFetchBridge}`);
     const envVars = [...envMap.values()];
     const envArgs = envVars.flatMap(e => ['--env', e]);
     const args = [...envArgs, '--rootfs', '/rootfs.tar', ...guestCmd];
@@ -1448,13 +1512,20 @@ async function main() {
     
     machineRunning = true;
 
-    // Send rootfs data + run command to worker
+    // Send rootfs data + checkpoint + run command to worker
     const rootfsArray = new Uint8Array(rootfs);
-    worker.postMessage({
+    const msg: Record<string, unknown> = {
         type: 'run',
         args,
         rootfsData: rootfsArray.buffer,
-    }, [rootfsArray.buffer]);
+    };
+    const transfers: ArrayBuffer[] = [rootfsArray.buffer];
+    if (checkpointData) {
+        const ckptArray = new Uint8Array(checkpointData);
+        msg.checkpointData = ckptArray.buffer;
+        transfers.push(ckptArray.buffer);
+    }
+    worker.postMessage(msg, transfers);
 
     // Give the WASM thread a moment to initialize before removing the progress screen
     setTimeout(() => {

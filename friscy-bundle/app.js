@@ -1043,6 +1043,21 @@ async function main() {
         rootfs = await fetchWithProgress(rootfsUrl);
     }
 
+    // Load checkpoint if specified in manifest
+    let checkpointData: ArrayBuffer | null = null;
+    const checkpointUrl = exampleCfg.checkpoint;
+    if (checkpointUrl) {
+        try {
+            const resp = await fetch(checkpointUrl);
+            if (resp.ok) {
+                checkpointData = await resp.arrayBuffer();
+                console.log(`[friscy] Checkpoint loaded: ${(checkpointData.byteLength / 1048576).toFixed(1)} MB`);
+            }
+        } catch (e) {
+            console.warn('[friscy] Checkpoint load failed:', e);
+        }
+    }
+
     // Initialize runtime (indeterminate)
     setProgress(-1, 'Initializing runtime...', undefined);
 
@@ -1448,13 +1463,20 @@ async function main() {
     
     machineRunning = true;
 
-    // Send rootfs data + run command to worker
+    // Send rootfs data + checkpoint + run command to worker
     const rootfsArray = new Uint8Array(rootfs);
-    worker.postMessage({
+    const msg: any = {
         type: 'run',
         args,
         rootfsData: rootfsArray.buffer,
-    }, [rootfsArray.buffer]);
+    };
+    const transfers = [rootfsArray.buffer];
+    if (checkpointData) {
+        const ckptArray = new Uint8Array(checkpointData);
+        msg.checkpointData = ckptArray.buffer;
+        transfers.push(ckptArray.buffer);
+    }
+    worker.postMessage(msg, transfers);
 
     // Give the WASM thread a moment to initialize before removing the progress screen
     setTimeout(() => {

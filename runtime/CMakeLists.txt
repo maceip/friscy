@@ -4,6 +4,8 @@ project(friscy CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(FRISCY_QUIET "Strip all debug/info logging at compile time" ON)
+
 # Apply -O3 + LTO globally so libriscv's interpreter hot path benefits too
 if(NOT EMSCRIPTEN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -flto -march=native -DNDEBUG")
@@ -91,6 +93,11 @@ add_definitions(-DRISCV_MAX_EXECUTE_SEGS=1024)
 # --- VH hypercall syscall range ---
 # VectorHeart harness uses ecalls 600-803. Default RISCV_SYSCALLS_MAX is 512.
 add_definitions(-DRISCV_SYSCALLS_MAX=1024)
+
+# --- Quiet mode: strip all debug/info logging ---
+if(FRISCY_QUIET)
+    add_definitions(-DFRISCY_QUIET)
+endif()
 
 # --- Add libriscv ---
 # libriscv is in ../vendor/libriscv (cloned by setup scripts)

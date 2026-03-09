@@ -213,32 +213,44 @@ mergeInto(LibraryManager.library, {
       host_ptr = Number(host_ptr); host_len = Number(host_len);
       ip_buf_ptr = Number(ip_buf_ptr); ip_buf_len = Number(ip_buf_len); port = Number(port);
       var hostname = UTF8ToString(host_ptr, host_len);
-
-      // Fast path: well-known hosts
-      var cache = {
-        'api.anthropic.com': '160.79.104.10',
-        'generativelanguage.googleapis.com': '142.250.80.106',
-        'api.openai.com': '104.18.6.192',
-        'httpbin.org': '34.198.16.126'
-      };
-
-      if (cache[hostname]) {
-        stringToUTF8(cache[hostname], ip_buf_ptr, ip_buf_len);
+      // IPv4 literal passthrough (no DNS roundtrip needed).
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
+        stringToUTF8(hostname, ip_buf_ptr, ip_buf_len);
         return 0;
       }
 
-      // Slow path: DNS-over-HTTPS via Cloudflare
-      var r = await fetch(
-        'https://cloudflare-dns.com/dns-query?name=' +
-          encodeURIComponent(hostname) + '&type=A',
-        { headers: { 'Accept': 'application/dns-json' } }
-      );
-      var data = await r.json();
-      if (data.Answer && data.Answer.length > 0) {
-        stringToUTF8(data.Answer[data.Answer.length - 1].data, ip_buf_ptr, ip_buf_len);
-        return 0;
+      // DNS-over-HTTPS: try Cloudflare first, then Google as fallback.
+      async function resolveA(url) {
+        var r = await fetch(url, { headers: { 'Accept': 'application/dns-json' } });
+        if (!r.ok) return null;
+        var data = await r.json();
+        if (!data || !data.Answer || !data.Answer.length) return null;
+        for (var i = 0; i < data.Answer.length; i++) {
+          var rec = data.Answer[i];
+          if (rec && rec.type === 1 && typeof rec.data === 'string') return rec.data;
+        }
+        return null;
       }
-      return -1;
+
+      var q = encodeURIComponent(hostname);
+      var ip = await resolveA('https://cloudflare-dns.com/dns-query?name=' + q + '&type=A');
+      if (!ip) {
+        ip = await resolveA('https://dns.google/resolve?name=' + q + '&type=A');
+      }
+      if (!ip) {
+        // Last-resort fallback for known API hosts when DoH is blocked.
+        var fallback = {
+          'api.anthropic.com': '160.79.104.10',
+          'generativelanguage.googleapis.com': '142.250.80.106',
+          'api.openai.com': '104.18.6.192',
+          'httpbin.org': '34.198.16.126'
+        };
+        ip = fallback[hostname] || null;
+      }
+      if (!ip) return -1;
+
+      stringToUTF8(ip, ip_buf_ptr, ip_buf_len);
+      return 0;
     } catch (e) {
       // SAFETY: Never throw into C++
       console.error('[vh] DNS error:', e);
@@ -260,7 +272,10 @@ mergeInto(LibraryManager.library, {
       var offset = 0;
       while (offset < l1) {
         var chunk = Math.min(l1 - offset, 65536);
-        crypto.getRandomValues(new Uint8Array(mem, p1 + offset, chunk));
+        // crypto.getRandomValues rejects SharedArrayBuffer views — copy out, fill, copy back
+        var tmp = new Uint8Array(chunk);
+        crypto.getRandomValues(tmp);
+        HEAPU8.set(tmp, p1 + offset);
         offset += chunk;
       }
       return l1;

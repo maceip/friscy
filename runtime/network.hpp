@@ -115,6 +115,7 @@ struct VSocket {
     bool connected;
     bool listening;
     bool nonblocking;
+    bool is_dns;             // UDP socket connected to port 53 (DNS)
 
 #ifndef __EMSCRIPTEN__
     int native_fd;           // Real socket fd for native builds
@@ -128,7 +129,8 @@ struct VSocket {
     std::function<void(const uint8_t*, size_t)> on_recv;
 
     VSocket() : fd(-1), domain(0), type(0), protocol(0),
-                connected(false), listening(false), nonblocking(false)
+                connected(false), listening(false), nonblocking(false),
+                is_dns(false)
 #ifndef __EMSCRIPTEN__
                 , native_fd(-1)
 #endif
@@ -143,6 +145,11 @@ public:
     NetworkContext() : next_fd_(SOCKET_FD_BASE) {}
 
     int create_socket(int domain, int type, int protocol) {
+        // Some guest libc paths pass AF_UNSPEC (0) before resolution settles.
+        // In webshell mode, treat that as IPv4 to avoid hard AFNOSUPPORT loops.
+        if (domain == 0) {
+            domain = af::INET;
+        }
         if (domain != af::INET && domain != af::INET6) {
             return err::AFNOSUPPORT;
         }
@@ -261,6 +268,9 @@ inline void sys_socket(Machine& m) {
         if (sock) sock->nonblocking = true;
     }
 
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.error("[net] socket domain=" + $0 + " type=" + $1 + " fd=" + $2); }, domain, type, result);
+#endif
     m.set_result(result);
 }
 
@@ -624,6 +634,19 @@ inline void sys_connect(Machine& m) {
     m.memory.memcpy_out(addr_data.data(), addr_ptr, addrlen);
 
 #ifdef __EMSCRIPTEN__
+    // Detect DNS: UDP socket connecting to port 53
+    if (sock->type == sock::DGRAM && addrlen >= sizeof(sockaddr_in)) {
+        auto* sa = (const sockaddr_in*)addr_data.data();
+        uint16_t port = __builtin_bswap16(sa->sin_port);
+        EM_ASM({ console.error("[dns-detect] connect UDP fd=" + $0 + " port=" + $1 + " type=" + $2); }, sockfd, (int)port, sock->type);
+        if (port == 53) {
+            sock->is_dns = true;
+            sock->connected = true;
+            m.set_result(0);
+            return;
+        }
+    }
+
     // Send connect request to JS bridge
     int result = EM_ASM_INT({
         if (typeof Module.onSocketConnect === 'function') {
@@ -681,11 +704,54 @@ inline void sys_sendto(Machine& m) {
         return;
     }
 
+    // Check dest_addr for port 53 (sendto without prior connect)
+    uint64_t dest_addr_ptr = m.template sysarg<uint64_t>(4);
+    uint32_t dest_addrlen = m.template sysarg<uint32_t>(5);
+    if (!sock->is_dns && sock->type == sock::DGRAM && dest_addr_ptr != 0 && dest_addrlen >= sizeof(sockaddr_in)) {
+        sockaddr_in dest_sa;
+        m.memory.memcpy_out(&dest_sa, dest_addr_ptr, sizeof(dest_sa));
+        if (__builtin_bswap16(dest_sa.sin_port) == 53) {
+            sock->is_dns = true;
+        }
+    }
+
     // Read data from guest memory
     std::vector<uint8_t> data(len);
     m.memory.memcpy_out(data.data(), buf_ptr, len);
 
 #ifdef __EMSCRIPTEN__
+    // DNS-over-HTTPS: intercept DNS queries on UDP port 53 sockets
+    if (sock->is_dns && len >= 12) {
+        EM_ASM({ console.error("[dns-doh] sendto DNS query fd=" + $0 + " len=" + $1); }, sockfd, (int)len);
+        // Pass raw DNS query to JS, which does synchronous DoH via Cloudflare
+        // and buffers the wire-format response for recvfrom
+        EM_ASM({
+            var qlen = Number($1);
+            var qptr = Number($0);
+            var sockfd = $2;
+            var qcopy = new Uint8Array(qlen);
+            qcopy.set(Module.HEAPU8.subarray(qptr, qptr + qlen));
+            if (!Module._dnsDoH) Module._dnsDoH = function(q, fd) {
+                var bin = "";
+                for (var j = 0; j < q.length; j++) bin += String.fromCharCode(q[j]);
+                var b = btoa(bin).replace(/[+]/g, "-").replace(/[/]/g, "_").replace(/[=]+/g, "");
+                var xhr = new XMLHttpRequest();
+                xhr.open("GET", "https://cloudflare-dns.com/dns-query?dns=" + b, false);
+                xhr.setRequestHeader("Accept", "application/dns-message");
+                xhr.responseType = "arraybuffer";
+                xhr.send();
+                if (xhr.status === 200 && xhr.response) {
+                    if (!Module._dnsResponses) Module._dnsResponses = {};
+                    Module._dnsResponses[fd] = new Uint8Array(xhr.response);
+                }
+            };
+            Module._dnsDoH(qcopy, sockfd);
+        }, data.data(), len, sockfd);
+
+        m.set_result((int64_t)len);
+        return;
+    }
+
     int result = EM_ASM_INT({
         if (typeof Module.onSocketSend === 'function') {
             const data = new Uint8Array(Module.HEAPU8.buffer, Number($1), Number($2));
@@ -726,6 +792,27 @@ inline void sys_recvfrom(Machine& m) {
     }
 
 #ifdef __EMSCRIPTEN__
+    // DNS-over-HTTPS: return buffered DoH response
+    if (sock->is_dns) {
+        int bytes_read = EM_ASM_INT({
+            if (!Module._dnsResponses) return 0;
+            var resp = Module._dnsResponses[$0];
+            if (!resp || resp.length === 0) return 0;
+            var copyLen = Math.min(resp.length, Number($2));
+            var dest = Number($1);
+            Module.HEAPU8.set(resp.subarray(0, copyLen), dest);
+            delete Module._dnsResponses[$0];
+            return copyLen;
+        }, sockfd, buf_ptr, len);
+
+        if (bytes_read > 0) {
+            m.set_result(bytes_read);
+        } else {
+            m.set_result(-11);  // EAGAIN
+        }
+        return;
+    }
+
     // First check C++ side buffer (may have been filled by previous JS drain)
     if (!sock->recv_buffer.empty()) {
         size_t to_copy = std::min(len, sock->recv_buffer.size());

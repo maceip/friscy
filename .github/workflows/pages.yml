@@ -3,7 +3,10 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [master]
-    paths: [friscy-bundle/**]
+    paths:
+      - friscy-bundle/**
+      - .github/workflows/pages.yml
+      - .gitattributes
   workflow_dispatch:
 
 permissions:
@@ -24,6 +27,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: true
+
+      - name: Validate LFS files are resolved (not pointer stubs)
+        run: |
+          echo "Checking that all LFS-tracked files in friscy-bundle/ are resolved..."
+          fail=0
+          for f in $(git lfs ls-files -n | grep '^friscy-bundle/'); do
+            if head -c 40 "$f" | grep -q 'version https://git-lfs'; then
+              echo "ERROR: $f is an unresolved LFS pointer"
+              fail=1
+            else
+              size=$(stat --format=%s "$f")
+              echo "OK: $f ($size bytes)"
+            fi
+          done
+          if [ "$fail" -eq 1 ]; then
+            echo ""
+            echo "Deploy blocked: LFS files were not resolved."
+            echo "Run 'git lfs pull' and re-push, or check LFS bandwidth."
+            exit 1
+          fi
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

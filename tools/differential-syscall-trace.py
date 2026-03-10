@@ -9,12 +9,14 @@ Usage:
   python3 tools/differential-syscall-trace.py \
     --friscy-rootfs /path/to/rootfs \
     --qemu-rootfs /path/to/rootfs \
-    --guest-cmd "/bin/bash -lc 'echo pre; node -e \"console.log(\\\"node-ok\\\")\"; echo post'"
+    --guest-cmd "/bin/bash -lc 'echo pre; node -e \"console.log(\\\"node-ok\\\")\"; echo post'" \
+    --qemu-rootfs-entry-mode host
   python3 tools/differential-syscall-trace.py \
     --differential-tag repro-node-mmap \
     --friscy-rootfs /path/to/rootfs \
     --qemu-rootfs /path/to/rootfs \
     --guest-cmd "/bin/bash -lc 'echo pre; node -e \"console.log(\\\"node-ok\\\")\"; echo post'"
+    --qemu-rootfs-entry-mode guest
 """
 
 from __future__ import annotations
@@ -500,9 +502,10 @@ def parse_qemu(text: str) -> List[QEvent]:
 
 
 def run_command(label: str, cmd: str, timeout: Optional[int], cwd: Optional[str]) -> Tuple[str, int]:
+    argv: List[str] = cmd if isinstance(cmd, list) else shlex.split(cmd)
     proc = subprocess.run(
-        cmd,
-        shell=True,
+        argv,
+        shell=False,
         text=True,
         capture_output=True,
         cwd=cwd,
@@ -633,7 +636,57 @@ def _validate_friscy_rootfs(path: Path) -> None:
         raise RuntimeError(f"--friscy-rootfs is not a file: {path}")
 
 
-def _validate_qemu_rootfs(path: Path, guest_argv: Sequence[str]) -> None:
+def _qemu_entry_for_checking(
+    entry: str,
+    qemu_rootfs: Path,
+    host_entry_mode: bool,
+) -> str:
+    if not host_entry_mode:
+        return entry
+    if not entry.startswith("/"):
+        return entry
+    if entry.startswith(str(qemu_rootfs)):
+        try:
+            rel = Path(entry).resolve(strict=False).relative_to(qemu_rootfs.resolve(strict=False))
+            return "/" + "/".join(rel.parts)
+        except ValueError:
+            return entry
+    return "/" + entry.lstrip("/")
+
+
+def _qemu_entry_for_launch(
+    entry: str,
+    qemu_rootfs: Path,
+    host_entry_mode: bool,
+) -> str:
+    if not host_entry_mode:
+        return entry
+    if not entry.startswith("/"):
+        return entry
+    if entry.startswith(str(qemu_rootfs)):
+        return entry
+    return str(qemu_rootfs / entry.lstrip("/"))
+
+
+def _normalize_node_path_for_qemu_rootfs(
+    node_path: str,
+    qemu_rootfs: Path,
+    host_entry_mode: bool,
+) -> str:
+    if not host_entry_mode:
+        return node_path
+    if not node_path.startswith("/"):
+        return node_path
+    if node_path.startswith(str(qemu_rootfs)):
+        try:
+            rel = Path(node_path).resolve(strict=False).relative_to(qemu_rootfs.resolve(strict=False))
+            return "/" + "/".join(rel.parts)
+        except ValueError:
+            return node_path
+    return node_path
+
+
+def _validate_qemu_rootfs(path: Path, guest_argv: Sequence[str], host_entry_mode: bool) -> None:
     if not path.exists():
         raise RuntimeError(f"--qemu-rootfs path does not exist: {path}")
     if _looks_like_rootfs_archive(path):
@@ -646,7 +699,7 @@ def _validate_qemu_rootfs(path: Path, guest_argv: Sequence[str]) -> None:
     if not path.is_dir():
         raise RuntimeError(f"--qemu-rootfs is not a directory: {path}")
 
-    guest_entry = guest_argv[0]
+    guest_entry = _qemu_entry_for_checking(guest_argv[0], path, host_entry_mode)
     if guest_entry.startswith("/"):
         guest_path = path / guest_entry.lstrip("/")
         if not guest_path.exists():
@@ -670,7 +723,12 @@ def _validate_qemu_rootfs(path: Path, guest_argv: Sequence[str]) -> None:
         )
 
 
-def _validate_node_path_for_guest_cmd(cmd: str, qemu_rootfs: Path, node_path: Optional[str]) -> str:
+def _validate_node_path_for_guest_cmd(
+    cmd: str,
+    qemu_rootfs: Path,
+    node_path: Optional[str],
+    host_entry_mode: bool,
+) -> str:
     if not _guest_cmd_mentions_node(cmd):
         return cmd
 
@@ -683,12 +741,15 @@ def _validate_node_path_for_guest_cmd(cmd: str, qemu_rootfs: Path, node_path: Op
                 "Use a rootfs that includes a node binary."
             )
         requested = candidates[0]
-    elif not (qemu_rootfs / requested.lstrip("/")).exists():
-        raise RuntimeError(
-            f"requested --node-path '{requested}' was not found in qemu rootfs {qemu_rootfs}"
-        )
+    else:
+        requested = _normalize_node_path_for_qemu_rootfs(requested, qemu_rootfs, host_entry_mode)
+        if not (qemu_rootfs / requested.lstrip("/")).exists():
+            raise RuntimeError(
+                f"requested --node-path '{requested}' was not found in qemu rootfs {qemu_rootfs}"
+            )
 
-    return _apply_node_path(cmd, requested)
+    replacement = _normalize_node_path_for_qemu_rootfs(requested, qemu_rootfs, host_entry_mode=host_entry_mode)
+    return _apply_node_path(cmd, replacement)
 
 
 def _normalize_command(cmd: str) -> str:
@@ -737,6 +798,8 @@ def preset_invocation(args: argparse.Namespace, friscy_cmd: str, qemu_cmd: str) 
             args.friscy_rootfs,
             "--qemu-rootfs",
             args.qemu_rootfs,
+            "--qemu-rootfs-entry-mode",
+            args.qemu_rootfs_entry_mode,
             "--guest-cmd",
             args.guest_cmd,
         ]
@@ -810,12 +873,18 @@ def build_mode_commands(args: argparse.Namespace) -> tuple[str, str]:
         raise RuntimeError("--guest-cmd could not be parsed into arguments")
 
     _validate_friscy_rootfs(friscy_rootfs)
-    _validate_qemu_rootfs(qemu_rootfs, guest_argv)
-    effective_guest_cmd = _validate_node_path_for_guest_cmd(effective_guest_cmd, qemu_rootfs, node_path)
+    host_entry_mode = args.qemu_rootfs_entry_mode == "host"
+    effective_guest_cmd = _validate_node_path_for_guest_cmd(
+        effective_guest_cmd,
+        qemu_rootfs,
+        node_path,
+        host_entry_mode=host_entry_mode,
+    )
     guest_argv = shlex.split(effective_guest_cmd)
+    _validate_qemu_rootfs(qemu_rootfs, guest_argv, host_entry_mode=host_entry_mode)
 
     guest_entry = guest_argv[0]
-    qemu_guest_entry = guest_entry
+    qemu_guest_entry = _qemu_entry_for_launch(guest_entry, qemu_rootfs, host_entry_mode=host_entry_mode)
     qemu_guest_argv = [qemu_guest_entry, *guest_argv[1:]]
 
     quoted_friscy_rootfs = shlex.quote(str(friscy_rootfs))
@@ -851,6 +920,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--friscy-rootfs", help="Build Friscy command from a rootfs path")
     p.add_argument("--qemu-rootfs", help="Build qemu command from a rootfs path")
     p.add_argument("--guest-cmd", help="Guest command executed under rootfs mode, e.g. /bin/bash -lc 'echo hi'")
+    p.add_argument(
+        "--qemu-rootfs-entry-mode",
+        choices=("host", "guest"),
+        default="host",
+        help=(
+            "How qemu should invoke the rootfs entry when using --qemu-rootfs: "
+            "'host' prefixes qemu rootfs to the guest path; "
+            "'guest' passes entry paths unchanged."
+        ),
+    )
     p.add_argument("--node-path", help="Replace '/bin/node', '/usr/bin/node', or 'node' in command strings (rootfs + manual modes). Use 'auto' in rootfs mode to pick the first known node path in guest rootfs.")
     p.add_argument("--differential-tag", "--diff-tag", dest="differential_tag", help="Preset tag for reproducible launcher replay")
     p.add_argument("--friscy-bin", default="./build-native/friscy")

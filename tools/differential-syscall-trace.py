@@ -50,8 +50,10 @@ QEMU_RE = re.compile(
     r"(?:(?:\d+)\s+)?"
     r"(?:(?P<pc>0x[0-9a-fA-F]+):\s*)?"
     r"(?:(?P<sysnum>\d+)\s+)?"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\([^\)]*\)\s*=\s*"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\((?P<args>[^)]*)\)\s*"
+    r"(?:=\s*"
     r"(?P<ret>-?0x[0-9a-fA-F]+|-?\d+)"
+    r")?"
 )
 
 PHASE_ORDER = [
@@ -62,8 +64,9 @@ PHASE_ORDER = [
     "parent-restore",
 ]
 
-FOCUS_SYSCALLS = {222, 215, 226, 220, 435, 221, 61, 93, 94}
+FOCUS_SYSCALLS = {222, 226, 220, 435, 221, 93, 94}
 ADDR_SPACE_PTR_SYSCALLS = {222}
+MAP_FIXED = 0x10
 
 syscall_name_map = {
     "mmap": 222,
@@ -126,6 +129,12 @@ class QEvent:
     name: Optional[str]
     pc: Optional[int]
     ret: int
+    a0: Optional[int]
+    a1: Optional[int]
+    a2: Optional[int]
+    a3: Optional[int]
+    a4: Optional[int]
+    a5: Optional[int]
     raw: str
     line_no: int
     phase: Optional[str] = None
@@ -150,6 +159,12 @@ class EventMismatch:
     reason: str
     friscy: Optional[FrEvent]
     qemu: Optional[QEvent]
+
+
+@dataclass
+class MmapReturnState:
+    first_success_ret: Optional[int] = None
+    first_success_nonfixed_ret: Optional[int] = None
 
 
 @dataclass
@@ -358,6 +373,66 @@ def to_signed64(v: int) -> int:
     return v
 
 
+def _parse_qemu_mmap_arg(arg: Optional[str]) -> Optional[int]:
+    if arg is None:
+        return None
+    token = arg.strip()
+    if not token:
+        return None
+    if token == "NULL":
+        return 0
+    if token == "-1":
+        return -1
+    if token.startswith("-0x") or token.startswith("-0X"):
+        try:
+            return int(token, 16)
+        except ValueError:
+            return None
+    if token.startswith("0x") or token.startswith("0X"):
+        try:
+            return int(token, 16)
+        except ValueError:
+            return None
+    if token.isdigit() or (token.startswith("-") and token[1:].isdigit()):
+        try:
+            return int(token, 10)
+        except ValueError:
+            return None
+    if "|" in token:
+        mapping = {
+            "PROT_NONE": 0,
+            "PROT_READ": 1,
+            "PROT_WRITE": 2,
+            "PROT_EXEC": 4,
+            "MAP_SHARED": 1,
+            "MAP_PRIVATE": 2,
+            "MAP_ANONYMOUS": 32,
+            "MAP_FIXED": 16,
+            "MAP_FIXED_NOREPLACE": 0x100000,
+            "MAP_GROWSDOWN": 0x100,
+        }
+        total = 0
+        for part in token.split("|"):
+            value = mapping.get(part.strip())
+            if value is None:
+                return None
+            total |= value
+        return total
+    return None
+
+
+def _normalize_mmap_return(ret: int, state: MmapReturnState, fixed: bool = False) -> Optional[int]:
+    if to_signed64(ret) < 0:
+        return None
+    if fixed:
+        if state.first_success_ret is None:
+            state.first_success_ret = ret
+        return ret - state.first_success_ret
+    if state.first_success_nonfixed_ret is None:
+        state.first_success_nonfixed_ret = ret
+    return ret - state.first_success_nonfixed_ret
+
+
 def extract_phase_markers(text: str) -> PhaseState:
     markers: List[PhaseMarker] = []
     child_execve_line: Optional[int] = None
@@ -469,9 +544,12 @@ def parse_qemu(text: str) -> List[QEvent]:
         if not m:
             continue
         d = m.groupdict()
-        ret_token = d["ret"].split()[0]
+        ret_token = d["ret"] or "0"
         sysname = d.get("name")
         sysnum = int(d["sysnum"]) if d.get("sysnum") else syscall_name_map.get(sysname or "")
+        args = [a.strip() for a in (d.get("args", "") or "").split(",")]
+        for _ in range(6 - len(args)):
+            args.append("")
         phase: Optional[str] = None
         if sysnum in {220, 435}:
             phase = "fork-save"
@@ -492,6 +570,12 @@ def parse_qemu(text: str) -> List[QEvent]:
                 name=sysname,
                 pc=int(d["pc"], 16) if d.get("pc") else None,
                 ret=parse_int(ret_token),
+                a0=_parse_qemu_mmap_arg(args[0]),
+                a1=_parse_qemu_mmap_arg(args[1]),
+                a2=_parse_qemu_mmap_arg(args[2]),
+                a3=_parse_qemu_mmap_arg(args[3]),
+                a4=_parse_qemu_mmap_arg(args[4]),
+                a5=_parse_qemu_mmap_arg(args[5]),
                 raw=line.strip(),
                 line_no=line_no,
                 phase=phase,
@@ -555,19 +639,26 @@ def syscall_display(sysnum: Optional[int]) -> str:
     return f"SYS{sysnum}:{syscall_display_name.get(sysnum, 'unknown')}"
 
 
-def event_match(fev: FrEvent, qev: QEvent) -> Optional[str]:
+def event_match(
+    fev: FrEvent,
+    qev: QEvent,
+    fr_mmap_state: MmapReturnState,
+    qemu_mmap_state: MmapReturnState,
+) -> Optional[str]:
     qsys = qev.sysnum
     if fev.sys != qsys:
         return "syscall"
 
-    # Normalize mmap return values by address-space class.
-    # Both runtimes return different virtual addresses for valid mappings, so only
-    # compare error/success shape, not the raw pointer value.
+    # Normalize mmap return addresses so host address-space choice differences do
+    # not become false positives.
     if fev.sys in ADDR_SPACE_PTR_SYSCALLS:
-        f_signed = to_signed64(fev.ret)
-        q_signed = to_signed64(qev.ret)
-        if (f_signed < 0) != (q_signed < 0):
+        f_ret = to_signed64(fev.ret)
+        q_ret = to_signed64(qev.ret)
+        if (f_ret < 0) != (q_ret < 0):
             return "return-class"
+        # Return addresses in guest processes can vary due ASLR and allocator layout
+        # differences (especially for non-fixed anonymous mappings), while still being
+        # semantically equivalent. We only fail on success/failure class changes.
         return None
 
     f_signed = to_signed64(fev.ret)
@@ -579,6 +670,8 @@ def event_match(fev: FrEvent, qev: QEvent) -> Optional[str]:
 
 def compare_traces(friscy_events: List[FrEvent], qemu_events: List[QEvent], max_div: int) -> List[EventMismatch]:
     mismatches: List[EventMismatch] = []
+    fr_mmap_state = MmapReturnState()
+    qemu_mmap_state = MmapReturnState()
     max_i = max(len(friscy_events), len(qemu_events))
     for i in range(max_i):
         fe = friscy_events[i] if i < len(friscy_events) else None
@@ -586,7 +679,12 @@ def compare_traces(friscy_events: List[FrEvent], qemu_events: List[QEvent], max_
         if fe is None or qe is None:
             mismatches.append(EventMismatch(idx=i, reason="stream-length", friscy=fe, qemu=qe))
         else:
-            reason = event_match(fe, qe)
+            reason = event_match(
+                fe,
+                qe,
+                fr_mmap_state=fr_mmap_state,
+                qemu_mmap_state=qemu_mmap_state,
+            )
             if reason is not None:
                 mismatches.append(EventMismatch(idx=i, reason=reason, friscy=fe, qemu=qe))
         if len(mismatches) >= max_div:

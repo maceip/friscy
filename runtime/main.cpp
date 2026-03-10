@@ -817,7 +817,9 @@ static void usage(const char* argv0) {
     dbg_cerr << "  --strace          Enable syscall trace logs.\n";
     dbg_cerr << "  --perf-stats      Enable compact mmap/munmap perf counters.\n";
     dbg_cerr << "  --perf-json FILE  Write perf stats as JSON to FILE.\n";
-    dbg_cerr << "  --safe-mode       Disable translation/cache and use libriscv mmap wrapper.\n";
+    dbg_cerr << "  --safe-mode       Disable translation/cache for deterministic execution.\n";
+    dbg_cerr << "  --disable-custom-mmap-wrapper\n"
+              << "                    Force passthrough to libriscv mmap handling.\n";
     dbg_cerr << "  --differential-syscall-trace\n";
     dbg_cerr << "                    Enable post-syscall register diff tracing.\n";
     dbg_cerr << "\nExamples:\n";
@@ -918,6 +920,10 @@ int main(int argc, char** argv) {
             syscalls::g_trace_countdown = 50000;
         } else if (!parsing_guest_args && strcmp(argv[i], "--safe-mode") == 0) {
             syscalls::g_safe_mode = true;
+        } else if (
+            !parsing_guest_args &&
+            strcmp(argv[i], "--disable-custom-mmap-wrapper") == 0
+        ) {
             syscalls::g_disable_custom_mmap_wrapper = true;
             syscalls::g_custom_mmap_bypass_pc = 0;
         } else if (!parsing_guest_args && strcmp(argv[i], "--differential-syscall-trace") == 0) {

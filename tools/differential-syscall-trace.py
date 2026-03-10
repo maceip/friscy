@@ -816,8 +816,6 @@ def build_mode_commands(args: argparse.Namespace) -> tuple[str, str]:
 
     guest_entry = guest_argv[0]
     qemu_guest_entry = guest_entry
-    if guest_entry.startswith("/"):
-        qemu_guest_entry = str(qemu_rootfs / guest_entry.lstrip("/"))
     qemu_guest_argv = [qemu_guest_entry, *guest_argv[1:]]
 
     quoted_friscy_rootfs = shlex.quote(str(friscy_rootfs))

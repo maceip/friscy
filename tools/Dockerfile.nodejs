@@ -1,0 +1,21 @@
+# Dockerfile.nodejs - Build riscv64 Alpine rootfs with Node.js (musl-linked)
+#
+# The previous nodejs.tar was glibc-linked and missing /lib/ld-linux-riscv64-lp64d.so.1,
+# which broke browser execution. This Alpine build uses musl, matching the runtime's
+# dynamic linker expectations (ld-musl-riscv64.so.1).
+#
+# Usage:
+#   docker buildx build --platform linux/riscv64 -f tools/Dockerfile.nodejs -t friscy-node-rv64 . --load
+#   docker create --name tmp friscy-node-rv64
+#   docker export tmp > friscy-bundle/nodejs.tar
+#   docker rm tmp
+
+FROM --platform=linux/riscv64 alpine:edge
+
+RUN apk add --no-cache \
+    nodejs \
+    npm \
+    bash \
+    ca-certificates
+
+CMD ["/bin/sh"]

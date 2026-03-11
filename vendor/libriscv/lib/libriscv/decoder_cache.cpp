@@ -360,8 +360,9 @@ namespace riscv
 		// Get a base address relative pointer to the decoder cache
 		// Eg. exec_decoder[pbase] is the first entry in the decoder cache
 		// so that PC with a simple shift can be used as a direct index.
-		auto* exec_decoder = 
-			decoder_cache[0].get_base() - pbase / DecoderCache<W>::DIVISOR;
+		auto* exec_decoder = reinterpret_cast<DecoderData<W>*>(
+			reinterpret_cast<uintptr_t>(decoder_cache[0].get_base()) -
+			static_cast<uintptr_t>(pbase / DecoderCache<W>::DIVISOR) * sizeof(DecoderData<W>));
 		exec.set_decoder(exec_decoder);
 
 		DecoderData<W> invalid_op;

@@ -1486,8 +1486,19 @@ async function main() {
     // Build args
     const entrypoint = exampleCfg.entrypoint || manifest.entrypoint;
     let guestCmd = Array.isArray(entrypoint) ? [...entrypoint] : entrypoint.split(' ').filter(s => s);
+    const argvOverride = runtimeParams.get('argv');
     const commandOverride = runtimeParams.get('cmd');
-    if (commandOverride) {
+    if (argvOverride) {
+        try {
+            const parsed = JSON.parse(argvOverride);
+            if (!Array.isArray(parsed) || parsed.some((v) => typeof v !== 'string')) {
+                throw new Error('argv must be a JSON string array');
+            }
+            guestCmd = [...parsed];
+        } catch (err) {
+            throw new Error(`Invalid argv override: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    } else if (commandOverride) {
         guestCmd = ['/bin/sh', '-lc', commandOverride];
     }
     if (guestCmd.length === 1 && (guestCmd[0] === '/bin/bash' || guestCmd[0] === 'bash')) {

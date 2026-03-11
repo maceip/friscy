@@ -29,7 +29,9 @@ namespace riscv
 		}
 
 		auto* exec_data(address_t pc = 0) const noexcept {
-			return m_exec_pagedata.get() - m_exec_pagedata_base + pc;
+			const uintptr_t base = reinterpret_cast<uintptr_t>(m_exec_pagedata.get());
+			const uintptr_t adjusted = base - static_cast<uintptr_t>(m_exec_pagedata_base) + static_cast<uintptr_t>(pc);
+			return reinterpret_cast<uint8_t*>(adjusted);
 		}
 
 		address_t exec_begin() const noexcept { return m_vaddr_begin; }

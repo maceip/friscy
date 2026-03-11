@@ -98,6 +98,14 @@ enum : uint32_t {
 static uint32_t g_last_fault_kind = FRISCY_FAULT_NONE;
 static uint32_t g_last_fault_pc = 0;
 static uint32_t g_last_fault_data = 0;
+static uint32_t g_startup_stage = 0;
+static uint32_t g_pre_run_pc = 0;
+static uint32_t g_pre_run_exec_begin = 0;
+static uint32_t g_pre_run_exec_empty = 0;
+static uint32_t g_pre_run_pc_page_flags = 0;
+static uint8_t g_debug_guest_bytes[16] = {};
+static uint8_t g_debug_exec_bytes[16] = {};
+static uint32_t g_debug_pc_bytes_mask = 0;
 
 static inline uint32_t current_stop_reason_mask() {
     uint32_t mask = syscalls::STOP_REASON_NONE;
@@ -193,10 +201,59 @@ EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_fault_pc() {
 EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_fault_data() {
     return g_last_fault_data;
 }
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_startup_stage() {
+    return g_startup_stage;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_pre_run_pc() {
+    return g_pre_run_pc;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_pre_run_exec_begin() {
+    return g_pre_run_exec_begin;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_pre_run_exec_empty() {
+    return g_pre_run_exec_empty;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_pre_run_pc_page_flags() {
+    return g_pre_run_pc_page_flags;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_elf_loader_stage() {
+    return dynlink::g_elf_loader_debug_stage;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_elf_loader_vaddr() {
+    return (uint32_t)dynlink::g_elf_loader_debug_vaddr;
+}
 EMSCRIPTEN_KEEPALIVE void friscy_clear_last_fault() {
     g_last_fault_kind = FRISCY_FAULT_NONE;
     g_last_fault_pc = 0;
     g_last_fault_data = 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_capture_pc_bytes() {
+    std::memset(g_debug_guest_bytes, 0, sizeof(g_debug_guest_bytes));
+    std::memset(g_debug_exec_bytes, 0, sizeof(g_debug_exec_bytes));
+    g_debug_pc_bytes_mask = 0;
+    if (!g_machine) return 0;
+    const uint64_t pc = g_machine->cpu.pc();
+    try {
+        g_machine->memory.memcpy_out(g_debug_guest_bytes, pc, sizeof(g_debug_guest_bytes));
+        g_debug_pc_bytes_mask |= 1u;
+    } catch (...) {}
+    try {
+        auto& exec_seg = g_machine->memory.exec_segment_for(pc);
+        if (exec_seg && !exec_seg->empty() && exec_seg->is_within(pc, sizeof(g_debug_exec_bytes))) {
+            const uint8_t* exec_ptr = exec_seg->exec_data(pc);
+            if (exec_ptr != nullptr) {
+                std::memcpy(g_debug_exec_bytes, exec_ptr, sizeof(g_debug_exec_bytes));
+                g_debug_pc_bytes_mask |= 2u;
+            }
+        }
+    } catch (...) {}
+    return g_debug_pc_bytes_mask;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_pc_guest_bytes_ptr() {
+    return (uint32_t)(uintptr_t)g_debug_guest_bytes;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_pc_exec_bytes_ptr() {
+    return (uint32_t)(uintptr_t)g_debug_exec_bytes;
 }
 
 // Called from JS when a protection fault escapes C++ try/catch (WASM tail-call
@@ -1410,10 +1467,12 @@ int main(int argc, char** argv) {
         }
 #endif
         auto& machine = *machine_ptr;
+        g_startup_stage = 10;
         dbg_cout << "[friscy-debug] Machine constructed (pc=0x"
                   << std::hex << machine.cpu.pc() << std::dec << ")\n";
         syscalls::install_live_mmap_page_fault_handler(machine);
-        if (exec_info.type == elf::ET_DYN) {
+        if (exec_info.type == elf::ET_DYN && machine.memory.uses_flat_memory_arena()) {
+            g_startup_stage = 20;
             const auto [exec_lo, exec_hi] = elf::get_load_range(binary);
             const uint64_t entry_addr = machine.memory.start_address();
             const uint64_t mapped_lo = entry_addr - (exec_info.entry_point - exec_lo);
@@ -1422,6 +1481,7 @@ int main(int argc, char** argv) {
             // Recopy the main ELF segments at the same mapped base so GOT/data
             // contents come from the file image before the interpreter runs.
             dynlink::load_elf_segments(machine, binary, mapped_lo);
+            g_startup_stage = 21;
             const auto* ehdr = reinterpret_cast<const elf::Elf64_Ehdr*>(binary.data());
             const uint64_t load_bias = mapped_lo - exec_lo;
             size_t phoff = ehdr->e_phoff;
@@ -1445,6 +1505,7 @@ int main(int argc, char** argv) {
 
         // If dynamic, also load the interpreter at a high address
         if (use_dynamic_linker) {
+            g_startup_stage = 30;
             // Load interpreter within the 2GB encompassing arena (2^31).
             // Place at 384MB mark, above heap/mmap but within arena.
             interp_base = 0x18000000;
@@ -1453,6 +1514,7 @@ int main(int argc, char** argv) {
 
             // Load interpreter segments
             dynlink::load_elf_segments(machine, interp_binary, interp_base);
+            g_startup_stage = 31;
 
             // Update interpreter entry point with base offset
             uint64_t interp_entry = interp_info.entry_point;
@@ -1502,8 +1564,10 @@ int main(int argc, char** argv) {
             }
 
             // We'll jump to interpreter's entry point instead of main binary's
+            g_startup_stage = 32;
             machine.cpu.jump(interp_entry);
         }
+        g_startup_stage = 40;
 
         // Save execution context for execve support (clone+execve needs
         // to reload segments and set up a fresh stack for the new process)
@@ -1827,6 +1891,23 @@ int main(int argc, char** argv) {
 #ifdef __EMSCRIPTEN__
         g_machine = &machine;
 #endif
+        if (!machine.cpu.current_execute_segment().empty()
+            && !machine.cpu.current_execute_segment().is_within(machine.cpu.pc())) {
+            dbg_cout << "[friscy] Evicting stale startup execute segment at 0x"
+                     << std::hex << machine.cpu.current_execute_segment().exec_begin()
+                     << " for pc=0x" << machine.cpu.pc() << std::dec << "\n";
+            machine.memory.evict_execute_segments();
+        }
+        g_pre_run_pc = (uint32_t)machine.cpu.pc();
+        g_pre_run_exec_begin = (uint32_t)machine.cpu.current_execute_segment().exec_begin();
+        g_pre_run_exec_empty = machine.cpu.current_execute_segment().empty() ? 1u : 0u;
+        g_pre_run_pc_page_flags = 0;
+        try {
+            const auto& page = machine.memory.get_pageno(machine.cpu.pc() / 4096ULL);
+            if (page.attr.read)  g_pre_run_pc_page_flags |= 1u;
+            if (page.attr.write) g_pre_run_pc_page_flags |= 2u;
+            if (page.attr.exec)  g_pre_run_pc_page_flags |= 4u;
+        } catch (...) {}
         // Run! The machine may stop for several reasons:
         // 1. Program exit (natural end)
         // 2. Stdin wait (g_waiting_for_stdin — JS calls friscy_resume)

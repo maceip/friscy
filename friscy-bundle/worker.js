@@ -574,10 +574,38 @@ function getRuntimeStateSnapshot() {
     const pc = (typeof emModule?._friscy_get_pc === 'function')
         ? (emModule._friscy_get_pc() >>> 0)
         : 0;
+    const startupStage = (typeof emModule?._friscy_get_startup_stage === 'function')
+        ? (emModule._friscy_get_startup_stage() >>> 0)
+        : 0;
+    const elfLoaderStage = (typeof emModule?._friscy_get_elf_loader_stage === 'function')
+        ? (emModule._friscy_get_elf_loader_stage() >>> 0)
+        : 0;
+    const elfLoaderVaddr = (typeof emModule?._friscy_get_elf_loader_vaddr === 'function')
+        ? (emModule._friscy_get_elf_loader_vaddr() >>> 0)
+        : 0;
+    const preRunPc = (typeof emModule?._friscy_get_pre_run_pc === 'function')
+        ? (emModule._friscy_get_pre_run_pc() >>> 0)
+        : 0;
+    const preRunExecBegin = (typeof emModule?._friscy_get_pre_run_exec_begin === 'function')
+        ? (emModule._friscy_get_pre_run_exec_begin() >>> 0)
+        : 0;
+    const preRunExecEmpty = (typeof emModule?._friscy_get_pre_run_exec_empty === 'function')
+        ? !!(emModule._friscy_get_pre_run_exec_empty() >>> 0)
+        : false;
+    const preRunPcPageFlags = (typeof emModule?._friscy_get_pre_run_pc_page_flags === 'function')
+        ? (emModule._friscy_get_pre_run_pc_page_flags() >>> 0)
+        : 0;
     return {
         stopped,
         stopReason,
         pc,
+        startupStage,
+        elfLoaderStage,
+        elfLoaderVaddr,
+        preRunPc,
+        preRunExecBegin,
+        preRunExecEmpty,
+        preRunPcPageFlags,
         fault: getRuntimeFaultInfo(),
         processExitStatus: lastProcessExitStatus,
         processWaitWakeStatus: lastProcessWaitWakeStatus,
@@ -590,6 +618,31 @@ function logRuntimeState(prefix) {
     } catch (e) {
         console.log(`${prefix} <state-unavailable:${e?.message || e}>`);
     }
+}
+
+function getPcByteSnapshot() {
+    if (typeof emModule?._friscy_capture_pc_bytes !== 'function'
+        || typeof emModule?._friscy_pc_guest_bytes_ptr !== 'function'
+        || typeof emModule?._friscy_pc_exec_bytes_ptr !== 'function'
+        || !emModule?.HEAPU8) {
+        return null;
+    }
+    try {
+        const mask = emModule._friscy_capture_pc_bytes() >>> 0;
+        const guestPtr = emModule._friscy_pc_guest_bytes_ptr() >>> 0;
+        const execPtr = emModule._friscy_pc_exec_bytes_ptr() >>> 0;
+        const guest = Array.from(emModule.HEAPU8.subarray(guestPtr, guestPtr + 16));
+        const exec = Array.from(emModule.HEAPU8.subarray(execPtr, execPtr + 16));
+        return { mask, guest, exec };
+    } catch (e) {
+        return { error: e?.message || String(e) };
+    }
+}
+
+function logPcByteSnapshot(prefix) {
+    const snapshot = getPcByteSnapshot();
+    if (!snapshot) return;
+    console.log(`${prefix} ${JSON.stringify(snapshot)}`);
 }
 
 function classifyRunFailure(error) {
@@ -1528,10 +1581,12 @@ self.onmessage = async function(e) {
             if (recoverableRunFault && typeof recoverFn === 'function') {
                 try {
                     logRuntimeState(`[worker] pre-recover escaped callMain fault (${errMsg})`);
+                    logPcByteSnapshot(`[worker] pre-recover pc-bytes (${errMsg})`);
                     const recovered = recoverFn();
                     console.log(`[worker] recover attempt for escaped callMain failure (${errMsg}) => ${recovered}`);
                     if (recovered) {
                         logRuntimeState(`[worker] post-recover escaped callMain fault (${errMsg})`);
+                        logPcByteSnapshot(`[worker] post-recover pc-bytes (${errMsg})`);
                         console.log(`[worker] recovered from escaped callMain failure (${errMsg}), forcing resume`);
                         drainProcessEvents();
                         const recoveredGracefully = await resumeEscapedRunFault(errMsg);
@@ -1547,6 +1602,7 @@ self.onmessage = async function(e) {
             }
 
             const cls = classifyRunFailure(e);
+            logPcByteSnapshot(`[worker] final-failure pc-bytes (${errMsg})`);
             if (cls.graceful) {
                 const diag = JSON.stringify(cls.diagnostics);
                 console.warn(`[worker] callMain threw after graceful completion, suppressing error: ${diag}`);

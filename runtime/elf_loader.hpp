@@ -16,6 +16,7 @@
 #include <vector>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 #include <libriscv/machine.hpp>
 
 namespace elf {
@@ -323,6 +324,8 @@ inline std::vector<std::pair<uint64_t, uint64_t>> build_auxv(
 namespace dynlink {
 
 using Machine = riscv::Machine<riscv::RISCV64>;
+inline uint32_t g_elf_loader_debug_stage = 0;
+inline uint64_t g_elf_loader_debug_vaddr = 0;
 
 // Stack layout for dynamic linker (grows down):
 //
@@ -402,29 +405,38 @@ inline uint64_t load_elf_segments(
         phoff += ehdr->e_phentsize;
     }
 
+    const bool use_arena = machine.memory.uses_flat_memory_arena();
+
     // Pass 1: Copy segment data into guest memory.
-    if constexpr (riscv::encompassing_Nbit_arena > 0) {
+    if (use_arena) {
         // Arena mode: write directly to arena buffer.
         auto* arena = (uint8_t*)machine.memory.memory_arena_ptr();
         size_t arena_size = machine.memory.memory_arena_size();
         constexpr uint64_t ARENA_MASK = (1ULL << riscv::encompassing_Nbit_arena) - 1;
+        size_t seg_index = 0;
         for (const auto& seg : segments) {
+            g_elf_loader_debug_vaddr = seg.vaddr;
+            g_elf_loader_debug_stage = 100 + (uint32_t)seg_index;
             uint64_t arena_dst = seg.vaddr & ARENA_MASK;
             if (seg.filesz > 0 && arena_dst + seg.filesz <= arena_size) {
                 std::memcpy(arena + arena_dst,
                             elf_data.data() + seg.offset, seg.filesz);
             }
             if (seg.memsz > seg.filesz) {
+                g_elf_loader_debug_stage = 200 + (uint32_t)seg_index;
                 uint64_t bss_dst = (seg.vaddr + seg.filesz) & ARENA_MASK;
                 size_t bss_len = seg.memsz - seg.filesz;
                 if (bss_dst + bss_len <= arena_size) {
                     std::memset(arena + bss_dst, 0, bss_len);
                 }
             }
+            seg_index++;
         }
     } else {
         // Page mode: use fault-retry loop for page-based memcpy.
+        size_t seg_index = 0;
         for (const auto& seg : segments) {
+            g_elf_loader_debug_vaddr = seg.vaddr;
             auto copy_with_retry = [&](uint64_t dst, const void* src, size_t len) {
                 size_t offset = 0;
                 int faults = 0;
@@ -435,7 +447,18 @@ inline uint64_t load_elf_segments(
                         return;
                     } catch (const riscv::MachineException& e) {
                         uint64_t fault = e.data();
-                        if (fault == 0) throw;
+                        if (fault == 0) {
+                            fprintf(stderr,
+                                "[elf-loader] memcpy fault dst=0x%llx offset=0x%zx len=0x%zx seg_vaddr=0x%llx filesz=0x%llx memsz=0x%llx what=%s\n",
+                                (unsigned long long)dst,
+                                offset,
+                                len,
+                                (unsigned long long)seg.vaddr,
+                                (unsigned long long)seg.filesz,
+                                (unsigned long long)seg.memsz,
+                                e.what());
+                            throw;
+                        }
                         faults++;
                         uint64_t page = fault & ~0xFFFULL;
                         riscv::PageAttributes attr;
@@ -455,7 +478,18 @@ inline uint64_t load_elf_segments(
                         return;
                     } catch (const riscv::MachineException& e) {
                         uint64_t fault = e.data();
-                        if (fault == 0) throw;
+                        if (fault == 0) {
+                            fprintf(stderr,
+                                "[elf-loader] memset fault dst=0x%llx offset=0x%zx len=0x%zx seg_vaddr=0x%llx filesz=0x%llx memsz=0x%llx what=%s\n",
+                                (unsigned long long)dst,
+                                offset,
+                                len,
+                                (unsigned long long)seg.vaddr,
+                                (unsigned long long)seg.filesz,
+                                (unsigned long long)seg.memsz,
+                                e.what());
+                            throw;
+                        }
                         uint64_t page = fault & ~0xFFFULL;
                         riscv::PageAttributes attr;
                         attr.read = true; attr.write = true; attr.exec = true;
@@ -468,11 +502,14 @@ inline uint64_t load_elf_segments(
             };
 
             if (seg.filesz > 0) {
+                g_elf_loader_debug_stage = 100 + (uint32_t)seg_index;
                 copy_with_retry(seg.vaddr, elf_data.data() + seg.offset, seg.filesz);
             }
             if (seg.memsz > seg.filesz) {
+                g_elf_loader_debug_stage = 200 + (uint32_t)seg_index;
                 memset_with_retry(seg.vaddr + seg.filesz, 0, seg.memsz - seg.filesz);
             }
+            seg_index++;
         }
     }
 
@@ -484,23 +521,72 @@ inline uint64_t load_elf_segments(
         constexpr uint64_t RISCV_PAGE = 4096;
         constexpr uint64_t RISCV_PAGE_MASK = ~(RISCV_PAGE - 1);
 
-        for (const auto& seg : segments) {
-            // In arena mode, only care about executable segments (decoder needs exec attr).
-            // In page mode, set all permissions.
-            if constexpr (riscv::encompassing_Nbit_arena > 0) {
-                if (!(seg.flags & elf::PF_X)) continue;  // skip non-exec in arena mode
+        if (use_arena) {
+            size_t seg_index = 0;
+            for (const auto& seg : segments) {
+                g_elf_loader_debug_vaddr = seg.vaddr;
+                if (!(seg.flags & elf::PF_X)) {
+                    seg_index++;
+                    continue;
+                }
+
+                uint64_t seg_start = seg.vaddr & RISCV_PAGE_MASK;
+                uint64_t seg_end = (seg.vaddr + seg.memsz + RISCV_PAGE - 1) & RISCV_PAGE_MASK;
+
+                riscv::PageAttributes attr;
+                attr.read = true;
+                attr.write = true;
+                attr.exec = true;
+
+                g_elf_loader_debug_stage = 300 + (uint32_t)seg_index;
+                for (uint64_t page = seg_start; page < seg_end; page += RISCV_PAGE) {
+                    try {
+                        machine.memory.set_page_attr(page, RISCV_PAGE, attr);
+                    } catch (const riscv::MachineException& e) {
+                        fprintf(stderr,
+                            "[elf-loader] set_page_attr fault page=0x%llx seg_start=0x%llx seg_end=0x%llx flags=0x%x what=%s\n",
+                            (unsigned long long)page,
+                            (unsigned long long)seg_start,
+                            (unsigned long long)seg_end,
+                            seg.flags,
+                            e.what());
+                        throw;
+                    }
+                }
+                seg_index++;
+            }
+        } else {
+            std::unordered_map<uint64_t, bool> page_exec;
+            for (const auto& seg : segments) {
+                uint64_t seg_start = seg.vaddr & RISCV_PAGE_MASK;
+                uint64_t seg_end = (seg.vaddr + seg.memsz + RISCV_PAGE - 1) & RISCV_PAGE_MASK;
+                const bool seg_exec = (seg.flags & elf::PF_X) != 0;
+                for (uint64_t page = seg_start; page < seg_end; page += RISCV_PAGE) {
+                    page_exec[page] = page_exec[page] || seg_exec;
+                }
             }
 
-            uint64_t seg_start = seg.vaddr & RISCV_PAGE_MASK;
-            uint64_t seg_end = (seg.vaddr + seg.memsz + RISCV_PAGE - 1) & RISCV_PAGE_MASK;
+            size_t seg_index = 0;
+            for (const auto& [page, exec] : page_exec) {
+                g_elf_loader_debug_vaddr = page;
+                g_elf_loader_debug_stage = 300 + (uint32_t)seg_index;
 
-            riscv::PageAttributes attr;
-            attr.read = true;
-            attr.write = true;
-            attr.exec = (seg.flags & elf::PF_X) != 0;
+                riscv::PageAttributes attr;
+                attr.read = true;
+                attr.write = true;
+                attr.exec = exec;
 
-            for (uint64_t page = seg_start; page < seg_end; page += RISCV_PAGE) {
-                machine.memory.set_page_attr(page, RISCV_PAGE, attr);
+                try {
+                    machine.memory.set_page_attr(page, RISCV_PAGE, attr);
+                } catch (const riscv::MachineException& e) {
+                    fprintf(stderr,
+                        "[elf-loader] merged set_page_attr fault page=0x%llx exec=%d what=%s\n",
+                        (unsigned long long)page,
+                        (int)exec,
+                        e.what());
+                    throw;
+                }
+                seg_index++;
             }
         }
     }

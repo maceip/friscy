@@ -16,6 +16,9 @@ else()
     # musttail emits return_call; -mtail-call enables the Wasm tail call proposal
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -mtail-call")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -mtail-call")
+    # Browser builds cannot reliably reserve a 2GB guest arena and a 2GB wasm
+    # heap at startup. Force page-backed guest memory instead.
+    add_definitions(-DFRISCY_EXPERIMENT_DISABLE_ARENA)
     if(FRISCY_WIZER)
         # Wizer builds: NO shared memory, NO bulk-memory (data.drop unsupported by wasmtime)
         # Wizer snapshots run single-threaded, no Worker/SharedArrayBuffer needed
@@ -187,7 +190,7 @@ if(EMSCRIPTEN)
         -sSUPPORT_LONGJMP=0
         -mtail-call
         -sALLOW_TABLE_GROWTH
-        -sINITIAL_MEMORY=2147483648     # 2GB initial (arena + host heap)
+        -sINITIAL_MEMORY=536870912      # 512MB initial; grow on demand in browser
         -sALLOW_MEMORY_GROWTH
         -sMAXIMUM_MEMORY=4294967296     # 4GB max (wasm32 limit)
         -sSTACK_SIZE=1048576            # 1MB stack
@@ -199,7 +202,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response" "_friscy_drain_process_events" "_friscy_get_last_fault_kind" "_friscy_get_last_fault_pc" "_friscy_get_last_fault_data" "_friscy_clear_last_fault" "_friscy_stop_reason" "_friscy_notify_child_exit" "_friscy_recover_fault" "_friscy_evict_execute_segments")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response" "_friscy_drain_process_events" "_friscy_get_last_fault_kind" "_friscy_get_last_fault_pc" "_friscy_get_last_fault_data" "_friscy_get_startup_stage" "_friscy_get_pre_run_pc" "_friscy_get_pre_run_exec_begin" "_friscy_get_pre_run_exec_empty" "_friscy_get_pre_run_pc_page_flags" "_friscy_get_elf_loader_stage" "_friscy_get_elf_loader_vaddr" "_friscy_clear_last_fault" "_friscy_capture_pc_bytes" "_friscy_pc_guest_bytes_ptr" "_friscy_pc_exec_bytes_ptr" "_friscy_stop_reason" "_friscy_notify_child_exit" "_friscy_recover_fault" "_friscy_evict_execute_segments")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)

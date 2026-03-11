@@ -42,6 +42,7 @@ async function run() {
         } else {
             if (!binaryPath) {
                 binaryPath = argv[i];
+                i++;
             }
             // Collect remaining as guest args
             while (i < argv.length) {

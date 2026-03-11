@@ -1130,7 +1130,10 @@ int main(int argc, char** argv) {
                               << "\nHint: use '--' before guest command/args if needed.\n";
                     return 1;
                 }
-                entry_path = argv[i];
+                entry_path = argv[i++];
+                if (i >= argc) {
+                    break;
+                }
             }
             parsing_guest_args = true;
             guest_args.push_back(argv[i]);

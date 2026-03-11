@@ -17,6 +17,7 @@
 #include <array>
 #include <algorithm>
 #include <ctime>
+#include <cerrno>
 #include <cstring>
 #include <random>
 #include <cstdlib>
@@ -35,6 +36,10 @@ extern "C" long js_opfs_io(int fd, void* buf, size_t len, int op, long off);
 #include <poll.h>
 #include <unistd.h>
 #endif
+
+extern "C" int close(int);
+extern "C" int dup(int);
+extern "C" int fcntl(int, int, ...);
 
 namespace syscalls {
 
@@ -1733,6 +1738,11 @@ constexpr int O_NONBLOCK = 04000;
 constexpr int O_DIRECTORY = 0200000;
 constexpr int O_CLOEXEC = 02000000;
 
+// mmap flags
+constexpr int MAP_FIXED = 0x10;
+constexpr int MAP_ANONYMOUS = 0x20;
+constexpr int MAP_NORESERVE = 0x04000;
+
 // Error codes (negated for syscall return values)
 namespace err {
     constexpr int64_t NOENT = -2;
@@ -1800,9 +1810,43 @@ static void sys_exit_group(Machine& m) {
         g_sched.threads[i].waiting = false;
     }
     g_sched.count = 0;
-
     m.stop();
     m.set_result(exit_code);
+}
+
+static bool resolve_dirfd_path(Machine& m, int dirfd, std::string& path, int64_t* err_out = nullptr) {
+    auto& fs = get_fs(m);
+    if (!path.empty() && path[0] == '/') {
+        return true;
+    }
+    if (dirfd == AT_FDCWD) {
+        return true;
+    }
+
+    auto entry = fs.get_entry(dirfd);
+    if (!entry) {
+        if (err_out) *err_out = err::BADF;
+        return false;
+    }
+    if (!entry->is_dir()) {
+        if (err_out) *err_out = err::NOTDIR;
+        return false;
+    }
+
+    const std::string base = fs.get_path(dirfd);
+    if (base.empty()) {
+        if (err_out) *err_out = err::BADF;
+        return false;
+    }
+
+    if (path.empty()) {
+        path = base;
+    } else if (base == "/") {
+        path = "/" + path;
+    } else {
+        path = base + "/" + path;
+    }
+    return true;
 }
 
 static void sys_exit(Machine& m) {
@@ -3273,7 +3317,6 @@ static void sys_openat(Machine& m) {
     int dirfd = m.template sysarg<int>(0);
     auto path_addr = m.sysarg(1);
     int flags = m.template sysarg<int>(2);
-
     std::string path;
     try {
         path = m.memory.memstring(path_addr);
@@ -3353,7 +3396,6 @@ static void sys_openat2(Machine& m) {
     auto path_addr = m.sysarg(1);
     auto how_addr = m.sysarg(2);
     auto size = m.sysarg(3);
-
     std::string path;
     try {
         path = m.memory.memstring(path_addr);
@@ -3431,16 +3473,18 @@ static void sys_openat2(Machine& m) {
 
 static void sys_close(Machine& m) {
     auto& fs = get_fs(m);
-    int fd = m.template sysarg<int>(0);
+    const int fd = m.template sysarg<int>(0);
     if (g_trace_syscalls && g_trace_countdown-- > 0)
         dbg_fprintf(stderr, "[TRACE] close(fd=%d) pc=0x%lx\n", fd, (long)m.cpu.pc());
 
+    const int translated_host_fd = m.has_file_descriptors() ? m.fds().translate(fd) : -1;
     bool is_stdio_valid = (fd >= 0 && fd <= 2 && g_stdio_open[fd]);
     bool is_valid = is_stdio_valid
         || fs.is_open(fd)
         || g_epoll_instances.count(fd)
         || g_eventfd_counters.count(fd)
         || g_timerfd_states.count(fd)
+        || translated_host_fd >= 0
         || (net_is_socket_fd && net_is_socket_fd(fd))
         || is_vh_fd(fd);
 
@@ -3484,8 +3528,23 @@ static void sys_close(Machine& m) {
 #endif
     }
 
-    // VFS close is idempotent; validity already checked above.
-    fs.close(fd);
+    if (fs.is_open(fd)) {
+        fs.close(fd);
+        g_vh_fds.erase(fd);
+        m.set_result(0);
+        return;
+    }
+
+    if (m.has_file_descriptors()) {
+        const int real_fd = m.fds().erase(fd);
+        if (real_fd >= 0) {
+            g_vh_fds.erase(fd);
+            const int res = ::close(real_fd);
+            m.set_result(res == 0 ? 0 : -errno);
+            return;
+        }
+    }
+
     g_vh_fds.erase(fd);
     m.set_result(0);
 }
@@ -4105,6 +4164,38 @@ static void sys_newfstatat(Machine& m) {
     }
     path = std::move(at.path);
 
+    if ((flags & AT_EMPTY_PATH) && path.empty()) {
+        auto entry = fs.get_entry(dirfd);
+        if (!entry) {
+            m.set_result(err::BADF);
+            return;
+        }
+
+        const std::string fd_path = fs.get_path(dirfd);
+        linux_stat64 st = {};
+        st.st_dev = 1;
+        st.st_ino = std::hash<std::string>{}(fd_path);
+        st.st_mode = static_cast<uint32_t>(entry->type) | entry->mode;
+        st.st_nlink = entry->is_dir() ? 2 : 1;
+        st.st_uid = entry->uid;
+        st.st_gid = entry->gid;
+        st.st_size = entry->size;
+        st.st_blksize = 4096;
+        st.st_blocks = (entry->size + 511) / 512;
+        st.st_mtime_sec = entry->mtime;
+        st.st_atime_sec = entry->mtime;
+        st.st_ctime_sec = entry->mtime;
+        m.memory.memcpy(statbuf_addr, &st, sizeof(st));
+        m.set_result(0);
+        return;
+    }
+
+    int64_t resolve_err = 0;
+    if (!resolve_dirfd_path(m, dirfd, path, &resolve_err)) {
+        m.set_result(resolve_err);
+        return;
+    }
+
     vfs::Entry entry;
     bool ok = (flags & AT_SYMLINK_NOFOLLOW) ? fs.lstat(path, entry) : fs.stat(path, entry);
     if (!ok) {
@@ -4183,6 +4274,12 @@ static void sys_readlinkat(Machine& m) {
     }
     path = std::move(at.path);
 
+    int64_t resolve_err = 0;
+    if (!resolve_dirfd_path(m, dirfd, path, &resolve_err)) {
+        m.set_result(resolve_err);
+        return;
+    }
+
     std::vector<char> buf(bufsiz);
     ssize_t n = fs.readlink(path, buf.data(), bufsiz);
     if (n > 0) {
@@ -4234,6 +4331,12 @@ static void sys_faccessat(Machine& m) {
         return;
     }
     path = std::move(at.path);
+
+    int64_t resolve_err = 0;
+    if (!resolve_dirfd_path(m, dirfd, path, &resolve_err)) {
+        m.set_result(resolve_err);
+        return;
+    }
 
     vfs::Entry entry;
     const int rc = fs.stat(path, entry) ? 0 : err::NOENT;
@@ -5194,21 +5297,16 @@ static void ensure_stdio_in_vfs(vfs::VirtualFS& fs, int fd) {
 
 static void sys_fcntl(Machine& m) {
     auto& fs = get_fs(m);
-    int fd = m.template sysarg<int>(0);
-    int cmd = m.template sysarg<int>(1);
-
-    // Validate fd: 0-2 are always valid (stdin/stdout/stderr),
-    // other fds must be open in VFS, be a socket fd, or be an epoll fd.
-    // Return -EBADF for invalid fds
-    // (critical: loops like libuv's fd-cloexec rely on -EBADF to terminate).
-    bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd) || net_is_socket_fd(fd)
-                 || g_epoll_instances.count(fd) || g_eventfd_counters.count(fd);
+    const int fd = m.template sysarg<int>(0);
+    const int cmd = m.template sysarg<int>(1);
+    const int arg = m.template sysarg<int>(2);
+    const bool valid = (fd >= 0 && fd <= 2) || fs.is_open(fd) || net_is_socket_fd(fd)
+        || g_epoll_instances.count(fd) || g_eventfd_counters.count(fd)
+        || g_timerfd_states.count(fd) || is_vh_fd(fd);
+    const int real_fd = m.has_file_descriptors() ? m.fds().translate(fd) : -1;
+    const bool host_fd_valid = real_fd >= 0 && !valid;
     if (g_trace_syscalls && g_trace_countdown-- > 0)
         dbg_fprintf(stderr, "[fcntl] fd=%d cmd=%d valid=%d\n", fd, cmd, (int)valid);
-    if (!valid) {
-        m.set_result(err::BADF);
-        return;
-    }
 
     constexpr int F_DUPFD = 0;
     constexpr int F_GETFD = 1;
@@ -5227,6 +5325,24 @@ static void sys_fcntl(Machine& m) {
     switch (cmd) {
         case F_DUPFD:
         case F_DUPFD_CLOEXEC: {
+            if (!valid) {
+                if (!host_fd_valid || fd <= 2) {
+                    m.set_result(err::BADF);
+                    return;
+                }
+                const int dupfd = (cmd == F_DUPFD_CLOEXEC)
+                    ? ::fcntl(real_fd, F_DUPFD_CLOEXEC, arg)
+                    : ::fcntl(real_fd, F_DUPFD, arg);
+                if (dupfd < 0) {
+                    m.set_result(-errno);
+                    return;
+                }
+                const int guest_fd = m.fds().is_socket(fd)
+                    ? m.fds().assign_socket(dupfd)
+                    : m.fds().assign_file(dupfd);
+                m.set_result(guest_fd);
+                return;
+            }
             // Epoll fds: dup by creating alias in g_epoll_instances
             if (g_epoll_instances.count(fd)) {
                 int newfd = g_next_epoll_fd++;
@@ -5262,25 +5378,63 @@ static void sys_fcntl(Machine& m) {
             return;
         }
         case F_GETFD:
+            if (!valid) {
+                if (!host_fd_valid) {
+                    m.set_result(err::BADF);
+                    return;
+                }
+                errno = 0;
+                const int res = ::fcntl(real_fd, F_GETFD);
+                m.set_result(res >= 0 ? res : -errno);
+                return;
+            }
             m.set_result(g_fd_cloexec_flags.count(fd) ? g_fd_cloexec_flags[fd] : 0);
             return;
         case F_SETFD:
-            g_fd_cloexec_flags[fd] = (m.template sysarg<int>(2) & FD_CLOEXEC) ? FD_CLOEXEC : 0;
+            if (!valid) {
+                if (!host_fd_valid) {
+                    m.set_result(err::BADF);
+                    return;
+                }
+                errno = 0;
+                const int res = ::fcntl(real_fd, F_SETFD, arg);
+                m.set_result(res >= 0 ? res : -errno);
+                return;
+            }
+            g_fd_cloexec_flags[fd] = (arg & FD_CLOEXEC) ? FD_CLOEXEC : 0;
             m.set_result(0);
             return;
         case F_GETFL:
+            if (!valid) {
+                if (!host_fd_valid) {
+                    m.set_result(err::BADF);
+                    return;
+                }
+                errno = 0;
+                const int res = ::fcntl(real_fd, F_GETFL);
+                m.set_result(res >= 0 ? res : -errno);
+                return;
+            }
             m.set_result(g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd));
             return;
         case F_SETFL: {
+            if (!valid) {
+                if (!host_fd_valid) {
+                    m.set_result(err::BADF);
+                    return;
+                }
+                errno = 0;
+                const int res = ::fcntl(real_fd, F_SETFL, arg);
+                m.set_result(res >= 0 ? res : -errno);
+                return;
+            }
 #ifndef __EMSCRIPTEN__
             // For socket FDs, forward nonblocking flag to the real socket
             if (net_is_socket_fd(fd) && net_set_nonblock) {
-                int arg = m.template sysarg<int>(2);
                 net_set_nonblock(fd, (arg & O_NONBLOCK) != 0);
             }
 #endif
             // Only status flags should change with F_SETFL; preserve access mode bits.
-            int arg = m.template sysarg<int>(2);
             int old_flags = g_fd_status_flags.count(fd) ? g_fd_status_flags[fd] : get_default_status(fd);
             int access_mode = old_flags & 0x3;
             g_fd_status_flags[fd] = access_mode | (arg & ~0x3);
@@ -5288,6 +5442,10 @@ static void sys_fcntl(Machine& m) {
             return;
         }
         default:
+            if (!valid && !host_fd_valid) {
+                m.set_result(err::BADF);
+                return;
+            }
             m.set_result(0);
             return;
     }
@@ -5319,16 +5477,33 @@ static void sys_dup(Machine& m) {
     auto& fs = get_fs(m);
     int oldfd = m.template sysarg<int>(0);
     ensure_stdio_in_vfs(fs, oldfd);
-    int result = fs.dup(oldfd);
-    // Propagate tty status to new fd
-    if (result >= 0 && g_tty_fds.count(oldfd))
-        g_tty_fds.insert(result);
-    if (result >= 0) {
-        g_fd_cloexec_flags[result] = 0;  // dup() clears FD_CLOEXEC on new descriptor
-        g_fd_status_flags[result] = g_fd_status_flags.count(oldfd) ? g_fd_status_flags[oldfd]
-                                                                    : ((oldfd == 0) ? O_RDONLY : ((oldfd == 1 || oldfd == 2) ? O_WRONLY : O_RDWR));
+    if (fs.is_open(oldfd)) {
+        int result = fs.dup(oldfd);
+        if (result >= 0 && g_tty_fds.count(oldfd))
+            g_tty_fds.insert(result);
+        if (result >= 0) {
+            g_fd_cloexec_flags[result] = 0;
+            g_fd_status_flags[result] = g_fd_status_flags.count(oldfd) ? g_fd_status_flags[oldfd]
+                                                                        : ((oldfd == 0) ? O_RDONLY : ((oldfd == 1 || oldfd == 2) ? O_WRONLY : O_RDWR));
+        }
+        m.set_result(result);
+        return;
     }
-    m.set_result(result);
+    if (m.has_file_descriptors()) {
+        const int real_fd = m.fds().translate(oldfd);
+        if (real_fd >= 0) {
+            const int dupfd = ::dup(real_fd);
+            if (dupfd < 0) {
+                m.set_result(-errno);
+            } else {
+                m.set_result(m.fds().is_socket(oldfd)
+                    ? m.fds().assign_socket(dupfd)
+                    : m.fds().assign_file(dupfd));
+            }
+            return;
+        }
+    }
+    m.set_result(err::BADF);
 }
 
 static void sys_dup3(Machine& m) {
@@ -5340,21 +5515,58 @@ static void sys_dup3(Machine& m) {
         m.set_result(err::INVAL);
         return;
     }
+    if (flags & ~O_CLOEXEC) {
+        m.set_result(err::INVAL);
+        return;
+    }
     // Lazily register stdio fds in VFS so dup2 can operate on them
     ensure_stdio_in_vfs(fs, oldfd);
-    int result = fs.dup2(oldfd, newfd);
-    // Propagate tty status: if old fd is tty, new fd becomes tty
-    if (result >= 0) {
-        if (g_tty_fds.count(oldfd))
-            g_tty_fds.insert(newfd);
-        else if (newfd > 2)
-            g_tty_fds.erase(newfd);  // dup'd non-tty over a tty fd
-        g_fd_cloexec_flags[newfd] = 0;  // dup2() clears FD_CLOEXEC on target fd
-        if (newfd >= 0 && newfd <= 2) g_stdio_open[newfd] = true;
-        g_fd_status_flags[newfd] = g_fd_status_flags.count(oldfd) ? g_fd_status_flags[oldfd]
-                                                                   : ((oldfd == 0) ? O_RDONLY : ((oldfd == 1 || oldfd == 2) ? O_WRONLY : O_RDWR));
+    if (fs.is_open(oldfd)) {
+        int result = fs.dup2(oldfd, newfd);
+        if (result >= 0) {
+            if (g_tty_fds.count(oldfd))
+                g_tty_fds.insert(newfd);
+            else if (newfd > 2)
+                g_tty_fds.erase(newfd);
+            g_fd_cloexec_flags[newfd] = (flags & O_CLOEXEC) ? 1 : 0;
+            if (newfd >= 0 && newfd <= 2) g_stdio_open[newfd] = true;
+            g_fd_status_flags[newfd] = g_fd_status_flags.count(oldfd) ? g_fd_status_flags[oldfd]
+                                                                       : ((oldfd == 0) ? O_RDONLY : ((oldfd == 1 || oldfd == 2) ? O_WRONLY : O_RDWR));
+        }
+        m.set_result(result);
+        return;
     }
-    m.set_result(result);
+    if (m.has_file_descriptors()) {
+        const int real_old_fd = m.fds().translate(oldfd);
+        if (real_old_fd >= 0) {
+            if (fs.is_open(newfd)) {
+                fs.close(newfd);
+            }
+            g_epoll_instances.erase(newfd);
+            g_eventfd_counters.erase(newfd);
+            g_timerfd_states.erase(newfd);
+            g_tty_fds.erase(newfd);
+            g_vh_fds.erase(newfd);
+            const int prior_real_fd = m.fds().erase(newfd);
+            if (prior_real_fd >= 0) {
+                ::close(prior_real_fd);
+            }
+            const int dupfd = ::dup(real_old_fd);
+            if (dupfd < 0) {
+                m.set_result(-errno);
+                return;
+            }
+            if (flags & O_CLOEXEC) {
+                ::fcntl(dupfd, F_SETFD, FD_CLOEXEC);
+            }
+            m.fds().translation[newfd] = dupfd;
+            g_fd_cloexec_flags[newfd] = (flags & O_CLOEXEC) ? 1 : 0;
+            g_fd_status_flags.erase(newfd);
+            m.set_result(newfd);
+            return;
+        }
+    }
+    m.set_result(err::BADF);
 }
 
 static void sys_pipe2(Machine& m) {

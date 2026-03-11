@@ -168,6 +168,64 @@ const chrome = '/home/devuser/.cache/puppeteer/chrome-headless-shell/linux-146.0
 const cmd = `/usr/bin/node -e 'console.log("node-ok")'`;
 const url = 'http://127.0.0.1:9098/index.html?example=nodejs&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=' + Date.now();
 EOF
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer-core');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/home/devuser/.cache/puppeteer/chrome-headless-shell/linux-146.0.7680.31/chrome-headless-shell-linux64/chrome-headless-shell',
+    headless: true,
+    args: ['--no-sandbox','--disable-dev-shm-usage']
+  });
+  const page = await browser.newPage();
+  page.setDefaultTimeout(60000);
+  page.on('console', msg => {
+    const text = msg.text();
+    if (text.includes('[worker]') || text.includes('[friscy] execve:') || text.includes('node-ok')) {
+      console.log('[console]', msg.type(), text);
+    }
+  });
+  page.on('pageerror', err => console.log('[pageerror]', err.message));
+  await page.setCacheEnabled(false);
+  const cmd = `/usr/bin/node -e "console.log(\\"node-ok\\")"`;
+  const url = 'http://127.0.0.1:9097/index.html?example=nodejs&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=iterH';
+  console.log('[url]', url);
+  await page.goto(url, {waitUntil: 'networkidle2'});
+  await new Promise(r => setTimeout(r, 30000));
+  const text = await page.evaluate(() => document.body.innerText);
+  console.log('--- DOM ---');
+  console.log(text);
+  await browser.close();
+})();
+EOF
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer-core');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/home/devuser/.cache/puppeteer/chrome-headless-shell/linux-146.0.7680.31/chrome-headless-shell-linux64/chrome-headless-shell',
+    headless: true,
+    args: ['--no-sandbox','--disable-dev-shm-usage']
+  });
+  const page = await browser.newPage();
+  page.setDefaultTimeout(60000);
+  page.on('console', msg => {
+    const text = msg.text();
+    if (text.includes('[worker]') || text.includes('[friscy] execve:') || text.includes('node-ok') || text.includes('pre') || text.includes('post')) {
+      console.log('[console]', msg.type(), text);
+    }
+  });
+  page.on('pageerror', err => console.log('[pageerror]', err.message));
+  await page.setCacheEnabled(false);
+  const cmd = `/bin/bash -lc 'echo pre; /usr/bin/node -e "console.log(\\"node-ok\\")"; echo post'`;
+  const url = 'http://127.0.0.1:9097/index.html?example=claude-nosnapshot&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=iterG';
+  console.log('[url]', url);
+  await page.goto(url, {waitUntil: 'networkidle2'});
+  await new Promise(r => setTimeout(r, 45000));
+  const text = await page.evaluate(() => document.body.innerText);
+  console.log('--- DOM ---');
+  console.log(text);
+  await browser.close();
+})();
+EOF
 ps -ef | rg 'chrome-linux64/chrome|chromium'
 ulimit -n
 find $HOME -maxdepth 6 \( -path '*/chrome-linux64/chrome' -o -path '*/chrome-headless-shell-linux64/chrome-headless-shell' -o -path '*/chromium/chrome-linux/chrome' \) 2>/dev/null | head -20
@@ -187,6 +245,15 @@ runtime/main.cpp
 runtime/network.hpp
 friscy-bundle/worker.js
 vendor/libriscv/lib/libriscv/memory.cpp
+runtime/CMakeLists.txt
+vendor/libriscv/lib/libriscv/bytecode_impl.cpp
+vendor/libriscv/lib/libriscv/cpu.cpp
+vendor/libriscv/lib/libriscv/cpu_dispatch.cpp
+vendor/libriscv/lib/libriscv/machine_inline.hpp
+vendor/libriscv/lib/libriscv/memory.hpp
+vendor/libriscv/lib/libriscv/memory_rw.cpp
+vendor/libriscv/lib/libriscv/tailcall_dispatch.cpp
+tools/differential-syscall-trace.py
 
 YOUR TASK:
 
@@ -196,48 +263,62 @@ Get browser friscy to run Node-based Claude Code / claude.js on the fast path, n
 Current known-good:
 - Native friscy runs bash and Node.
 - Native friscy runs inline Node and file-based JS.
-- Browser worker host-fetch plumbing exists.
+- Browser worker recovery now resumes past escaped callMain failures.
+- Browser shell path reaches /bin/bash, prints pre, then execves /usr/bin/node.
 - LLRT browser path has explicit __host_fetch override support.
 
 Current browser gap:
-- Plain browser Node is still not reliably on the host-fetch path.
-- Browser synthetic socket path needed EOF vs EAGAIN separation and DNS timing fixes.
-- After rebuilding wasm with those source fixes, current browser Node regressed to std::bad_alloc even for simple node -e.
-- That means there are now two separate browser blockers:
-  1. browser Node startup / allocation regression in fresh wasm build
-  2. plain browser Node fetch path still not wired to the clean host-fetch override used by LLRT
+- Plain browser Node still is not on the explicit host-fetch override path.
+- Browser worker socket path now distinguishes EOF vs EAGAIN and has DNS fixes, but that is not the current primary blocker.
+- Browser Node no longer dies immediately at exec. It now reaches Node exec, then throws one escaped std::bad_alloc, then repeated riscv::MachineException Out of memory on resume.
+- Current browser failure shape is:
+  1. /bin/bash runs
+  2. pre prints
+  3. /usr/bin/node execve runs
+  4. first resume throws std::bad_alloc
+  5. subsequent resumes throw riscv::MachineException,Out of memory
+  6. worker ends with outcome=too_many_faults and exit code 1
+- Native Node is healthy, so this is now a browser wasm allocator / memory-arena problem before it is a guest syscall problem.
 
 Fastest path to Claude Code in browser:
-1. Restore browser Node baseline first.
-   - Use the last-known-good browser wasm/bundle that can run node -e "console.log('node-ok')".
-   - Do not continue fetch/debug work on a browser wasm that fails simple Node startup.
-2. Put plain browser Node on explicit host-fetch.
+1. Fix browser wasm memory behavior first.
+   - Inspect the browser-only arena / allocator path in vendor/libriscv/lib/libriscv/memory.cpp and memory.hpp.
+   - Compare that against the current wasm memory config in runtime/CMakeLists.txt.
+   - Eliminate the post-Node-exec std::bad_alloc plus repeated MachineException Out of memory chain for plain node -e.
+2. Keep the worker recovery path intact while iterating on allocator changes.
+   - The current worker.js changes are valuable because they prove Node exec is reached and guest execution is resuming.
+   - Do not regress back to the old false-success path that exited code 0 without running Node.
+3. Once browser plain Node can run node -e "console.log('node-ok')" again, put plain browser Node on explicit host-fetch.
    - Reuse the LLRT pattern from runtime/claude-repl-llrt.js.
-   - Add a Node preload shim loaded by NODE_OPTIONS that overrides globalThis.fetch to call the existing host-fetch bridge directly.
-   - Prefer this over relying on undici + synthetic TCP/DNS.
-3. Verify smallest browser cases in order.
-   - node -e "console.log('node-ok')"
-   - node -e "await fetch('http://127.0.0.1:PORT/__host_fetch-proxy-test')"
-   - node -e "await fetch('http://www.aol.com')"
+   - Add a preload-based fetch override for plain Node instead of depending on undici over synthetic TCP/DNS.
+4. Verify in this order.
+   - browser node -e "console.log('node-ok')"
+   - browser /bin/bash -lc 'echo pre; /usr/bin/node -e "console.log(\"node-ok\")"; echo post'
+   - browser node fetch to local host-fetch test endpoint
+   - browser node fetch to http://www.aol.com
    - claude-fast.js
    - claude-repl.js / Claude Code browser entrypoint
-4. Only after fetch works on explicit host-fetch, return to raw browser socket correctness.
-   - Raw DNS/TCP correctness is lower priority than getting Claude Code functional.
 
 Files to focus on for that task:
 - runtime/main.cpp
 - runtime/syscalls.hpp
 - runtime/network.hpp
+- runtime/CMakeLists.txt
 - runtime/claude-repl-llrt.js
 - friscy-bundle/worker.js
 - friscy-bundle/app.ts
 - friscy-bundle/manifest.json
 - docs_site/worker.js
 - docs_site/app.js
+- vendor/libriscv/lib/libriscv/memory.cpp
+- vendor/libriscv/lib/libriscv/memory.hpp
 
 Immediate next commands:
-- git checkout -- friscy-bundle/friscy.js friscy-bundle/friscy.wasm
+- sed -n '1,260p' runtime/CMakeLists.txt
+- sed -n '1,260p' vendor/libriscv/lib/libriscv/memory.cpp
+- sed -n '1,220p' vendor/libriscv/lib/libriscv/memory.hpp
 - node friscy-bundle/serve.js 9097
-- verify browser node baseline with node -e console.log
-- add preload-based fetch override for plain Node
-- rerun browser node fetch to aol
+- rerun browser node baseline with /usr/bin/node -e "console.log(\"node-ok\")"
+- rerun browser shell+node baseline with echo pre / node-ok / echo post
+- patch allocator / arena sizing or wasm initial-memory strategy
+- rebuild wasm and copy friscy.js + friscy.wasm into friscy-bundle

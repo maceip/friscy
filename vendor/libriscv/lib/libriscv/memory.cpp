@@ -219,6 +219,47 @@ namespace riscv
 		this->invalidate_reset_cache();
 	}
 
+	template <int W>
+	void Memory<W>::set_memory_arena_fast_path_end(address_t end_addr) noexcept
+	{
+		if (!this->uses_flat_memory_arena())
+			return;
+		const address_t arena_size = this->memory_arena_size();
+		const address_t capped_end = std::min(end_addr, arena_size);
+		if (capped_end > RWREAD_BEGIN) {
+			this->m_arena.read_boundary =
+				std::min(arena_size - RWREAD_BEGIN, capped_end - RWREAD_BEGIN);
+		} else {
+			this->m_arena.read_boundary = 0;
+		}
+		if (capped_end > this->m_arena.initial_rodata_end) {
+			this->m_arena.write_boundary =
+				std::min(arena_size - this->m_arena.initial_rodata_end,
+					capped_end - this->m_arena.initial_rodata_end);
+		} else {
+			this->m_arena.write_boundary = 0;
+		}
+		this->invalidate_reset_cache();
+	}
+
+	template <int W>
+	void Memory<W>::restore_memory_arena_fast_path() noexcept
+	{
+		if (!this->uses_flat_memory_arena())
+			return;
+		const address_t arena_size = this->memory_arena_size();
+		if (arena_size >= this->m_arena.initial_rodata_end) {
+			this->m_arena.read_boundary =
+				std::min(arena_size, static_cast<address_t>(arena_size - RWREAD_BEGIN));
+			this->m_arena.write_boundary =
+				std::min(arena_size, static_cast<address_t>(arena_size - this->m_arena.initial_rodata_end));
+		} else {
+			this->m_arena.read_boundary = 0;
+			this->m_arena.write_boundary = 0;
+		}
+		this->invalidate_reset_cache();
+	}
+
 	template <int W> RISCV_INTERNAL
 	void Memory<W>::initial_paging()
 	{

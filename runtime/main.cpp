@@ -23,6 +23,9 @@
 #include "checkpoint.hpp"
 
 #include <iostream>
+#ifndef __EMSCRIPTEN__
+#include <unistd.h>
+#endif
 
 // Reuse dbg_fprintf from syscalls.hpp (defined when FRISCY_QUIET)
 #ifndef dbg_fprintf
@@ -96,6 +99,14 @@ static uint32_t g_last_fault_kind = FRISCY_FAULT_NONE;
 static uint32_t g_last_fault_pc = 0;
 static uint32_t g_last_fault_data = 0;
 
+static inline uint32_t current_stop_reason_mask() {
+    uint32_t mask = syscalls::STOP_REASON_NONE;
+    if (syscalls::g_waiting_for_stdin)      mask |= syscalls::STOP_REASON_STDIN;
+    if (syscalls::g_waiting_for_host_fetch) mask |= syscalls::STOP_REASON_HOST_FETCH;
+    if (syscalls::fork_parent_waiting())    mask |= syscalls::STOP_REASON_WAIT_CHILD;
+    return mask;
+}
+
 static inline void enforce_fork_state_invariant(const char* where) {
     if (syscalls::fork_child_exited() && !syscalls::fork_parent_context_restored()) {
         dbg_cerr << "[friscy] FATAL: ChildExited observed before parent restore (" << where << ")\n";
@@ -115,6 +126,46 @@ static std::string format_callsite_symbol(const Machine& machine, uint64_t pc) {
         return call.name + "+" + std::to_string((unsigned long long)call.offset);
     } catch (...) {
         return "(unknown)";
+    }
+}
+
+static void dump_exec_bytes(Machine& machine, uint64_t pc, const char* tag) {
+    uint8_t guest_bytes[16] = {};
+    bool have_guest_bytes = false;
+    try {
+        machine.memory.memcpy_out(guest_bytes, pc, sizeof(guest_bytes));
+        have_guest_bytes = true;
+    } catch (...) {}
+
+    auto& exec_seg = machine.memory.exec_segment_for(pc);
+    const uint8_t* exec_ptr = nullptr;
+    if (exec_seg && !exec_seg->empty() && exec_seg->is_within(pc, sizeof(guest_bytes))) {
+        exec_ptr = exec_seg->exec_data(pc);
+    }
+
+    fprintf(stderr,
+            "%s pc=0x%lx exec_base=0x%lx seg=[0x%lx,0x%lx) stale=%d have_guest=%d have_exec=%d\n",
+            tag,
+            (unsigned long)pc,
+            (unsigned long)syscalls::g_exec_ctx.exec_base,
+            (unsigned long)(exec_seg ? exec_seg->exec_begin() : 0),
+            (unsigned long)(exec_seg ? exec_seg->exec_end() : 0),
+            (int)(exec_seg ? exec_seg->is_stale() : 0),
+            (int)have_guest_bytes,
+            (int)(exec_ptr != nullptr));
+    if (have_guest_bytes) {
+        fprintf(stderr, "%s guest:", tag);
+        for (size_t i = 0; i < sizeof(guest_bytes); i++) {
+            fprintf(stderr, " %02x", guest_bytes[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    if (exec_ptr != nullptr) {
+        fprintf(stderr, "%s exec :", tag);
+        for (size_t i = 0; i < sizeof(guest_bytes); i++) {
+            fprintf(stderr, " %02x", exec_ptr[i]);
+        }
+        fprintf(stderr, "\n");
     }
 }
 
@@ -166,6 +217,23 @@ EMSCRIPTEN_KEEPALIVE int friscy_recover_fault() {
     return 1; // recoverable
 }
 
+// Recover browser-side runs that escape through a wrapped host exception
+// before the normal MachineException path can evict stale execute segments.
+EMSCRIPTEN_KEEPALIVE int friscy_evict_execute_segments() {
+    if (!g_machine) return 0;
+    g_machine->memory.evict_execute_segments();
+    uint64_t pc = g_machine->cpu.pc();
+    if (pc != 0) {
+        riscv::PageAttributes attr;
+        attr.read = true;
+        attr.write = true;
+        attr.exec = true;
+        g_machine->memory.set_page_attr(pc & ~0xFFFULL, 4096, attr);
+    }
+    friscy_clear_last_fault();
+    return 1;
+}
+
 // Resume execution. Returns 1 if machine stopped again (needs more stdin), 0 if done.
 // Handles page protection faults by making the faulting page writable and
 // retrying. This acts as a simple page fault handler for pages at the
@@ -191,9 +259,6 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 if (!g_machine->instruction_limit_reached()) break;
             }
             if (syscalls::fork_child_exited()) {
-                if (!syscalls::fork_parent_restoring()) {
-                    __builtin_trap();
-                }
                 syscalls::fork_parent_restore(*g_machine);
                 retries = -1;
                 continue;
@@ -390,11 +455,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t friscy_drain_process_events(uint32_t out_ptr, uint
 
 // Phase 2: stop-reason bitmask for worker.js yield dispatch
 EMSCRIPTEN_KEEPALIVE uint32_t friscy_stop_reason() {
-    uint32_t mask = syscalls::STOP_REASON_NONE;
-    if (syscalls::g_waiting_for_stdin)      mask |= syscalls::STOP_REASON_STDIN;
-    if (syscalls::g_waiting_for_host_fetch) mask |= syscalls::STOP_REASON_HOST_FETCH;
-    if (syscalls::fork_parent_waiting())     mask |= syscalls::STOP_REASON_WAIT_CHILD;
-    return mask;
+    return current_stop_reason_mask();
 }
 
 // Phase 2: host delivers child exit notification to unblock wait4
@@ -493,11 +554,38 @@ static void setup_virtual_files() {
     g_vfs.add_virtual_file("/dev/urandom", std::vector<uint8_t>{});
     g_vfs.add_virtual_file("/dev/random", std::vector<uint8_t>{});
 
-    // /etc/passwd (minimal)
-    g_vfs.add_virtual_file("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
+    // Several guest images install Node at /usr/bin/node only, but existing
+    // repro commands and shebangs frequently invoke /bin/node. Add a guest-side
+    // compatibility symlink when the image exposes the real binary but not the alias.
+    if (!g_vfs.resolve("/bin/node") && g_vfs.resolve("/usr/bin/node")) {
+        (void)g_vfs.mkdir("/bin", 0755);
+        (void)g_vfs.symlink("/usr/bin/node", "/bin/node");
+    }
 
-    // /etc/group (minimal)
-    g_vfs.add_virtual_file("/etc/group", "root:x:0:\n");
+    // /etc/passwd and /etc/group — keep root, and on native runs also expose
+    // the current host user so login shells see the same identity branch as
+    // qemu-user/native processes.
+    std::string passwd = "root:x:0:0:root:/root:/bin/sh\n";
+    std::string group = "root:x:0:\n";
+#ifndef __EMSCRIPTEN__
+    {
+        const uid_t uid = ::getuid();
+        const gid_t gid = ::getgid();
+        const char* user_env = std::getenv("USER");
+        const char* home_env = std::getenv("HOME");
+        const std::string user = (user_env && *user_env) ? user_env : "user";
+        const std::string home = (home_env && *home_env) ? home_env : ("/home/" + user);
+        if (uid != 0) {
+            passwd += user + ":x:" + std::to_string(uid) + ":" + std::to_string(gid)
+                + ":" + user + ":" + home + ":/bin/sh\n";
+        }
+        if (gid != 0) {
+            group += user + ":x:" + std::to_string(gid) + ":\n";
+        }
+    }
+#endif
+    g_vfs.add_virtual_file("/etc/passwd", passwd);
+    g_vfs.add_virtual_file("/etc/group", group);
 
     // /etc/hosts
     g_vfs.add_virtual_file("/etc/hosts", "127.0.0.1 localhost\n");
@@ -719,6 +807,10 @@ static void setup_virtual_files() {
     g_vfs.add_virtual_file("/proc/version_signature",
         "Linux version 6.8.0 (friscy@libriscv) (riscv64-linux-gnu-gcc)\n");
 
+    // /proc/self/cgroup — Node.js reads this to locate cgroup v2 memory limits.
+    // Expose the root cgroup so follow-up probes stay under /sys/fs/cgroup.
+    g_vfs.add_virtual_file("/proc/self/cgroup", "0::/\n");
+
     // /proc/cpuinfo — V8 reads this to detect RISC-V ISA extensions.
     // Without it, V8 may abort thinking required features are missing.
     g_vfs.add_virtual_file("/proc/cpuinfo",
@@ -732,6 +824,21 @@ static void setup_virtual_files() {
     // /proc/self/maps — V8 reads this during cage setup
     g_vfs.add_virtual_file("/proc/self/maps", "");
 
+    // /proc/meminfo — Node reads this while sizing heaps and cgroup limits.
+    g_vfs.add_virtual_file("/proc/meminfo",
+        "MemTotal:        1048576 kB\n"
+        "MemFree:          524288 kB\n"
+        "MemAvailable:     786432 kB\n"
+        "Buffers:               0 kB\n"
+        "Cached:           131072 kB\n"
+        "SwapCached:            0 kB\n"
+        "Active:           131072 kB\n"
+        "Inactive:         131072 kB\n"
+        "SwapTotal:             0 kB\n"
+        "SwapFree:              0 kB\n"
+        "Committed_AS:     262144 kB\n"
+        "CommitLimit:     1048576 kB\n");
+
     // /proc/sys/vm/overcommit_memory — V8 checks this
     g_vfs.add_virtual_file("/proc/sys/vm/overcommit_memory", "0\n");
 
@@ -739,10 +846,28 @@ static void setup_virtual_files() {
     // to determine physHugePageSize. Return "0" to disable hugepage alignment
     // requirements, which cause crashes on our flat 2GB arena.
     g_vfs.mkdir("/sys", 0755);
+    g_vfs.mkdir("/sys/fs", 0755);
+    g_vfs.mkdir("/sys/fs/cgroup", 0755);
     g_vfs.mkdir("/sys/kernel", 0755);
     g_vfs.mkdir("/sys/kernel/mm", 0755);
     g_vfs.mkdir("/sys/kernel/mm/transparent_hugepage", 0755);
     g_vfs.add_virtual_file("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", "0\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/cgroup.controllers", "cpu memory\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/cgroup.events",
+        "populated 1\n"
+        "frozen 0\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/cpu.max", "max 100000\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/cpu.stat",
+        "usage_usec 0\n"
+        "user_usec 0\n"
+        "system_usec 0\n"
+        "nr_periods 0\n"
+        "nr_throttled 0\n"
+        "throttled_usec 0\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/cpuset.cpus.effective", "0\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/memory.current", "0\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/memory.max", "max\n");
+    g_vfs.add_virtual_file("/sys/fs/cgroup/memory.high", "max\n");
 
     // /tmp directory and NODE_COMPILE_CACHE directory
     // Node.js will create cache files here; persist via --export-tar
@@ -918,6 +1043,7 @@ int main(int argc, char** argv) {
         } else if (!parsing_guest_args && strcmp(argv[i], "--strace") == 0) {
             syscalls::g_trace_syscalls = true;
             syscalls::g_trace_countdown = 50000;
+            syscalls::g_trace_after_cpu_max = true;
         } else if (!parsing_guest_args && strcmp(argv[i], "--safe-mode") == 0) {
             syscalls::g_safe_mode = true;
         } else if (
@@ -1286,6 +1412,36 @@ int main(int argc, char** argv) {
         auto& machine = *machine_ptr;
         dbg_cout << "[friscy-debug] Machine constructed (pc=0x"
                   << std::hex << machine.cpu.pc() << std::dec << ")\n";
+        syscalls::install_live_mmap_page_fault_handler(machine);
+        if (exec_info.type == elf::ET_DYN) {
+            const auto [exec_lo, exec_hi] = elf::get_load_range(binary);
+            const uint64_t entry_addr = machine.memory.start_address();
+            const uint64_t mapped_lo = entry_addr - (exec_info.entry_point - exec_lo);
+            // The constructor-loaded PIE image is not reliable enough for the
+            // main executable's writable PT_LOAD pages under our arena setup.
+            // Recopy the main ELF segments at the same mapped base so GOT/data
+            // contents come from the file image before the interpreter runs.
+            dynlink::load_elf_segments(machine, binary, mapped_lo);
+            const auto* ehdr = reinterpret_cast<const elf::Elf64_Ehdr*>(binary.data());
+            const uint64_t load_bias = mapped_lo - exec_lo;
+            size_t phoff = ehdr->e_phoff;
+            for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+                const auto* phdr = reinterpret_cast<const elf::Elf64_Phdr*>(binary.data() + phoff);
+                if (phdr->p_type == elf::PT_LOAD && phdr->p_memsz != 0) {
+                    riscv::PageAttributes attr {};
+                    attr.read = true;
+                    attr.write = (phdr->p_flags & elf::PF_W) != 0;
+                    attr.exec = (phdr->p_flags & elf::PF_X) != 0;
+                    const uint64_t seg_start = (phdr->p_vaddr + load_bias) & ~0xFFFULL;
+                    const uint64_t seg_end =
+                        ((phdr->p_vaddr + load_bias + phdr->p_memsz + 0xFFFULL) & ~0xFFFULL);
+                    machine.memory.set_page_attr(seg_start, seg_end - seg_start, attr);
+                }
+                phoff += ehdr->e_phentsize;
+            }
+            dbg_cout << "[friscy] Reapplied main PIE permissions at 0x"
+                      << std::hex << mapped_lo << " bias=0x" << load_bias << std::dec << "\n";
+        }
 
         // If dynamic, also load the interpreter at a high address
         if (use_dynamic_linker) {
@@ -1308,24 +1464,28 @@ int main(int argc, char** argv) {
 
             dbg_cout << "[friscy] Interpreter entry: 0x" << std::hex << interp_entry << std::dec << "\n";
 
-            // Calculate the base address where libriscv loaded the main executable.
-            // For PIE (ET_DYN), libriscv loads at DYLINK_BASE (0x40000).
-            // We can derive the base adjustment from the machine's start address.
+            // Calculate the actual load bias for the main executable.
+            // machine.memory.start_address() is the mapped start of the first PT_LOAD
+            // segment, not the program entry point. Auxv needs the load bias so
+            // AT_PHDR/AT_ENTRY point at the in-memory program headers and true entry.
             if (exec_info.type == elf::ET_DYN) {
-                uint64_t actual_entry = machine.memory.start_address();
-                uint64_t exec_base = actual_entry - exec_info.entry_point;
-                exec_info.phdr_addr += exec_base;
-                exec_info.entry_point = actual_entry;
-                dbg_cout << "[friscy] PIE base: 0x" << std::hex << exec_base << std::dec << "\n";
-
-                // Save PIE base for execve: load_elf_segments needs the
-                // address where the first segment starts (exec_base + lo)
                 auto [lo, hi] = elf::get_load_range(binary);
-                syscalls::g_exec_ctx.exec_base = exec_base + lo;
+                const uint64_t entry_addr = machine.memory.start_address();
+                uint64_t mapped_lo = entry_addr - (exec_info.entry_point - lo);
+                uint64_t load_bias = mapped_lo - lo;
+                exec_info.base_addr = mapped_lo;
+                exec_info.phdr_addr += load_bias;
+                exec_info.entry_point += load_bias;
+                dbg_cout << "[friscy] PIE mapped lo: 0x" << std::hex << mapped_lo
+                          << " load_bias=0x" << load_bias << std::dec << "\n";
+
+                // Save PIE base for execve: load_elf_segments needs the address
+                // where the first PT_LOAD segment starts in guest memory.
+                syscalls::g_exec_ctx.exec_base = mapped_lo;
                 // Find writable data segment range (skip code segments)
                 auto [rw_lo, rw_hi] = elf::get_writable_range(binary);
-                syscalls::g_exec_ctx.exec_rw_start = exec_base + rw_lo;
-                syscalls::g_exec_ctx.exec_rw_end = exec_base + rw_hi;
+                syscalls::g_exec_ctx.exec_rw_start = load_bias + rw_lo;
+                syscalls::g_exec_ctx.exec_rw_end = load_bias + rw_hi;
             }
 
             // Advance mmap region past the interpreter to prevent overlap.
@@ -1349,6 +1509,14 @@ int main(int argc, char** argv) {
         // to reload segments and set up a fresh stack for the new process)
         syscalls::g_exec_ctx.exec_binary = binary;
         syscalls::g_exec_ctx.exec_info = exec_info;  // Already adjusted for PIE
+        // Tiny anonymous mmap hole reuse has been a bad fit for musl startup
+        // allocators; keep initial guest startup on the same conservative
+        // policy that execve/restart paths already use.
+        syscalls::g_conservative_small_mmap_reuse = true;
+        // Keep initial guest startup on the conservative eager path. Node can
+        // relax anon mmap materialization later once it is past musl bootstrap.
+        syscalls::g_force_materialize_anon_mmap = true;
+        syscalls::g_enable_node_anon_relax = syscalls::is_node_guest_path(entry_path);
         if (use_dynamic_linker) {
             syscalls::g_exec_ctx.interp_binary = interp_binary;
             syscalls::g_exec_ctx.interp_base = interp_base;
@@ -1423,14 +1591,49 @@ int main(int argc, char** argv) {
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME=/root",
             "USER=root",
+            "LOGNAME=root",
+            "SHELL=/bin/sh",
             "TERM=xterm-256color",
             "LANG=C.UTF-8",
             "HOSTNAME=friscy",
             "TZ=UTC",
-            "NODE_OPTIONS=--jitless --v8-pool-size=0 --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js",
-            "NODE_COMPILE_CACHE=/tmp/node-compile-cache",
-            "UV_THREADPOOL_SIZE=1",
         };
+#ifdef __EMSCRIPTEN__
+        env.push_back("NODE_OPTIONS=--jitless --v8-pool-size=0 --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js");
+        env.push_back("NODE_COMPILE_CACHE=/tmp/node-compile-cache");
+        env.push_back("UV_THREADPOOL_SIZE=1");
+#endif
+#ifndef __EMSCRIPTEN__
+        auto replace_env = [&env](const std::string& key, const std::string& value) {
+            const std::string prefix = key + "=";
+            for (auto& existing : env) {
+                if (existing.compare(0, prefix.size(), prefix) == 0) {
+                    existing = prefix + value;
+                    return;
+                }
+            }
+            env.push_back(prefix + value);
+        };
+        if (const char* user_env = std::getenv("USER"); user_env && *user_env) {
+            replace_env("USER", user_env);
+            replace_env("LOGNAME", user_env);
+        }
+        if (const char* home_env = std::getenv("HOME"); home_env && *home_env) {
+            replace_env("HOME", home_env);
+        }
+        if (const char* shell_env = std::getenv("SHELL"); shell_env && *shell_env) {
+            replace_env("SHELL", shell_env);
+        }
+        if (const char* term_env = std::getenv("TERM"); term_env && *term_env) {
+            replace_env("TERM", term_env);
+        }
+        if (const char* lang_env = std::getenv("LANG"); lang_env && *lang_env) {
+            replace_env("LANG", lang_env);
+        }
+        if (const char* pwd_env = std::getenv("PWD"); pwd_env && *pwd_env) {
+            replace_env("PWD", pwd_env);
+        }
+#endif
         // Apply --env overrides: if KEY matches an existing var, replace it
         for (const auto& e : extra_env) {
             auto eq = e.find('=');
@@ -1653,10 +1856,13 @@ int main(int argc, char** argv) {
                 }
                 // Fork child exited: restore parent state outside simulate()
                 if (syscalls::fork_child_exited()) {
-                    if (!syscalls::fork_parent_restoring()) {
-                        __builtin_trap();
-                    }
                     syscalls::fork_parent_restore(machine);
+                    fprintf(stderr,
+                            "[simulate-loop] after-restore pc=0x%lx stopped=%d fork_active=%d state=%s\n",
+                            (unsigned long)machine.cpu.pc(),
+                            (int)machine.stopped(),
+                            (int)syscalls::g_fork_active(),
+                            syscalls::process_state_name(syscalls::fork_state()));
                     retries = -1;
                     continue;
                 }
@@ -1667,7 +1873,120 @@ int main(int argc, char** argv) {
                     continue;
                 }
 #else
-                machine.simulate(MAX_INSTRUCTIONS);
+                if (syscalls::g_trace_syscalls && syscalls::g_trace_after_cpu_max) {
+                    static constexpr uint64_t TRACE_CHUNK = 5'000'000;
+                    while (true) {
+                        if (syscalls::g_single_step_budget > 0) {
+                            const uint64_t pc = machine.cpu.pc();
+                            const uint64_t ra = machine.cpu.reg(riscv::REG_RA);
+                            const uint64_t sp = machine.cpu.reg(riscv::REG_SP);
+                            const uint64_t a0 = machine.cpu.reg(10);
+                            const uint64_t a5 = machine.cpu.reg(15);
+                            static bool logged_exec_bytes = false;
+                            if (!logged_exec_bytes
+                                && ((pc >= 0x5d5000 && pc < 0x5f0000)
+                                    || (pc >= 0x440000 && pc < 0x450000))) {
+                                logged_exec_bytes = true;
+                                dump_exec_bytes(machine, pc, "[single-step-bytes]");
+                            }
+                            if (pc == 0x5e2b24 || pc == 0x5e2b54 || pc == 0x5e2b7c) {
+                                fprintf(stderr,
+                                        "[single-step-stack] pc=0x%lx sp=0x%lx ra=0x%lx\n",
+                                        (unsigned long)pc,
+                                        (unsigned long)sp,
+                                        (unsigned long)ra);
+                                for (int i = 0; i < 6; i++) {
+                                    uint64_t addr = sp + 56 + i * 8;
+                                    uint64_t val = 0;
+                                    try {
+                                        val = machine.memory.read<uint64_t>(addr);
+                                    } catch (...) {}
+                                    fprintf(stderr,
+                                            "[single-step-stack] [0x%lx]=0x%lx\n",
+                                            (unsigned long)addr,
+                                            (unsigned long)val);
+                                }
+                            }
+                            std::string instr_text;
+                            try {
+                                instr_text = machine.cpu.current_instruction_to_string();
+                            } catch (const std::exception& e) {
+                                instr_text = std::string("<decode-error: ") + e.what() + ">";
+                            }
+                            fprintf(stderr,
+                                    "[single-step] budget=%d pc=0x%lx ra=0x%lx sp=0x%lx a0=0x%lx a5=0x%lx %s\n",
+                                    syscalls::g_single_step_budget,
+                                    (unsigned long)pc,
+                                    (unsigned long)ra,
+                                    (unsigned long)sp,
+                                    (unsigned long)a0,
+                                    (unsigned long)a5,
+                                    instr_text.c_str());
+                            machine.cpu.step_one();
+                            syscalls::g_single_step_budget--;
+                            if (syscalls::fork_child_exited()
+                                || syscalls::fork_parent_waiting() || syscalls::g_execve_restart
+                                || syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch
+                                || (machine.stopped() && !machine.instruction_limit_reached())) {
+                                break;
+                            }
+                            continue;
+                        }
+                        machine.resume<false>(TRACE_CHUNK);
+                        if (syscalls::fork_child_exited()
+                            || syscalls::fork_parent_waiting() || syscalls::g_execve_restart
+                            || syscalls::g_waiting_for_stdin || syscalls::g_waiting_for_host_fetch
+                            || (machine.stopped() && !machine.instruction_limit_reached()
+                                && syscalls::g_single_step_budget <= 0)) {
+                            break;
+                        }
+                        if (!machine.instruction_limit_reached()) break;
+                        const auto [instrs, _] = machine.get_counters();
+                        fprintf(stderr,
+                                "[trace-chunk] pc=0x%lx instr=%llu stopped=%d fork=%d execve_restart=%d\n",
+                                (unsigned long)machine.cpu.pc(),
+                                (unsigned long long)instrs,
+                                (int)machine.stopped(),
+                                (int)syscalls::g_fork_active(),
+                                (int)syscalls::g_execve_restart);
+                    }
+                } else {
+                    machine.simulate(MAX_INSTRUCTIONS);
+                }
+                {
+                    const auto [instrs, _] = machine.get_counters();
+                    fprintf(stderr,
+                            "[simulate-native] returned pc=0x%lx stopped=%d limit=%d stdin=%d host_fetch=%d fork_active=%d fork_child_exited=%d fork_parent_waiting=%d execve_restart=%d instr=%llu\n",
+                            (unsigned long)machine.cpu.pc(),
+                            (int)machine.stopped(),
+                            (int)machine.instruction_limit_reached(),
+                            (int)syscalls::g_waiting_for_stdin,
+                            (int)syscalls::g_waiting_for_host_fetch,
+                            (int)syscalls::g_fork_active(),
+                            (int)syscalls::fork_child_exited(),
+                            (int)syscalls::fork_parent_waiting(),
+                            (int)syscalls::g_execve_restart,
+                            (unsigned long long)instrs);
+                }
+                if (syscalls::g_single_step_resume
+                    && machine.stopped()
+                    && !machine.instruction_limit_reached()) {
+                    if (syscalls::g_single_step_budget <= 0) {
+                        syscalls::g_single_step_resume = false;
+                    }
+                    retries = -1;
+                    continue;
+                }
+                if (syscalls::g_fork_active() || syscalls::fork_child_exited()
+                    || syscalls::fork_parent_waiting() || syscalls::g_execve_restart) {
+                    fprintf(stderr,
+                            "[simulate-loop] returned pc=0x%lx stopped=%d fork_active=%d state=%s execve_restart=%d\n",
+                            (unsigned long)machine.cpu.pc(),
+                            (int)machine.stopped(),
+                            (int)syscalls::g_fork_active(),
+                            syscalls::process_state_name(syscalls::fork_state()),
+                            (int)syscalls::g_execve_restart);
+                }
                 // Checkpoint export: save state when machine first waits for stdin
                 if (syscalls::g_waiting_for_stdin && !export_checkpoint_path.empty()) {
                     dbg_fprintf(stderr, "[friscy] Saving checkpoint at stdin wait point...\n");
@@ -1684,9 +2003,6 @@ int main(int argc, char** argv) {
                 }
                 // Fork child exited: restore parent state outside simulate()
                 if (syscalls::fork_child_exited()) {
-                    if (!syscalls::fork_parent_restoring()) {
-                        __builtin_trap();
-                    }
                     syscalls::fork_parent_restore(machine);
                     retries = -1;
                     continue;
@@ -1812,7 +2128,29 @@ int main(int argc, char** argv) {
                     retries = 0;
                     continue;  // Resume machine execution
                 }
+                if (machine.stopped() && !machine.instruction_limit_reached()
+                    && syscalls::g_single_step_budget <= 0) {
+                    syscalls::g_trace_after_cpu_max = false;
+                }
 #endif
+                {
+                    static int normal_return_budget = 32;
+                    if (normal_return_budget-- > 0) {
+                        fprintf(stderr,
+                                "[simulate-return] retries=%d instructions=%llu exit_code=%lu pc=0x%lx stopped=%d stdin_wait=%d host_fetch=%d limit=%d fork=%d execve_restart=%d stop_mask=0x%x\n",
+                                retries,
+                                (unsigned long long)machine.instruction_counter(),
+                                (unsigned long)machine.return_value(),
+                                (unsigned long)machine.cpu.pc(),
+                                (int)machine.stopped(),
+                                (int)syscalls::g_waiting_for_stdin,
+                                (int)syscalls::g_waiting_for_host_fetch,
+                                (int)machine.instruction_limit_reached(),
+                                (int)syscalls::g_fork_active(),
+                                (int)syscalls::g_execve_restart,
+                                current_stop_reason_mask());
+                    }
+                }
                 dbg_cerr << "[friscy] simulate() returned normally, retries=" << retries
                           << " instructions=" << machine.instruction_counter()
                           << " exit_code=" << machine.return_value()
@@ -1826,6 +2164,87 @@ int main(int argc, char** argv) {
                 uint64_t fault_addr = e.data();
                 uint64_t crash_pc = machine.cpu.pc();
                 const std::string what = e.what();
+                {
+                    static int machine_exception_budget = 32;
+                    if (machine_exception_budget-- > 0) {
+                        fprintf(stderr,
+                                "[machine-exception] what=%s data=0x%lx pc=0x%lx ra=0x%lx sp=0x%lx a0=0x%lx a7=%ld stopped=%d stop_mask=0x%x\n",
+                                what.c_str(),
+                                (unsigned long)fault_addr,
+                                (unsigned long)crash_pc,
+                                (unsigned long)machine.cpu.reg(riscv::REG_RA),
+                                (unsigned long)machine.cpu.reg(riscv::REG_SP),
+                                (unsigned long)machine.cpu.reg(10),
+                                (long)machine.cpu.reg(17),
+                                (int)machine.stopped(),
+                                current_stop_reason_mask());
+                        try {
+                            const auto pc_info = machine.memory.get_page_info(crash_pc);
+                            fprintf(stderr, "[machine-exception] pc-page %s\n", pc_info.c_str());
+                        } catch (...) {}
+                        try {
+                            const auto ra_info = machine.memory.get_page_info(machine.cpu.reg(riscv::REG_RA));
+                            fprintf(stderr, "[machine-exception] ra-page %s\n", ra_info.c_str());
+                        } catch (...) {}
+                        auto dump_stack_words = [&machine](const char* label, uint64_t base, int count) {
+                            fprintf(stderr, "[machine-exception] %s:", label);
+                            for (int i = 0; i < count; i++) {
+                                const uint64_t addr = base + uint64_t(i) * 8;
+                                uint64_t val = 0;
+                                try {
+                                    val = machine.memory.read<uint64_t>(addr);
+                                    fprintf(stderr, " [0x%lx]=0x%lx",
+                                            (unsigned long)addr,
+                                            (unsigned long)val);
+                                } catch (...) {
+                                    fprintf(stderr, " [0x%lx]=<fault>", (unsigned long)addr);
+                                    break;
+                                }
+                            }
+                            fprintf(stderr, "\n");
+                        };
+                        const uint64_t sp = machine.cpu.reg(riscv::REG_SP);
+                        if (sp >= 0x1000) {
+                            const uint64_t window_base = (sp >= 0x20) ? (sp - 0x20) : 0;
+                            dump_stack_words("sp-window", window_base, 12);
+                        }
+                        uint64_t fp = machine.cpu.reg(8);
+                        if (fp >= 0x1000) {
+                            fprintf(stderr, "[machine-exception] fp-chain:");
+                            for (int i = 0; i < 8 && fp >= 0x1000; i++) {
+                                try {
+                                    const uint64_t saved_fp = machine.memory.read<uint64_t>(fp - 16);
+                                    const uint64_t saved_ra = machine.memory.read<uint64_t>(fp - 8);
+                                    fprintf(stderr, " {fp=0x%lx ra=0x%lx next=0x%lx}",
+                                            (unsigned long)fp,
+                                            (unsigned long)saved_ra,
+                                            (unsigned long)saved_fp);
+                                    if (saved_fp == 0 || saved_fp == fp) break;
+                                    fp = saved_fp;
+                                } catch (...) {
+                                    fprintf(stderr, " {fp=0x%lx <fault>}", (unsigned long)fp);
+                                    break;
+                                }
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        if (crash_pc < 0x100000 || machine.cpu.reg(riscv::REG_RA) < 0x100000) {
+                            constexpr uint64_t got_base = 0xc82f0;
+                            fprintf(stderr, "[machine-exception] got-window:");
+                            for (int i = 0; i < 8; i++) {
+                                uint64_t val = 0;
+                                try {
+                                    val = machine.memory.read<uint64_t>(got_base + i * 8);
+                                } catch (...) {}
+                                fprintf(stderr, " [0x%lx]=0x%lx",
+                                        (unsigned long)(got_base + i * 8),
+                                        (unsigned long)val);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        dump_exec_bytes(machine, crash_pc, "[machine-exception-bytes]");
+                    }
+                }
                 const bool is_ebreak = what.find("EBREAK") != std::string::npos;
                 const bool is_sigill = what.find("SIGILL") != std::string::npos || what.find("Illegal instruction") != std::string::npos;
                 g_last_fault_kind = FRISCY_FAULT_MACHINE_EXCEPTION;
@@ -1916,6 +2335,11 @@ int main(int argc, char** argv) {
 
                 if (retries < 7) {
                     machine.memory.evict_execute_segments();
+                    const auto* pc_region = syscalls::live_mmap_find(crash_pc);
+                    if (pc_region != nullptr && pc_region->attr.exec) {
+                        const uint64_t pc_page = crash_pc & ~0xFFFULL;
+                        machine.memory.set_page_attr(pc_page, 4096, pc_region->attr);
+                    }
                     if (fault_addr != 0) {
                         constexpr uint64_t PAGE_MASK = ~0xFFFULL;
                         uint64_t page = fault_addr & PAGE_MASK;

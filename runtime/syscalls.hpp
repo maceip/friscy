@@ -21,6 +21,7 @@
 #include <random>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <set>
 #include <vector>
 #include <unordered_map>
@@ -32,6 +33,7 @@ extern "C" long js_opfs_io(int fd, void* buf, size_t len, int op, long off);
 #else
 #include <sys/socket.h>
 #include <poll.h>
+#include <unistd.h>
 #endif
 
 namespace syscalls {
@@ -64,6 +66,12 @@ inline std::string g_host_fetch_response;
 // Flag: true when machine stopped due to execve loading a new binary.
 // The dispatch loop must re-enter simulate() with the new binary.
 inline bool g_execve_restart = false;
+// Debug flag: when tracing direct Node startup, switch to chunked execution
+// after the cgroup cpu.max probe completes so we can sample the post-probe PC
+// without perturbing earlier loader behavior.
+inline bool g_trace_after_cpu_max = false;
+inline int g_single_step_budget = 0;
+inline bool g_single_step_resume = false;
 
 // Fork lifecycle state model (durable over implicit lifecycle flags).
 enum class ProcessState : uint8_t {
@@ -225,6 +233,232 @@ static constexpr uint32_t STOP_REASON_FORK_RESTORE = 1u << 4;
 // Global mmap bump pointer — must be file-scope so fork_parent_restore can
 // reset it. See sys_mmap for usage.
 inline uint64_t g_mmap_bump = 0;
+inline bool g_conservative_small_mmap_reuse = false;
+inline bool g_force_materialize_anon_mmap = false;
+
+struct LiveMmapRegion {
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    riscv::PageAttributes attr {};
+    bool lazy = false;
+    bool anonymous = false;
+};
+inline std::map<uint64_t, LiveMmapRegion> g_live_mmap_regions;
+inline bool g_lazy_mmap_page_tables_enabled = false;
+inline typename riscv::Memory<riscv::RISCV64>::page_fault_cb_t g_prev_page_fault_handler;
+inline bool g_live_mmap_page_fault_handler_installed = false;
+
+inline riscv::PageAttributes normalize_live_mmap_attr(riscv::PageAttributes attr) {
+    attr.is_cow = false;
+    attr.non_owning = false;
+    attr.dont_fork = false;
+    attr.user_defined = 0;
+    attr.cacheable = true;
+    return attr;
+}
+
+inline riscv::PageAttributes mmap_attr_from_prot(int prot) {
+    riscv::PageAttributes attr;
+    attr.read = (prot & 1) != 0;
+    attr.write = (prot & 2) != 0;
+    attr.exec = (prot & 4) != 0;
+    return normalize_live_mmap_attr(attr);
+}
+
+inline riscv::PageAttributes merge_live_mmap_attr(
+    riscv::PageAttributes a, const riscv::PageAttributes& b
+) {
+    a.read = a.read || b.read;
+    a.write = a.write || b.write;
+    a.exec = a.exec || b.exec;
+    return normalize_live_mmap_attr(a);
+}
+
+inline bool same_live_mmap_attr(const riscv::PageAttributes& a, const riscv::PageAttributes& b) {
+    return a.read == b.read && a.write == b.write && a.exec == b.exec;
+}
+
+inline void coalesce_live_mmap_regions() {
+    if (g_live_mmap_regions.empty()) return;
+    for (auto it = g_live_mmap_regions.begin(); it != g_live_mmap_regions.end();) {
+        auto next = std::next(it);
+        if (next != g_live_mmap_regions.end()
+            && it->second.addr + it->second.size == next->second.addr
+            && it->second.lazy == next->second.lazy
+            && it->second.anonymous == next->second.anonymous
+            && same_live_mmap_attr(it->second.attr, next->second.attr)) {
+            it->second.size += next->second.size;
+            g_live_mmap_regions.erase(next);
+            continue;
+        }
+        ++it;
+    }
+}
+
+inline void live_mmap_unmap(uint64_t addr, uint64_t size) {
+    if (size == 0) return;
+    const uint64_t end = addr + size;
+    auto it = g_live_mmap_regions.lower_bound(addr);
+    if (it != g_live_mmap_regions.begin()) --it;
+    while (it != g_live_mmap_regions.end()) {
+        const LiveMmapRegion cur = it->second;
+        const uint64_t cur_end = cur.addr + cur.size;
+        if (cur_end <= addr) {
+            ++it;
+            continue;
+        }
+        if (cur.addr >= end) break;
+        auto erase_it = it++;
+        g_live_mmap_regions.erase(erase_it);
+        if (cur.addr < addr) {
+            g_live_mmap_regions.emplace(cur.addr, LiveMmapRegion {
+                .addr = cur.addr,
+                .size = addr - cur.addr,
+                .attr = cur.attr,
+                .lazy = cur.lazy,
+                .anonymous = cur.anonymous,
+            });
+        }
+        if (cur_end > end) {
+            g_live_mmap_regions.emplace(end, LiveMmapRegion {
+                .addr = end,
+                .size = cur_end - end,
+                .attr = cur.attr,
+                .lazy = cur.lazy,
+                .anonymous = cur.anonymous,
+            });
+            break;
+        }
+    }
+}
+
+inline void live_mmap_map(
+    uint64_t addr, uint64_t size, riscv::PageAttributes attr, bool lazy = false, bool anonymous = false
+) {
+    if (size == 0) return;
+    live_mmap_unmap(addr, size);
+    g_live_mmap_regions[addr] = LiveMmapRegion {
+        .addr = addr,
+        .size = size,
+        .attr = normalize_live_mmap_attr(attr),
+        .lazy = lazy,
+        .anonymous = anonymous,
+    };
+    coalesce_live_mmap_regions();
+}
+
+inline const LiveMmapRegion* live_mmap_find(uint64_t addr) {
+    auto it = g_live_mmap_regions.upper_bound(addr);
+    if (it == g_live_mmap_regions.begin()) return nullptr;
+    --it;
+    const auto& region = it->second;
+    if (addr >= region.addr && addr < region.addr + region.size) {
+        return &region;
+    }
+    return nullptr;
+}
+
+inline void enable_lazy_mmap_page_tables(Machine& m) {
+    if (g_lazy_mmap_page_tables_enabled || !m.memory.uses_flat_memory_arena()) return;
+    g_lazy_mmap_page_tables_enabled = true;
+    m.memory.set_memory_arena_fast_path_end(m.memory.mmap_start());
+}
+
+inline void reset_lazy_mmap_page_tables(Machine& m) {
+    g_lazy_mmap_page_tables_enabled = false;
+    if (m.memory.uses_flat_memory_arena()) {
+        m.memory.restore_memory_arena_fast_path();
+    }
+}
+
+inline void install_live_mmap_page_fault_handler(Machine& m) {
+    if (g_live_mmap_page_fault_handler_installed) return;
+    g_prev_page_fault_handler = m.memory.set_page_fault_handler(
+        [] (auto& mem, const auto pageno, bool init) -> riscv::Page& {
+            const uint64_t addr = uint64_t(pageno) * riscv::Page::size();
+            if (g_lazy_mmap_page_tables_enabled
+                && mem.uses_flat_memory_arena()
+                && addr >= mem.mmap_start()
+                && addr < mem.memory_arena_size()) {
+                const auto* region = live_mmap_find(addr);
+                if (region == nullptr || !region->lazy || !region->anonymous) {
+                    return g_prev_page_fault_handler(mem, pageno, init);
+                }
+                auto* arena = static_cast<riscv::PageData*>(mem.memory_arena_ptr());
+                if (arena == nullptr) {
+                    return g_prev_page_fault_handler(mem, pageno, init);
+                }
+                // Lazy anonymous mappings are already zero-filled when mapped.
+                // At first touch the arena may now contain live stack / heap
+                // data from direct arena writes, so materializing the page must
+                // preserve the existing bytes instead of blanking the whole page.
+                return mem.allocate_page(pageno, region->attr, &arena[pageno]);
+            }
+            return g_prev_page_fault_handler(mem, pageno, init);
+        });
+    g_live_mmap_page_fault_handler_installed = true;
+}
+
+inline void set_materialized_page_attrs_for_range(
+    Machine& m, uint64_t addr, uint64_t size, riscv::PageAttributes attr
+) {
+    if (size == 0) return;
+    const uint64_t first = addr >> 12;
+    const uint64_t last = (addr + size - 1) >> 12;
+    for (auto& [pageno, page] : m.memory.pages()) {
+        if (pageno < first || pageno > last) continue;
+        const bool is_cow = page.attr.is_cow;
+        page.attr.apply_regular_attributes(attr);
+        if (is_cow || (attr.write && page.is_cow_page())) {
+            page.attr.is_cow = true;
+            page.attr.write = false;
+        }
+        m.memory.invalidate_cache(pageno, &page);
+    }
+}
+
+inline void free_materialized_pages_for_range(Machine& m, uint64_t addr, uint64_t size) {
+    if (size == 0) return;
+    const uint64_t first = addr >> 12;
+    const uint64_t last = (addr + size - 1) >> 12;
+    std::vector<uint64_t> victims;
+    victims.reserve(64);
+    for (const auto& [pageno, page] : m.memory.pages()) {
+        (void)page;
+        if (pageno >= first && pageno <= last) {
+            victims.push_back(pageno);
+        }
+    }
+    for (const uint64_t pageno : victims) {
+        m.memory.free_pageno(pageno);
+    }
+}
+
+inline bool should_materialize_anon_mmap(
+    Machine& m, uint64_t addr, uint64_t size, const riscv::PageAttributes& attr
+) {
+    if (!m.memory.uses_flat_memory_arena()) return true;
+    if (addr >= m.memory.memory_arena_size()) return true;
+    if (size > m.memory.memory_arena_size() - addr) return true;
+    // Large guests like node trip musl allocator traps when anonymous RW
+    // mappings stay lazy. Keep the custom mmap wrapper, but eagerly back anon
+    // mappings once a large executable is active.
+    if (g_force_materialize_anon_mmap) return true;
+    // Anonymous executable mappings need concrete page entries before the CPU
+    // can fetch from them. Non-executable mappings can be materialized lazily
+    // on first touch once the mmap arena is routed through the page table.
+    return attr.exec;
+}
+
+inline bool is_node_guest_path(std::string_view path) {
+    if (path.empty()) return false;
+    if (path == "node") return true;
+    auto slash = path.rfind('/');
+    const auto base = (slash == std::string_view::npos) ? path : path.substr(slash + 1);
+    return base == "node";
+}
+
+inline bool g_enable_node_anon_relax = false;
 
 // Safe-mode bypass for custom mmap handling.
 inline bool g_disable_custom_mmap_wrapper = false;
@@ -251,7 +485,7 @@ struct MmapRails {
     std::unordered_map<uint64_t, uint64_t> munmap_ra_hits;
 };
 inline MmapRails g_mmap_rails;
-inline int g_mmap_boundary_dump_budget = 1;
+inline int g_mmap_boundary_dump_budget = 0;
 inline uint64_t g_mmap_boundary_target_call = 0;
 inline bool g_mmap_boundary_watch_all_calls = false;
 inline bool g_mmap_boundary_panic_on_drift = false;
@@ -379,9 +613,23 @@ static inline void dump_mmap_boundary_decode_once(Machine& m, const char* phase)
     } catch (...) {
         fprintf(stderr, "[mmap-boundary] decode-one-shot unavailable\n");
     }
+    constexpr uint64_t got_base = 0xc82f0;
+    fprintf(stderr, "[mmap-boundary] got-window phase=%s", phase);
+    for (int i = 0; i < 8; i++) {
+        uint64_t val = 0;
+        try {
+            val = m.memory.template read<uint64_t>(got_base + i * 8);
+        } catch (...) {}
+        fprintf(stderr, " [0x%lx]=0x%lx",
+                (unsigned long)(got_base + i * 8),
+                (unsigned long)val);
+    }
+    fprintf(stderr, "\n");
 }
 
 static inline void check_mmap_boundary_drift(Machine& m, uint64_t call_id, const char* phase) {
+    if (call_id == 0)
+        return;
     const bool watched = (g_mmap_boundary_watch_all_calls || call_id == g_mmap_boundary_target_call);
     if (!watched)
         return;
@@ -529,6 +777,37 @@ static inline void invalidate_reuse_cache(Machine& m, uint64_t addr, uint64_t le
     }
 }
 
+static inline bool mmap_reuse_cache_eligible(uint64_t len) {
+    // After a guest execve, musl/Node churn many short-lived 4K/8K anonymous
+    // mappings during loader and allocator setup. Recycling those holes
+    // aggressively diverges from Linux's more monotonic mmap layout and has
+    // been observed to trip musl allocator consistency checks. Keep arena-top
+    // shrinkage, but only recycle larger holes through the free-list once the
+    // conservative post-execve mode is enabled.
+    if (!g_conservative_small_mmap_reuse) {
+        return true;
+    }
+    constexpr uint64_t MIN_REUSABLE_MMAP = 1ULL << 20; // 1 MiB
+    return len >= MIN_REUSABLE_MMAP;
+}
+
+static inline bool keep_monotonic_small_anon_unmap(uint64_t addr, uint64_t len) {
+    if (!g_conservative_small_mmap_reuse || len == 0) {
+        return false;
+    }
+    constexpr uint64_t MIN_REUSABLE_MMAP = 1ULL << 20; // 1 MiB
+    if (len >= MIN_REUSABLE_MMAP) {
+        return false;
+    }
+    const auto* region = live_mmap_find(addr);
+    if (region == nullptr || !region->anonymous) {
+        return false;
+    }
+    const uint64_t region_end = region->addr + region->size;
+    const uint64_t unmap_end = addr + len;
+    return addr >= region->addr && unmap_end <= region_end;
+}
+
 struct AnonMapResult {
     uint64_t addr = 0;
     uint64_t aligned_len = 0;
@@ -570,11 +849,13 @@ static inline AnonMapResult alloc_anon_mapping(Machine& m, uint64_t addr_hint, u
         addr_hint = 0;
     }
 
-    auto reused = m.memory.mmap_cache().find(out.aligned_len);
-    if (!reused.empty()) {
-        out.addr = reused.addr;
-        out.from_reuse_cache = true;
-        return out;
+    if (mmap_reuse_cache_eligible(out.aligned_len)) {
+        auto reused = m.memory.mmap_cache().find(out.aligned_len);
+        if (!reused.empty()) {
+            out.addr = reused.addr;
+            out.from_reuse_cache = true;
+            return out;
+        }
     }
 
     if (g_mmap_bump + out.aligned_len > limit) {
@@ -604,13 +885,14 @@ static inline uint64_t munmap_return_ra(Machine& m) {
 }
 
 static inline void custom_unmap_range(Machine& m, uint64_t addr, uint64_t aligned_len, uint64_t pc, uint64_t ra) {
+    const bool keep_monotonic = keep_monotonic_small_anon_unmap(addr, aligned_len);
     if (addr >= m.memory.mmap_start() && aligned_len > 0) {
-        if (g_mmap_bump != 0 && addr + aligned_len == g_mmap_bump) {
+        if (!keep_monotonic && g_mmap_bump != 0 && addr + aligned_len == g_mmap_bump) {
             g_mmap_bump = addr;
             if (m.memory.mmap_address() > g_mmap_bump) {
                 m.memory.mmap_address() = g_mmap_bump;
             }
-        } else {
+        } else if (!keep_monotonic && mmap_reuse_cache_eligible(aligned_len)) {
             m.memory.mmap_cache().insert(addr, aligned_len);
         }
     }
@@ -979,10 +1261,16 @@ struct ForkState {
         uint64_t addr;
         uint64_t size;
     };
+    struct MmapRegion {
+        std::vector<uint8_t> data;
+        uint64_t addr = 0;
+        uint64_t size = 0;
+        riscv::PageAttributes attr {};
+    };
     MemRegion exec_data;     // data/BSS + BRK region
     MemRegion interp_data;
     MemRegion stack_data;
-    MemRegion mmap_data;     // guest mmap allocations (TLS, malloc)
+    std::vector<MmapRegion> mmap_regions; // live guest mmap allocations only
     // VFS fd table snapshot: full clone of open file/dir handles.
     // Restored after child exits so child's close/dup2/open changes
     // are undone while preserving pipe buffer data.
@@ -995,6 +1283,8 @@ struct ForkState {
     // resets g_sched; must restore parent's thread state on child exit.
     alignas(16) uint8_t saved_sched[8192];  // enough for ThreadScheduler (~5KB)
     uint64_t saved_mmap_address = 0;
+    bool saved_conservative_small_mmap_reuse = false;
+    bool saved_force_materialize_anon_mmap = false;
     ExecContext saved_exec_ctx;
     bool has_exec_ctx = false;
     bool child_did_execve = false;
@@ -1081,8 +1371,22 @@ struct TermiosState {
 };
 // Shared termios for the tty (fd 0/1/2 all refer to the same terminal)
 inline TermiosState g_termios;
-// Track which fds are tty fds (0/1/2 are always tty; /dev/tty opens add more)
-inline std::set<int> g_tty_fds = {0, 1, 2};
+// Track which fds are tty fds. In the browser we always present a terminal,
+// but in native batch runs stdio should only be tty-backed when the host fds
+// really are terminals.
+inline std::set<int> g_tty_fds = [] {
+    std::set<int> tty_fds;
+#ifdef __EMSCRIPTEN__
+    tty_fds.insert(0);
+    tty_fds.insert(1);
+    tty_fds.insert(2);
+#else
+    if (::isatty(STDIN_FILENO)) tty_fds.insert(0);
+    if (::isatty(STDOUT_FILENO)) tty_fds.insert(1);
+    if (::isatty(STDERR_FILENO)) tty_fds.insert(2);
+#endif
+    return tty_fds;
+}();
 // fcntl per-fd state
 // - F_GETFD / F_SETFD -> g_fd_cloexec_flags (FD_CLOEXEC bit)
 // - F_GETFL / F_SETFL -> g_fd_status_flags (O_* status flags)
@@ -1118,6 +1422,8 @@ struct ThreadScheduler {
         threads[0].tid = main_tid;
         threads[0].active = true;
         threads[0].waiting = false;
+        threads[0].clear_child_tid = 0;
+        threads[0].syscall_budget = THREAD_QUANTUM_MAIN;
         current = 0;
         count = 1;
     }
@@ -1205,6 +1511,12 @@ inline bool switch_to_thread(Machine& m, int target_idx) {
 // Preemptive yield: called from hot-path syscalls (clock_gettime, etc.).
 // Decrements current thread's budget; when exhausted, switches to next runnable.
 inline void maybe_preempt(Machine& m) {
+    (void)m;
+    // Opportunistic syscall-tail preemption is currently unsafe for musl's
+    // pthread startup path: switching the active vthread before the dispatcher
+    // finishes the syscall return sequence can corrupt the resumed control flow.
+    // Keep scheduling cooperative at explicit blocking points for now.
+    return;
     if (g_sched.count <= 1) return;
     auto& cur = g_sched.threads[g_sched.current];
     if (cur.syscall_budget > 0) {
@@ -1406,12 +1718,14 @@ constexpr int O_CLOEXEC = 02000000;
 // Error codes (negated for syscall return values)
 namespace err {
     constexpr int64_t NOENT = -2;
+    constexpr int64_t NXIO = -6;
     constexpr int64_t BADF = -9;
     constexpr int64_t ACCES = -13;
     constexpr int64_t EXIST = -17;
     constexpr int64_t NOTDIR = -20;
     constexpr int64_t ISDIR = -21;
     constexpr int64_t INVAL = -22;
+    constexpr int64_t NOTTY = -25;
     constexpr int64_t NOSYS = -38;
     constexpr int64_t NOTSUP = -95;
 }
@@ -1512,7 +1826,7 @@ static void sys_exit(Machine& m) {
         // No other threads — fall through to actual exit
     }
 
-    if (g_fork_active()) {
+    if (g_fork_active() && g_fork().in_child) {
 fork_child_exit:
         // "Child" is exiting — record exit status and stop machine.
         // The actual parent restore happens OUTSIDE simulate() via
@@ -1536,6 +1850,11 @@ fork_child_exit:
             g_fork().exit_status);
         g_process_model.mark_exited(g_fork().child_pid, g_fork().exit_status);
         m.stop();
+        fprintf(stderr,
+                "[fork-exit] stop requested stopped=%d state=%s current_pid=%d\n",
+                (int)m.stopped(),
+                process_state_name(fork_state()),
+                (int)g_process_model.current_pid);
         return;
     }
     int exit_code = m.template sysarg<int>(0);
@@ -1559,7 +1878,7 @@ inline void fork_parent_restore(Machine& m) {
         expect_transition(fork_state(), ProcessState::ParentRestored, "restore", "restore parent context without child exit");
     }
     fork_set_state(m, ProcessState::ParentRestored, "restore", "restore parent context");
-    dbg_fprintf(stderr,
+    fprintf(stderr,
             "[fork-restore] begin child_pid=%d parent_pid=%d exit_status=%d child_reaped=%d child_execve=%d current_pid=%d wait_child=%d wait_pid=%d state=%s\n",
             g_fork().child_pid,
             g_fork().parent_pid,
@@ -1568,7 +1887,8 @@ inline void fork_parent_restore(Machine& m) {
             (int)g_fork().child_did_execve,
             (int)g_process_model.current_pid,
             (int)fork_parent_waiting(),
-            (int)g_wait_blocked_pid);
+            (int)g_wait_blocked_pid,
+            process_state_name(fork_state()));
     g_fork().in_child = false;
 
     // Reload parent executable/interpreter text segments
@@ -1612,7 +1932,6 @@ inline void fork_parent_restore(Machine& m) {
     };
     fix_perms(g_fork().exec_data.addr, g_fork().exec_data.size);
     fix_perms(g_fork().interp_data.addr, g_fork().interp_data.size);
-    fix_perms(g_fork().mmap_data.addr, g_fork().mmap_data.size);
     fix_perms(g_fork().stack_data.addr, g_fork().stack_data.size);
 
     // Restore parent memory using arena-aware copy (see arena_memcpy_in).
@@ -1623,16 +1942,44 @@ inline void fork_parent_restore(Machine& m) {
             r.data.shrink_to_fit();
         }
     };
-    dbg_fprintf(stderr, "[fork-restore] exec=[0x%lx+0x%lx] interp=[0x%lx+0x%lx] "
-            "stack=[0x%lx+0x%lx] mmap=[0x%lx+0x%lx]\n",
+    size_t mmap_restore_bytes = 0;
+    for (const auto& region : g_fork().mmap_regions) mmap_restore_bytes += region.size;
+    fprintf(stderr, "[fork-restore] exec=[0x%lx+0x%lx] interp=[0x%lx+0x%lx] "
+            "stack=[0x%lx+0x%lx] mmap_regions=%zu mmap_bytes=0x%zx\n",
             (long)g_fork().exec_data.addr, (long)g_fork().exec_data.size,
             (long)g_fork().interp_data.addr, (long)g_fork().interp_data.size,
             (long)g_fork().stack_data.addr, (long)g_fork().stack_data.size,
-            (long)g_fork().mmap_data.addr, (long)g_fork().mmap_data.size);
+            g_fork().mmap_regions.size(), mmap_restore_bytes);
     restore(g_fork().exec_data, "exec");
     restore(g_fork().interp_data, "interp");
     restore(g_fork().stack_data, "stack");
-    restore(g_fork().mmap_data, "mmap");
+    if (!g_live_mmap_regions.empty()) {
+        // After a child execve, the arena contains large child-only mappings
+        // that no longer belong to the restored parent. In encompassing-arena
+        // mode, aggressively zeroing and PROT_NONE'ing every child region here
+        // can fault mid-restore and is not required for correctness: the
+        // parent's saved mmap regions are restored explicitly below, the mmap
+        // frontier is reset, and fresh anonymous mappings are zero-filled on
+        // allocation. Drop the child live-map view and let the parent snapshot
+        // become authoritative.
+        g_live_mmap_regions.clear();
+    }
+    for (auto& region : g_fork().mmap_regions) {
+        if (region.size == 0) continue;
+        riscv::PageAttributes rwx;
+        rwx.read = true;
+        rwx.write = true;
+        rwx.exec = true;
+        m.memory.set_page_attr(region.addr, region.size, rwx);
+        if (!region.data.empty()) {
+            arena_memcpy_in(m, region.addr, region.data.data(), region.size);
+            region.data.clear();
+            region.data.shrink_to_fit();
+        }
+        m.memory.set_page_attr(region.addr, region.size, region.attr);
+        live_mmap_map(region.addr, region.size, region.attr);
+    }
+    g_fork().mmap_regions.clear();
 
     // Restore VFS fd table from snapshot. This undoes the child's
     // close/dup2/open while preserving pipe buffer data (shared_ptr<Entry>).
@@ -1650,6 +1997,8 @@ inline void fork_parent_restore(Machine& m) {
         // Reset mmap bump pointer to match — child may have advanced it
         g_mmap_bump = g_fork().saved_mmap_address;
     }
+    g_conservative_small_mmap_reuse = g_fork().saved_conservative_small_mmap_reuse;
+    g_force_materialize_anon_mmap = g_fork().saved_force_materialize_anon_mmap;
     // Clear stale mmap free-list entries from child's execution
     m.memory.mmap_cache() = {};
     if (g_fork().has_exec_ctx) {
@@ -1664,7 +2013,7 @@ inline void fork_parent_restore(Machine& m) {
     g_process_model.set_current(g_fork().parent_pid);
     m.cpu.jump(g_fork().pc);
     m.set_result(g_fork().child_pid);
-    dbg_fprintf(stderr,
+    fprintf(stderr,
             "[fork-restore] resume parent_pid=%d child_pid=%d pc=0x%lx a0=%ld sp=0x%lx current_pid=%d mmap=0x%lx brk=0x%lx\n",
             g_fork().parent_pid,
             g_fork().child_pid,
@@ -1680,6 +2029,8 @@ inline void fork_parent_restore(Machine& m) {
 }
 
 namespace handlers {
+
+static void dump_guest_qwords(Machine& m, const char* label, uint64_t base, int count);
 
 // Signal mask and action state — needed early by sys_execve
 inline uint64_t g_signal_mask[2] = {0, 0};
@@ -1701,7 +2052,18 @@ inline int g_next_timer_id = 1;
 // exit/exit_group, parent state is restored with child PID as return.
 static void sys_clone(Machine& m) {
     uint64_t flags = m.sysarg(0);
-
+    auto ensure_sched_bootstrap = []() -> int {
+        const int main_tid = (g_sched.count > 0)
+            ? g_sched.threads[g_sched.current].tid
+            : static_cast<int>(g_process_model.current_pid);
+        if (g_sched.count == 0) {
+            g_sched.init(main_tid);
+        }
+        if (g_next_pid <= main_tid) {
+            g_next_pid = main_tid + 1;
+        }
+        return main_tid;
+    };
 
     // Check if this is thread creation (CLONE_VM | CLONE_THREAD)
     // vs fork (flags == SIGCHLD or CLONE_VFORK | CLONE_VM | SIGCHLD)
@@ -1715,12 +2077,16 @@ static void sys_clone(Machine& m) {
 
     if ((flags & F_CLONE_THREAD) || ((flags & F_CLONE_VM) && !(flags & F_CLONE_VFORK))) {
         // Thread creation with cooperative scheduling.
-        // Save parent state, switch to child. The child runs until it
-        // calls futex_wait (idle), then we switch back to the parent.
+        // Save parent state, enqueue a child thread, and keep executing in
+        // the parent. pthread_create expects clone() to return the child TID
+        // in the parent immediately; running the child inline here makes the
+        // parent believe the thread exists while we are actually executing on
+        // the child's stack, which quickly derails startup.
         constexpr uint64_t F_CLONE_PARENT_SETTID  = 0x00100000;
         constexpr uint64_t F_CLONE_CHILD_CLEARTID = 0x00200000;
         constexpr uint64_t F_CLONE_SETTLS         = 0x00080000;
 
+        ensure_sched_bootstrap();
         int tid = g_next_pid++;
         auto child_stack = m.sysarg(1);
 
@@ -1730,11 +2096,6 @@ static void sys_clone(Machine& m) {
             if (parent_tidptr != 0) {
                 m.memory.template write<int32_t>(parent_tidptr, tid);
             }
-        }
-
-        // Initialize scheduler if this is the first thread
-        if (g_sched.count == 0) {
-            g_sched.init(g_next_pid - 2);  // main thread's TID
         }
 
         // Add child thread slot
@@ -1749,37 +2110,44 @@ static void sys_clone(Machine& m) {
         // Save parent state: registers are at the point of the ecall.
         int parent_idx = g_sched.current;
         save_thread(m, g_sched.threads[parent_idx]);
-        // Fix: parent's return value from clone() should be child TID (a0 = x10)
         g_sched.threads[parent_idx].regs[10] = (uint64_t)tid;
 
-        // Set up child: new stack, return value 0, optionally TLS
-        m.cpu.reg(riscv::REG_SP) = child_stack;
-        m.set_result(0);  // Child sees clone() return 0
-
+        // Seed the child with a copy of the parent's post-syscall state, then
+        // adjust the thread-specific registers.
+        auto& child = g_sched.threads[child_idx];
+        std::memcpy(child.regs, g_sched.threads[parent_idx].regs, sizeof(child.regs));
+        child.pc = g_sched.threads[parent_idx].pc;
+        child.regs[riscv::REG_SP] = child_stack;
+        child.regs[10] = 0;  // Child sees clone() return 0.
         if (flags & F_CLONE_SETTLS) {
             auto tls = m.sysarg(3);
-            m.cpu.reg(4) = tls;  // tp register = x4
+            child.regs[4] = tls;  // tp register = x4
         }
 
         // Handle CLONE_CHILD_CLEARTID: store address to clear+wake on thread exit
         if (flags & F_CLONE_CHILD_CLEARTID) {
             auto child_tidptr = m.sysarg(4);
-            g_sched.threads[child_idx].clear_child_tid = child_tidptr;
+            child.clear_child_tid = child_tidptr;
         }
 
-        // Switch context: we're now "the child"
-        g_sched.current = child_idx;
-        // Store child's initial state (PC is already at the ecall)
-        g_sched.threads[child_idx].pc = m.cpu.pc();
-
         static int thread_count = 0;
-        if (++thread_count <= 10)
-            if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[clone] thread #%d cooperative, tid=%d stack=0x%lx\n",
-                    thread_count, tid, (long)child_stack);
+        if (++thread_count <= 10) {
+            if (g_trace_syscalls && g_trace_countdown-- > 0) {
+                const uint64_t tls = (flags & F_CLONE_SETTLS) ? m.sysarg(3) : 0;
+                dbg_fprintf(stderr,
+                        "[clone] thread #%d cooperative tid=%d flags=0x%lx stack=0x%lx parent_tidptr=0x%lx tls=0x%lx child_tidptr=0x%lx\n",
+                        thread_count, tid, (long)flags, (long)child_stack,
+                        (long)m.sysarg(2), (long)tls, (long)m.sysarg(4));
+                dump_guest_qwords(m, "[clone] child-stack:", child_stack, 6);
+                if (tls >= 0x20) {
+                    dump_guest_qwords(m, "[clone] tls-window:", tls - 0x20, 8);
+                }
+            }
+        }
 
-        // Return: execution continues as the child thread.
-        // The parent's state is saved in g_sched.threads[parent_idx].
-        // Preemption (maybe_preempt) will give the parent time slices.
+        // Continue in the parent; the cooperative scheduler will run the child
+        // when the parent blocks or yields.
+        m.set_result(tid);
         return;
     }
 
@@ -1886,26 +2254,25 @@ static void sys_clone(Machine& m) {
         arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
 
-    // Region 4: guest mmap allocations only.
-    // Avoid snapshotting the fixed native-heap reservation window on every
-    // fork+exec cycle; it dominates copy cost and is not needed for guest
-    // process isolation semantics.
+    // Region 4: save only live mmap mappings, not the entire mmap frontier.
     {
-        uint64_t mmap_region_start = m.memory.mmap_start();
-        uint64_t mmap_frontier = std::max<uint64_t>(mmap_region_start, std::max(g_mmap_bump, m.memory.mmap_address()));
-        dbg_fprintf(stderr, "[fork-save] regions: exec=[0x%lx,0x%lx) interp=[0x%lx,0x%lx) "
-                "stack=[0x%lx,0x%lx) mmap=[0x%lx,0x%lx) mmap_addr=0x%lx\n",
+        size_t mmap_snapshot_bytes = 0;
+        for (const auto& [addr, region] : g_live_mmap_regions) {
+            (void)addr;
+            auto& saved = g_fork().mmap_regions.emplace_back();
+            saved.addr = region.addr;
+            saved.size = region.size;
+            saved.attr = region.attr;
+            saved.data.resize(saved.size);
+            arena_memcpy_out(m, saved.data.data(), saved.addr, saved.size);
+            mmap_snapshot_bytes += saved.size;
+        }
+        fprintf(stderr, "[fork-save] regions: exec=[0x%lx,0x%lx) interp=[0x%lx,0x%lx) "
+                "stack=[0x%lx,0x%lx) mmap_regions=%zu mmap_bytes=0x%zx mmap_addr=0x%lx\n",
                 (long)g_fork().exec_data.addr, (long)(g_fork().exec_data.addr + g_fork().exec_data.size),
                 (long)g_fork().interp_data.addr, (long)(g_fork().interp_data.addr + g_fork().interp_data.size),
                 (long)g_fork().stack_data.addr, (long)(g_fork().stack_data.addr + g_fork().stack_data.size),
-                (long)mmap_region_start, (long)mmap_frontier, (long)m.memory.mmap_address());
-        if (mmap_frontier > mmap_region_start) {
-            auto& r = g_fork().mmap_data;
-            r.addr = mmap_region_start;
-            r.size = mmap_frontier - mmap_region_start;
-            r.data.resize(r.size);
-            arena_memcpy_out(m, r.data.data(), r.addr, r.size);
-        }
+                g_fork().mmap_regions.size(), mmap_snapshot_bytes, (long)m.memory.mmap_address());
     }
 
     // Save VFS fd table and per-fd flags so child's changes can be undone
@@ -1920,6 +2287,8 @@ static void sys_clone(Machine& m) {
     static_assert(sizeof(ForkState::saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork().saved_sched, &g_sched, sizeof(g_sched));
     g_fork().saved_mmap_address = m.memory.mmap_address();
+    g_fork().saved_conservative_small_mmap_reuse = g_conservative_small_mmap_reuse;
+    g_fork().saved_force_materialize_anon_mmap = g_force_materialize_anon_mmap;
     g_fork().saved_exec_ctx = g_exec_ctx;
     g_fork().has_exec_ctx = true;
 
@@ -1970,9 +2339,22 @@ static void sys_clone3(Machine& m) {
     constexpr uint64_t F_CLONE_PARENT_SETTID   = 0x00100000;
     constexpr uint64_t F_CLONE_CHILD_CLEARTID  = 0x00200000;
     constexpr uint64_t F_CLONE_SETTLS          = 0x00080000;
+    auto ensure_sched_bootstrap = []() -> int {
+        const int main_tid = (g_sched.count > 0)
+            ? g_sched.threads[g_sched.current].tid
+            : static_cast<int>(g_process_model.current_pid);
+        if (g_sched.count == 0) {
+            g_sched.init(main_tid);
+        }
+        if (g_next_pid <= main_tid) {
+            g_next_pid = main_tid + 1;
+        }
+        return main_tid;
+    };
 
     if ((flags & F_CLONE_THREAD) || ((flags & F_CLONE_VM) && !(flags & F_CLONE_VFORK))) {
-        // Thread creation — same logic as sys_clone thread path
+        // Thread creation — same semantics as sys_clone thread path.
+        ensure_sched_bootstrap();
         int tid = g_next_pid++;
         // clone3 stack = bottom of stack region, stack_size = size
         // Child SP = stack + stack_size (top of stack, grows down)
@@ -1999,24 +2381,24 @@ static void sys_clone3(Machine& m) {
         save_thread(m, g_sched.threads[parent_idx]);
         g_sched.threads[parent_idx].regs[10] = (uint64_t)tid;
 
-        m.cpu.reg(riscv::REG_SP) = child_sp;
-        m.set_result(0);
-
+        auto& child = g_sched.threads[child_idx];
+        std::memcpy(child.regs, g_sched.threads[parent_idx].regs, sizeof(child.regs));
+        child.pc = g_sched.threads[parent_idx].pc;
+        child.regs[riscv::REG_SP] = child_sp;
+        child.regs[10] = 0;
         if (flags & F_CLONE_SETTLS) {
-            m.cpu.reg(4) = tls;  // tp register = x4
+            child.regs[4] = tls;  // tp register = x4
         }
 
         if (flags & F_CLONE_CHILD_CLEARTID) {
-            g_sched.threads[child_idx].clear_child_tid = child_tid;
+            child.clear_child_tid = child_tid;
         }
-
-        g_sched.current = child_idx;
-        g_sched.threads[child_idx].pc = m.cpu.pc();
 
         static int clone3_thread_count = 0;
         if (++clone3_thread_count <= 10)
             dbg_fprintf(stderr, "[clone3] thread #%d cooperative, tid=%d stack=0x%lx+0x%lx\n",
                     clone3_thread_count, tid, (long)stack, (long)stack_size);
+        m.set_result(tid);
         return;
     }
 
@@ -2088,14 +2470,14 @@ static void sys_clone3(Machine& m) {
         arena_memcpy_out(m, r.data.data(), r.addr, r.size);
     }
     {
-        uint64_t mmap_region_start = m.memory.mmap_start();
-        uint64_t mmap_frontier = std::max<uint64_t>(mmap_region_start, std::max(g_mmap_bump, m.memory.mmap_address()));
-        if (mmap_frontier > mmap_region_start) {
-            auto& r = g_fork().mmap_data;
-            r.addr = mmap_region_start;
-            r.size = mmap_frontier - mmap_region_start;
-            r.data.resize(r.size);
-            arena_memcpy_out(m, r.data.data(), r.addr, r.size);
+        for (const auto& [addr, region] : g_live_mmap_regions) {
+            (void)addr;
+            auto& saved = g_fork().mmap_regions.emplace_back();
+            saved.addr = region.addr;
+            saved.size = region.size;
+            saved.attr = region.attr;
+            saved.data.resize(saved.size);
+            arena_memcpy_out(m, saved.data.data(), saved.addr, saved.size);
         }
     }
     g_fork().fd_snapshot = get_fs(m).snapshot_fds();
@@ -2105,6 +2487,8 @@ static void sys_clone3(Machine& m) {
     static_assert(sizeof(ForkState::saved_sched) >= sizeof(g_sched));
     std::memcpy(g_fork().saved_sched, &g_sched, sizeof(g_sched));
     g_fork().saved_mmap_address = m.memory.mmap_address();
+    g_fork().saved_conservative_small_mmap_reuse = g_conservative_small_mmap_reuse;
+    g_fork().saved_force_materialize_anon_mmap = g_force_materialize_anon_mmap;
     g_fork().saved_exec_ctx = g_exec_ctx;
     g_fork().has_exec_ctx = true;
 
@@ -2279,11 +2663,29 @@ struct AtPathResult {
 };
 
 static AtPathResult resolve_at_path(vfs::VirtualFS& fs, int dirfd, const std::string& path) {
+    auto normalize_guest_path = [](const std::string& input) {
+        if (input.empty()) return input;
+        std::string out;
+        out.reserve(input.size());
+        bool last_was_slash = false;
+        for (char ch : input) {
+            if (ch == '/') {
+                if (!last_was_slash) out.push_back(ch);
+                last_was_slash = true;
+            } else {
+                out.push_back(ch);
+                last_was_slash = false;
+            }
+        }
+        if (out.empty()) return std::string("/");
+        return out;
+    };
+
     if (!path.empty() && path[0] == '/') {
-        return {AtPathStatus::Ok, path};
+        return {AtPathStatus::Ok, normalize_guest_path(path)};
     }
     if (dirfd == AT_FDCWD) {
-        return {AtPathStatus::Ok, path};
+        return {AtPathStatus::Ok, normalize_guest_path(path)};
     }
     auto entry = fs.get_entry(dirfd);
     if (!entry) {
@@ -2294,8 +2696,8 @@ static AtPathResult resolve_at_path(vfs::VirtualFS& fs, int dirfd, const std::st
     }
     std::string base = fs.get_path(dirfd);
     if (base.empty()) base = "/";
-    if (base.back() == '/') return {AtPathStatus::Ok, base + path};
-    return {AtPathStatus::Ok, base + "/" + path};
+    if (base.back() == '/') return {AtPathStatus::Ok, normalize_guest_path(base + path)};
+    return {AtPathStatus::Ok, normalize_guest_path(base + "/" + path)};
 }
 
 static inline int at_path_errno(AtPathStatus st) {
@@ -2485,6 +2887,8 @@ static void sys_execve(Machine& m) {
             m.memory.evict_execute_segments();
             // Clear mmap free-list cache — stale entries from parent process
             m.memory.mmap_cache() = {};
+            g_live_mmap_regions.clear();
+            reset_lazy_mmap_page_tables(m);
 
             // In arena mode, skip set_page_attr for old/new ranges.
             // Arena reads/writes bypass page attributes entirely, so these
@@ -2597,6 +3001,8 @@ static void sys_execve(Machine& m) {
             // Update exec context
             g_exec_ctx.exec_binary = std::move(new_binary);
             g_exec_ctx.exec_info = exec_info;
+            g_enable_node_anon_relax = is_node_guest_path(resolved);
+            g_force_materialize_anon_mmap = true;
 
             // ---- CRITICAL: Reset memory layout after loading new binary ----
             // After loading a large binary (e.g. 48MB Node.js), libriscv's
@@ -2625,11 +3031,7 @@ static void sys_execve(Machine& m) {
                 // binary's layout, matching the Machine constructor behavior.
                 m.memory.set_heap_address(new_brk_base);
 
-                // Make brk area writable (16MB)
                 constexpr uint64_t BRK_MAX = 16ULL << 20;
-                riscv::PageAttributes rw;
-                rw.read = true; rw.write = true;
-                m.memory.set_page_attr(new_brk_base, BRK_MAX, rw);
 
                 // Replicate the initial setup from main.cpp:
                 // 1. mmap_address = heap_address + BRK_MAX (from constructor)
@@ -2759,6 +3161,7 @@ static void sys_execve(Machine& m) {
             // loop tries to read the next instruction from the freed segment →
             // SIGSEGV on the host. machine.stop() sets a flag that makes the
             // dispatch loop exit at the next checkpoint.
+            g_conservative_small_mmap_reuse = true;
             g_execve_restart = true;
             // Mark that child did execve so fork_parent_restore reloads text
             if (!g_fork_stack.empty()) g_fork().child_did_execve = true;
@@ -2824,15 +3227,6 @@ static void sys_execve(Machine& m) {
             m.memory.mmap_address() = g_exec_ctx.brk_base + BRK_MAX;
         }
     }
-
-    // Make BRK region writable
-    if (g_exec_ctx.brk_base > 0) {
-        constexpr uint64_t BRK_MAX = 16ULL << 20;
-        riscv::PageAttributes rw;
-        rw.read = true; rw.write = true;
-        m.memory.set_page_attr(g_exec_ctx.brk_base, BRK_MAX, rw);
-    }
-
     uint64_t sp = dynlink::setup_dynamic_stack(
         m, g_exec_ctx.exec_info, g_exec_ctx.interp_base,
         args, exec_env, g_exec_ctx.original_stack_top);
@@ -2843,6 +3237,9 @@ static void sys_execve(Machine& m) {
     m.cpu.jump(g_exec_ctx.interp_entry);
 
     // Stop machine to break out of stale decoder context
+    g_conservative_small_mmap_reuse = true;
+    g_enable_node_anon_relax = is_node_guest_path(resolved);
+    g_force_materialize_anon_mmap = true;
     g_execve_restart = true;
     if (!g_fork_stack.empty()) g_fork().child_did_execve = true;
             (void)fs.unlink("/proc/self/exe");
@@ -2873,11 +3270,34 @@ static void sys_openat(Machine& m) {
     }
     path = std::move(at.path);
 
+    if (g_enable_node_anon_relax &&
+        g_force_materialize_anon_mmap &&
+        (path == "/proc/version_signature" || path == "/proc/cpuinfo")) {
+        g_force_materialize_anon_mmap = false;
+        static int node_relax_log_budget = 4;
+        if (node_relax_log_budget-- > 0) {
+            dbg_fprintf(stderr,
+                "[node-mmap] relaxed anon materialization at path=%s pc=0x%lx ra=0x%lx\n",
+                path.c_str(), (long)m.cpu.pc(), (long)m.cpu.reg(riscv::REG_RA));
+        }
+    }
+
     // Virtual device files: create synthetic VFS entries on demand via open+O_CREAT
     if ((path == "/dev/urandom" || path == "/dev/random" || path == "/dev/null")
         && !fs.resolve(path)) {
         fs.open(path, 0100 /* O_CREAT */);  // creates empty file via VFS open path
     }
+
+#ifndef __EMSCRIPTEN__
+    if (path == "/dev/tty" && !::isatty(STDIN_FILENO) && !::isatty(STDOUT_FILENO) && !::isatty(STDERR_FILENO)) {
+        if (g_trace_syscalls) {
+            fprintf(stderr, "[openat] dirfd=%d flags=0x%x path=%s => %lld (native-no-tty)\n",
+                dirfd, flags, path.c_str(), (long long)err::NXIO);
+        }
+        m.set_result(err::NXIO);
+        return;
+    }
+#endif
 
     // Intercept /mnt/host access for local folder sharing
 #ifdef __EMSCRIPTEN__
@@ -2951,6 +3371,17 @@ static void sys_openat2(Machine& m) {
         && !fs.resolve(path)) {
         fs.open(path, 0100 /* O_CREAT */);  // creates empty file via VFS open path
     }
+
+#ifndef __EMSCRIPTEN__
+    if (path == "/dev/tty" && !::isatty(STDIN_FILENO) && !::isatty(STDOUT_FILENO) && !::isatty(STDERR_FILENO)) {
+        if (g_trace_syscalls) {
+            fprintf(stderr, "[openat2] dirfd=%d flags=0x%x path=%s => %lld (native-no-tty)\n",
+                dirfd, flags, path.c_str(), (long long)err::NXIO);
+        }
+        m.set_result(err::NXIO);
+        return;
+    }
+#endif
 
     // Intercept /mnt/host access for local folder sharing
 #ifdef __EMSCRIPTEN__
@@ -3191,7 +3622,8 @@ static void sys_read(Machine& m) {
         int bytes_read = EM_ASM_INT({
             if (typeof Module.readSocketData !== 'function') return 0;
             var result = Module.readSocketData($0, $1);
-            if (!result || result.length === 0) return 0;
+            if (result === null) return -11;
+            if (result.length === 0) return 0;
             var off = Number($2);
             for (var i = 0; i < result.length; i++) {
                 Module.HEAPU8[off + i] = result[i];
@@ -3199,7 +3631,7 @@ static void sys_read(Machine& m) {
             return result.length;
         }, fd, (int)count, view.data());
         dbg_fprintf(stderr, "[read-socket] fd=%d len=%zu bytes_read=%d\n", fd, count, bytes_read);
-        m.set_result(bytes_read > 0 ? bytes_read : -11 /*EAGAIN*/);
+        m.set_result(bytes_read >= 0 ? bytes_read : -11 /*EAGAIN*/);
         return;
 #else
         int native_fd = net_get_native_fd ? net_get_native_fd(fd) : -1;
@@ -3226,6 +3658,13 @@ static void sys_read(Machine& m) {
 
     std::vector<uint8_t> buf(count);
     ssize_t n = fs.read(fd, buf.data(), count);
+    if (fd > 2) {
+        const auto path = fs.get_path(fd);
+        if (!path.empty() && path == "/sys/fs/cgroup/cpu.max"
+            && n >= 0 && g_trace_syscalls && !g_trace_after_cpu_max) {
+            g_trace_after_cpu_max = true;
+        }
+    }
     if (n > 0) {
         m.memory.memcpy(buf_addr, buf.data(), n);
     }
@@ -3511,7 +3950,16 @@ static void sys_lseek(Machine& m) {
     }
 
     auto& fs = get_fs(m);
-    m.set_result(fs.lseek(fd, offset, whence));
+    const int64_t res = fs.lseek(fd, offset, whence);
+    if (fd > 2) {
+        const auto path = fs.get_path(fd);
+        if (!path.empty()
+            && (path.rfind("/proc/", 0) == 0 || path.rfind("/sys/fs/cgroup/", 0) == 0)) {
+            fprintf(stderr, "[lseek-probe] fd=%d path=%s off=%lld whence=%d => %lld\n",
+                    fd, path.c_str(), (long long)offset, whence, (long long)res);
+        }
+    }
+    m.set_result(res);
 }
 
 static void sys_getdents64(Machine& m) {
@@ -3794,10 +4242,34 @@ static void sys_gettid(Machine& m) {
         dbg_fprintf(stderr, "[TRACE] gettid() => %d pc=0x%lx\n", tid, (long)m.cpu.pc());
     m.set_result(tid);
 }
-static void sys_getuid(Machine& m) { m.set_result(0); }
-static void sys_geteuid(Machine& m) { m.set_result(0); }
-static void sys_getgid(Machine& m) { m.set_result(0); }
-static void sys_getegid(Machine& m) { m.set_result(0); }
+static void sys_getuid(Machine& m) {
+#ifdef __EMSCRIPTEN__
+    m.set_result(0);
+#else
+    m.set_result(::getuid());
+#endif
+}
+static void sys_geteuid(Machine& m) {
+#ifdef __EMSCRIPTEN__
+    m.set_result(0);
+#else
+    m.set_result(::geteuid());
+#endif
+}
+static void sys_getgid(Machine& m) {
+#ifdef __EMSCRIPTEN__
+    m.set_result(0);
+#else
+    m.set_result(::getgid());
+#endif
+}
+static void sys_getegid(Machine& m) {
+#ifdef __EMSCRIPTEN__
+    m.set_result(0);
+#else
+    m.set_result(::getegid());
+#endif
+}
 static void sys_set_tid_address(Machine& m) {
     auto tidptr = m.sysarg(0);
     // Store clear_child_tid for current thread (used on thread exit)
@@ -3994,7 +4466,30 @@ static void sys_mmap(Machine& m) {
         return;
     }
 
-        if (anon.from_reuse_cache || (flags & MAP_FIXED)) {
+        const bool brk_guard_page =
+            (flags & MAP_FIXED) &&
+            prot == 0 &&
+            anon.aligned_len == 0x1000 &&
+            anon.addr == g_exec_ctx.brk_base &&
+            g_exec_ctx.brk_current >= g_exec_ctx.brk_base + anon.aligned_len;
+        if (brk_guard_page) {
+            g_exec_ctx.brk_base += anon.aligned_len;
+            if (g_exec_ctx.brk_current < g_exec_ctx.brk_base) {
+                g_exec_ctx.brk_current = g_exec_ctx.brk_base;
+            }
+            m.memory.set_heap_address(g_exec_ctx.brk_base);
+            fprintf(stderr,
+                    "[brk-guard] old_base=0x%lx new_base=0x%lx cur=0x%lx mmap=0x%lx\n",
+                    (long)(g_exec_ctx.brk_base - anon.aligned_len),
+                    (long)g_exec_ctx.brk_base,
+                    (long)g_exec_ctx.brk_current,
+                    (long)m.memory.mmap_address());
+        }
+
+        // Anonymous mmap must always start zero-filled. Reused holes and
+        // MAP_FIXED replacements obviously need clearing, but fresh bump
+        // allocations do too once we materialize pages up front.
+        if (anon.aligned_len > 0) {
             if constexpr (riscv::encompassing_Nbit_arena != 0) {
                 auto* arena = (uint8_t*)m.memory.memory_arena_ptr();
                 if (arena && anon.addr + anon.aligned_len <= m.memory.memory_arena_size()) {
@@ -4007,8 +4502,49 @@ static void sys_mmap(Machine& m) {
             }
         }
 
+        if ((anon.addr >= m.memory.mmap_start() || brk_guard_page) && anon.aligned_len > 0) {
+            const auto attr = mmap_attr_from_prot(prot);
+            static int anon_attr_probe_count = 0;
+            ++anon_attr_probe_count;
+            const bool trace_anon_attr =
+                anon_attr_probe_count <= 64 && (g_trace_after_cpu_max || anon.aligned_len >= (1ULL << 20));
+            if (trace_anon_attr) {
+                fprintf(stderr,
+                        "[mmap-anon-probe] before set_page_attr addr=0x%lx len=0x%lx prot=%d flags=0x%x\n",
+                        (long)anon.addr, (long)anon.aligned_len, prot, flags);
+            }
+            const bool materialize_attrs =
+                brk_guard_page || should_materialize_anon_mmap(m, anon.addr, anon.aligned_len, attr);
+            if (!materialize_attrs) {
+                enable_lazy_mmap_page_tables(m);
+                free_materialized_pages_for_range(m, anon.addr, anon.aligned_len);
+            }
+            if (materialize_attrs) {
+                m.memory.set_page_attr(anon.addr, anon.aligned_len, attr);
+            }
+            if (trace_anon_attr) {
+                fprintf(stderr,
+                        "[mmap-anon-probe] after %s addr=0x%lx len=0x%lx\n",
+                        materialize_attrs ? "set_page_attr" : "skip-attr-materialize",
+                        (long)anon.addr, (long)anon.aligned_len);
+            }
+            live_mmap_map(anon.addr, anon.aligned_len, attr, !materialize_attrs, true);
+        }
+
         m.set_result(anon.addr);
         rails_note_mmap(m.cpu.pc(), m.cpu.reg(1), anon.aligned_len);
+        {   static int anon_flow_debug_budget = 96;
+            if (anon_flow_debug_budget-- > 0) {
+                fprintf(stderr,
+                        "[mmap-anon-flow] pc=0x%lx ra=0x%lx hint=0x%lx len=0x%lx prot=%d flags=0x%x => addr=0x%lx aligned=0x%lx reuse=%d ignored_hint=%d bump=0x%lx\n",
+                        (long)m.cpu.pc(), (long)m.cpu.reg(1),
+                        (long)addr_g, (long)length, prot, flags,
+                        (long)anon.addr, (long)anon.aligned_len,
+                        (int)anon.from_reuse_cache, (int)anon.ignored_hint,
+                        (long)g_mmap_bump);
+                fflush(stderr);
+            }
+        }
         dump_boundary("anon-success");
         assert_guard();
 
@@ -4126,12 +4662,24 @@ static void sys_mmap(Machine& m) {
     rw_attr.write = true;
     m.memory.set_page_attr(dst, length, rw_attr);
 
-    // Zero existing mappings before reusing them. Fresh bump allocations in the
-    // encompassing arena already start zeroed, so avoid paying memdiscard on
-    // the common loader fast-path.
+    // File-backed mappings must be zero-filled beyond the copied file bytes.
+    // Fresh bump allocations in the encompassing arena are not guaranteed to
+    // be clean after prior execs or mmaps, so always clear the destination
+    // before copying the file contents.
     const bool reusing_existing_bytes = dst < nextfree_before;
-    if (reusing_existing_bytes) {
-        m.memory.memdiscard(dst, length, true);
+    if (length > 0) {
+        if (reusing_existing_bytes) {
+            m.memory.memdiscard(dst, length, true);
+        } else if constexpr (riscv::encompassing_Nbit_arena != 0) {
+            auto* arena = (uint8_t*)m.memory.memory_arena_ptr();
+            if (arena && dst + length <= m.memory.memory_arena_size()) {
+                std::memset(arena + dst, 0, length);
+            } else {
+                m.memory.memset(dst, 0, length);
+            }
+        } else {
+            m.memory.memset(dst, 0, length);
+        }
     }
 
 
@@ -4143,12 +4691,22 @@ static void sys_mmap(Machine& m) {
         m.memory.memcpy(dst, content.data() + offset, to_copy);
     }
 
-    // Set final page attributes
-    riscv::PageAttributes attr;
-    attr.read  = (prot & 1) != 0;  // PROT_READ
-    attr.write = (prot & 2) != 0;  // PROT_WRITE
-    attr.exec  = (prot & 4) != 0;  // PROT_EXEC
+    // Set final page attributes. When a later PT_LOAD overlaps the tail of an
+    // earlier executable mapping, Linux effectively merges the page
+    // permissions on the shared boundary pages. Without this, shared-library
+    // PLT/text pages can lose execute permission during ld-musl startup.
+    auto attr = mmap_attr_from_prot(prot);
+    if (length > 0 && (dst < nextfree_before || (flags & MAP_FIXED))) {
+        for (uint64_t page = dst; page < dst + length; page += 4096) {
+            if (const auto* old_region = live_mmap_find(page); old_region != nullptr) {
+                attr = merge_live_mmap_attr(attr, old_region->attr);
+            }
+        }
+    }
     m.memory.set_page_attr(dst, length, attr);
+    if (dst >= m.memory.mmap_start() && length > 0) {
+        live_mmap_map(dst, length, attr);
+    }
 
     m.set_result(dst);
     assert_guard();
@@ -4195,13 +4753,21 @@ static void sys_mprotect(Machine& m) {
     // musl allocates thread stacks with PROT_NONE then mprotects them writable.
     // Without this, thread stacks would be inaccessible.
     if (addr >= m.memory.mmap_start()) {
-        riscv::PageAttributes attr;
-        attr.read = (prot & 1) != 0;   // PROT_READ
-        attr.write = (prot & 2) != 0;  // PROT_WRITE
-        attr.exec = (prot & 4) != 0;   // PROT_EXEC
-
-        m.memory.set_page_attr(addr, len, attr);
-
+        const auto* old_region = live_mmap_find(addr);
+        const auto attr = mmap_attr_from_prot(prot);
+        const bool anonymous = old_region != nullptr && old_region->anonymous;
+        if (anonymous) {
+            // Anonymous mappings already live in the encompassing arena. Do
+            // not eagerly materialize every page on mprotect: large V8
+            // reservations can span hundreds of MB, and future page faults
+            // should materialize untouched pages with the updated attrs.
+            enable_lazy_mmap_page_tables(m);
+            set_materialized_page_attrs_for_range(m, addr, len, attr);
+            live_mmap_map(addr, len, attr, true, true);
+        } else {
+            m.memory.set_page_attr(addr, len, attr);
+            live_mmap_map(addr, len, attr, false, false);
+        }
     }
 
 #ifdef __EMSCRIPTEN__
@@ -4229,13 +4795,36 @@ static void sys_munmap(Machine& m) {
     auto addr = m.sysarg(0);
     auto len  = m.sysarg(1);
     uint64_t aligned_len = (len + 4095) & ~4095ULL;
+    const bool keep_monotonic = keep_monotonic_small_anon_unmap(addr, aligned_len);
 
     static int munmap_count = 0;
     if (++munmap_count <= 50)
         if (g_trace_syscalls && g_trace_countdown-- > 0) dbg_fprintf(stderr, "[munmap] addr=0x%lx len=0x%lx pc=0x%lx\n",
                 (long)addr, (long)aligned_len, (long)m.cpu.pc());
+    {   static int munmap_flow_debug_budget = 96;
+        if (munmap_flow_debug_budget-- > 0) {
+            fprintf(stderr,
+                    "[munmap-flow] pc=0x%lx ra=0x%lx addr=0x%lx len=0x%lx keep_monotonic=%d bump_before=0x%lx\n",
+                    (long)m.cpu.pc(), (long)munmap_return_ra(m),
+                    (long)addr, (long)aligned_len, (int)keep_monotonic,
+                    (long)g_mmap_bump);
+            fflush(stderr);
+        }
+    }
 
     custom_unmap_range(m, addr, aligned_len, m.cpu.pc(), munmap_return_ra(m));
+    if (addr >= m.memory.mmap_start() && aligned_len > 0) {
+        if (g_lazy_mmap_page_tables_enabled) {
+            free_materialized_pages_for_range(m, addr, aligned_len);
+        } else {
+            riscv::PageAttributes none {};
+            none.read = false;
+            none.write = false;
+            none.exec = false;
+            m.memory.set_page_attr(addr, aligned_len, none);
+        }
+        live_mmap_unmap(addr, aligned_len);
+    }
 
 #ifdef __EMSCRIPTEN__
     // JIT invalidation: unmapped pages may have contained JIT-compiled code.
@@ -4283,9 +4872,35 @@ static void sys_sigprocmask(Machine& m) {
     auto set_addr = m.sysarg(1);     // new mask (or 0)
     auto oldset_addr = m.sysarg(2);  // old mask output (or 0)
     auto sigsetsize = m.sysarg(3);   // typically 8
+    static int child_trampoline_probe_budget = 8;
 
     TRACE_SC("sigprocmask(how=%d, set=0x%lx, oldset=0x%lx, size=%lu)",
              how, (long)set_addr, (long)oldset_addr, (long)sigsetsize);
+    if (g_trace_syscalls && child_trampoline_probe_budget > 0 && m.cpu.pc() == 0x18050ce8ULL) {
+        child_trampoline_probe_budget--;
+        const uint64_t thread_obj = m.cpu.reg(15); // a5 in the trampoline
+        uint64_t start_fn = 0;
+        uint64_t start_arg = 0;
+        try { start_fn = m.memory.template read<uint64_t>(thread_obj + 0); } catch (...) {}
+        try { start_arg = m.memory.template read<uint64_t>(thread_obj + 8); } catch (...) {}
+        fprintf(stderr,
+                "[thread-start-probe] pc=0x%lx thread=0x%lx fn=0x%lx arg=0x%lx sp=0x%lx tp=0x%lx ra=0x%lx\n",
+                (unsigned long)m.cpu.pc(),
+                (unsigned long)thread_obj,
+                (unsigned long)start_fn,
+                (unsigned long)start_arg,
+                (unsigned long)m.cpu.reg(riscv::REG_SP),
+                (unsigned long)m.cpu.reg(4),
+                (unsigned long)m.cpu.reg(riscv::REG_RA));
+        dump_guest_qwords(m, "[thread-start-probe] thread-window:", thread_obj, 8);
+        dump_guest_qwords(m, "[thread-start-probe] child-stack:", m.cpu.reg(riscv::REG_SP), 8);
+        if (start_arg >= 0x1000) {
+            dump_guest_qwords(m, "[thread-start-probe] arg-window:", start_arg, 12);
+        }
+        g_single_step_budget = 4096;
+        g_single_step_resume = true;
+        m.stop();
+    }
 
     // Write old mask if requested
     if (oldset_addr != 0) {
@@ -4448,6 +5063,8 @@ static void sys_ioctl(Machine& m) {
             m.set_result(0);
             return;
         }
+        m.set_result(err::NOTTY);
+        return;
     }
 
     // TIOCSWINSZ - set window size (accept silently)
@@ -4456,6 +5073,8 @@ static void sys_ioctl(Machine& m) {
             m.set_result(0);
             return;
         }
+        m.set_result(err::NOTTY);
+        return;
     }
 
     // TCGETS - get terminal attributes
@@ -4470,6 +5089,8 @@ static void sys_ioctl(Machine& m) {
             m.set_result(0);
             return;
         }
+        m.set_result(err::NOTTY);
+        return;
     }
 
     // TCSETS, TCSETSW, TCSETSF - set terminal attributes
@@ -4483,6 +5104,8 @@ static void sys_ioctl(Machine& m) {
             m.set_result(0);
             return;
         }
+        m.set_result(err::NOTTY);
+        return;
     }
 
     // TIOCGPGRP - get foreground process group
@@ -4494,6 +5117,8 @@ static void sys_ioctl(Machine& m) {
             m.set_result(0);
             return;
         }
+        m.set_result(err::NOTTY);
+        return;
     }
 
     // TIOCSPGRP - set foreground process group (accept silently)
@@ -4502,6 +5127,8 @@ static void sys_ioctl(Machine& m) {
             m.set_result(0);
             return;
         }
+        m.set_result(err::NOTTY);
+        return;
     }
 
     // FIONBIO - set non-blocking mode (libuv uses this on pipes/sockets)
@@ -4884,6 +5511,14 @@ static void sys_pread64(Machine& m) {
 
     std::vector<uint8_t> buf(count);
     ssize_t n = fs.pread(fd, buf.data(), count, offset);
+    if (fd > 2) {
+        const auto path = fs.get_path(fd);
+        if (!path.empty()
+            && (path.rfind("/proc/", 0) == 0 || path.rfind("/sys/fs/cgroup/", 0) == 0)) {
+            fprintf(stderr, "[pread-probe] fd=%d path=%s count=%zu off=%llu => %zd\n",
+                    fd, path.c_str(), count, (unsigned long long)offset, n);
+        }
+    }
     if (n > 0) {
         m.memory.memcpy(buf_addr, buf.data(), n);
     }
@@ -6108,8 +6743,32 @@ static void sys_mremap(Machine& m) {
         return;
     }
 
+    const uint64_t aligned_old = (old_size + 4095) & ~4095ULL;
+    const uint64_t aligned_new = (new_size + 4095) & ~4095ULL;
+    const auto* old_region = live_mmap_find(old_addr);
+    const auto old_attr = (old_region != nullptr)
+        ? old_region->attr
+        : mmap_attr_from_prot(1 | 2);
+    const bool old_lazy = old_region != nullptr && old_region->lazy;
+    const bool old_anonymous = old_region != nullptr && old_region->anonymous;
+
     // Shrink / same-size remap: keep address stable and report success.
     if (new_size <= old_size) {
+        if (new_size < old_size && old_addr >= m.memory.mmap_start()) {
+            if (aligned_old > aligned_new) {
+                if (g_lazy_mmap_page_tables_enabled) {
+                    free_materialized_pages_for_range(m, old_addr + aligned_new, aligned_old - aligned_new);
+                } else {
+                    riscv::PageAttributes none {};
+                    none.read = false;
+                    none.write = false;
+                    none.exec = false;
+                    m.memory.set_page_attr(old_addr + aligned_new, aligned_old - aligned_new, none);
+                }
+                live_mmap_unmap(old_addr + aligned_new, aligned_old - aligned_new);
+            }
+            live_mmap_map(old_addr, aligned_new, old_attr, old_lazy, old_anonymous);
+        }
         m.set_result(old_addr);
         return;
     }
@@ -6123,20 +6782,21 @@ static void sys_mremap(Machine& m) {
         return;
     }
 
-    const uint64_t aligned_old = (old_size + 4095) & ~4095ULL;
-    const uint64_t aligned_new = (new_size + 4095) & ~4095ULL;
     sync_mmap_bump(m);
 
     if (old_addr + aligned_old == g_mmap_bump && old_addr + aligned_new <= ARENA_LIMIT) {
         g_mmap_bump = old_addr + aligned_new;
         publish_mmap_bump(m);
         if (aligned_new > aligned_old) {
-            riscv::PageAttributes rw;
-            rw.read = true;
-            rw.write = true;
-            m.memory.set_page_attr(old_addr + aligned_old, aligned_new - aligned_old, rw);
+            if (old_lazy) {
+                enable_lazy_mmap_page_tables(m);
+                set_materialized_page_attrs_for_range(m, old_addr, aligned_new, old_attr);
+            } else {
+                m.memory.set_page_attr(old_addr, aligned_new, old_attr);
+            }
             rails_note_mmap(m.cpu.pc(), m.cpu.reg(1), aligned_new - aligned_old);
         }
+        live_mmap_map(old_addr, aligned_new, old_attr, old_lazy, old_anonymous);
         m.set_result(old_addr);
         return;
     }
@@ -6166,6 +6826,27 @@ static void sys_mremap(Machine& m) {
 
     rails_note_mmap(m.cpu.pc(), m.cpu.reg(1), anon.aligned_len);
     custom_unmap_range(m, old_addr, aligned_old, m.cpu.pc(), m.cpu.reg(1));
+    if (old_addr >= m.memory.mmap_start()) {
+        if (g_lazy_mmap_page_tables_enabled) {
+            free_materialized_pages_for_range(m, old_addr, aligned_old);
+        } else {
+            riscv::PageAttributes none {};
+            none.read = false;
+            none.write = false;
+            none.exec = false;
+            m.memory.set_page_attr(old_addr, aligned_old, none);
+        }
+        live_mmap_unmap(old_addr, aligned_old);
+    }
+    if (new_addr >= m.memory.mmap_start()) {
+        if (old_lazy) {
+            enable_lazy_mmap_page_tables(m);
+            free_materialized_pages_for_range(m, new_addr, anon.aligned_len);
+        } else {
+            m.memory.set_page_attr(new_addr, anon.aligned_len, old_attr);
+        }
+        live_mmap_map(new_addr, anon.aligned_len, old_attr, old_lazy, old_anonymous);
+    }
     m.set_result(new_addr);
 }
 
@@ -6365,13 +7046,21 @@ static void sys_setsid(Machine& m) {
 }
 
 static void sys_getresuid(Machine& m) {
-    // Write real, effective, saved UIDs (all 0 = root)
     auto ruid_addr = m.sysarg(0);
     auto euid_addr = m.sysarg(1);
     auto suid_addr = m.sysarg(2);
-    m.memory.template write<uint32_t>(ruid_addr, 0);
-    m.memory.template write<uint32_t>(euid_addr, 0);
-    m.memory.template write<uint32_t>(suid_addr, 0);
+#ifdef __EMSCRIPTEN__
+    const uint32_t ruid = 0;
+    const uint32_t euid = 0;
+    const uint32_t suid = 0;
+#else
+    const uint32_t ruid = ::getuid();
+    const uint32_t euid = ::geteuid();
+    const uint32_t suid = euid;
+#endif
+    m.memory.template write<uint32_t>(ruid_addr, ruid);
+    m.memory.template write<uint32_t>(euid_addr, euid);
+    m.memory.template write<uint32_t>(suid_addr, suid);
     m.set_result(0);
 }
 
@@ -6379,9 +7068,18 @@ static void sys_getresgid(Machine& m) {
     auto rgid_addr = m.sysarg(0);
     auto egid_addr = m.sysarg(1);
     auto sgid_addr = m.sysarg(2);
-    m.memory.template write<uint32_t>(rgid_addr, 0);
-    m.memory.template write<uint32_t>(egid_addr, 0);
-    m.memory.template write<uint32_t>(sgid_addr, 0);
+#ifdef __EMSCRIPTEN__
+    const uint32_t rgid = 0;
+    const uint32_t egid = 0;
+    const uint32_t sgid = 0;
+#else
+    const uint32_t rgid = ::getgid();
+    const uint32_t egid = ::getegid();
+    const uint32_t sgid = egid;
+#endif
+    m.memory.template write<uint32_t>(rgid_addr, rgid);
+    m.memory.template write<uint32_t>(egid_addr, egid);
+    m.memory.template write<uint32_t>(sgid_addr, sgid);
     m.set_result(0);
 }
 
@@ -6402,14 +7100,48 @@ static void sys_clock_getres(Machine& m) {
 }
 
 static void sys_membarrier(Machine& m) {
-    // Single-core: no memory ordering issues. Return -ENOSYS for registration,
-    // which tells callers to fall back to compiler barriers.
+    // Single-core/runtime-local emulation: expedited membarrier operations can
+    // safely succeed as no-ops. Modern runtimes like Node/libuv register
+    // private expedited barriers during thread startup and expect success.
     int cmd = m.template sysarg<int>(0);
-    if (cmd == 0) {
-        // MEMBARRIER_CMD_QUERY — report no supported commands
-        m.set_result(0);
-    } else {
-        m.set_result(err::NOSYS);
+    constexpr int MEMBARRIER_CMD_QUERY = 0;
+    constexpr int MEMBARRIER_CMD_GLOBAL = 1;
+    constexpr int MEMBARRIER_CMD_GLOBAL_EXPEDITED = 2;
+    constexpr int MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED = 4;
+    constexpr int MEMBARRIER_CMD_PRIVATE_EXPEDITED = 8;
+    constexpr int MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED = 16;
+    constexpr int MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE = 32;
+    constexpr int MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE = 64;
+    constexpr int MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ = 128;
+    constexpr int MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ = 256;
+    constexpr int SUPPORTED_MASK =
+        MEMBARRIER_CMD_GLOBAL |
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED |
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED |
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED |
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED |
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE |
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE |
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ |
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ;
+    switch (cmd) {
+        case MEMBARRIER_CMD_QUERY:
+            m.set_result(SUPPORTED_MASK);
+            return;
+        case MEMBARRIER_CMD_GLOBAL:
+        case MEMBARRIER_CMD_GLOBAL_EXPEDITED:
+        case MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED:
+        case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
+        case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
+        case MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE:
+        case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE:
+        case MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ:
+        case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ:
+            m.set_result(0);
+            return;
+        default:
+            m.set_result(err::NOSYS);
+            return;
     }
 }
 
@@ -6663,14 +7395,127 @@ static void sys_tkill(Machine& m) {
     m.set_result(0);
 }
 
+static void dump_guest_words_around(Machine& m, const char* label, uint64_t center) {
+    if (center < 8) {
+        fprintf(stderr, "[ebreak-handler] %s=0x%lx too low for word dump\n",
+                label, (long)center);
+        return;
+    }
+    fprintf(stderr, "[ebreak-handler] %s words around 0x%lx:\n",
+            label, (long)center);
+    const uint64_t base = center - 8;
+    for (int i = 0; i < 6; i++) {
+        const uint64_t addr = base + uint64_t(i) * 4;
+        try {
+            uint32_t word = 0;
+            m.memory.memcpy_out(&word, addr, sizeof(word));
+            fprintf(stderr, "  0x%lx: 0x%08x%s\n",
+                    (long)addr, word, addr == center ? "  <==" : "");
+        } catch (...) {
+            fprintf(stderr, "  0x%lx: <unreadable>\n", (long)addr);
+            break;
+        }
+    }
+}
+
+static void dump_guest_qwords(Machine& m, const char* label, uint64_t base, int count) {
+    fprintf(stderr, "%s", label);
+    for (int i = 0; i < count; i++) {
+        const uint64_t addr = base + uint64_t(i) * 8;
+        try {
+            const uint64_t word = m.memory.template read<uint64_t>(addr);
+            fprintf(stderr, " [0x%lx]=0x%lx", (unsigned long)addr, (unsigned long)word);
+        } catch (...) {
+            fprintf(stderr, " [0x%lx]=<fault>", (unsigned long)addr);
+            break;
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
+static void dump_exec_decode_state(Machine& m, uint64_t pc) {
+    auto& exec = m.cpu.current_execute_segment();
+    fprintf(stderr,
+            "[ebreak-handler] exec-state pc=0x%lx within=%d seg=[0x%lx,0x%lx) stale=%d translated=%d\n",
+            (long)pc,
+            (int)exec.is_within(pc),
+            (long)exec.exec_begin(),
+            (long)exec.exec_end(),
+            (int)exec.is_stale(),
+            (int)exec.is_binary_translated());
+    if (!exec.is_within(pc)) {
+        return;
+    }
+    try {
+        const auto dec_index = pc >> riscv::DecoderCache<riscv::RISCV64>::SHIFT;
+        const auto* dec = &exec.decoder_cache()[dec_index];
+        uint32_t exec_word = 0;
+        const auto* exec_ptr = exec.exec_data(pc);
+        std::memcpy(&exec_word, exec_ptr, sizeof(exec_word));
+        fprintf(stderr,
+                "[ebreak-handler] exec-decode pc=0x%lx dec_instr=0x%08x dec_bc=%u block=%u icount=%u exec_word=0x%08x\n",
+                (long)pc,
+                dec->instr,
+                unsigned(dec->get_bytecode()),
+                unsigned(dec->block_bytes()),
+                unsigned(dec->instruction_count()),
+                exec_word);
+        const uint64_t start = (pc >= 8) ? pc - 8 : 0;
+        const uint64_t end = pc + 8;
+        for (uint64_t addr = start; addr <= end; addr += 2) {
+            const auto dec_i = addr >> riscv::DecoderCache<riscv::RISCV64>::SHIFT;
+            const auto* entry = &exec.decoder_cache()[dec_i];
+            uint32_t word = 0;
+            if (addr + 4 <= exec.exec_end()) {
+                std::memcpy(&word, exec.exec_data(addr), sizeof(word));
+            }
+            fprintf(stderr,
+                    "[ebreak-handler] exec-near addr=0x%lx word=0x%08x bc=%u block=%u icount=%u\n",
+                    (long)addr,
+                    word,
+                    unsigned(entry->get_bytecode()),
+                    unsigned(entry->block_bytes()),
+                    unsigned(entry->instruction_count()));
+        }
+    } catch (...) {
+        fprintf(stderr, "[ebreak-handler] exec-decode pc=0x%lx unavailable\n", (long)pc);
+    }
+}
+
+static bool is_real_ebreak_instruction(Machine& m, uint64_t pc) {
+    try {
+        uint32_t instr = 0;
+        m.memory.memcpy_out(&instr, pc, sizeof(instr));
+        return instr == 0x00100073U || (instr & 0xFFFFU) == 0x9002U;
+    } catch (...) {
+        return true;
+    }
+}
+
 // Custom EBREAK handler: do NOT throw (JSPI breaks wasm exception propagation).
 // Instead, handle abort recovery inline — mirrors what the catch block in
 // friscy_resume() was supposed to do.
 static void sys_ebreak(Machine& m) {
-    dbg_fprintf(stderr, "[ebreak-handler] PC=0x%lx RA=0x%lx SP=0x%lx\n",
-            (long)m.cpu.pc(), (long)m.cpu.reg(1), (long)m.cpu.reg(2));
+    const uint64_t pc = m.cpu.pc();
+    const uint64_t ra = m.cpu.reg(1);
+    const uint64_t sp = m.cpu.reg(2);
+    const bool real_ebreak = is_real_ebreak_instruction(m, pc);
+    fprintf(stderr,
+            "[ebreak-handler] PC=0x%lx RA=0x%lx SP=0x%lx A0=0x%lx A1=0x%lx A7=%ld fork=%d real=%d\n",
+            (long)pc, (long)ra, (long)sp,
+            (long)m.cpu.reg(10), (long)m.cpu.reg(11), (long)m.cpu.reg(17),
+            (int)g_fork_active(), (int)real_ebreak);
+    dump_exec_decode_state(m, pc);
+    dump_guest_words_around(m, "pc", pc);
+    if (ra != pc) dump_guest_words_around(m, "ra", ra);
+    if (!real_ebreak) {
+        fprintf(stderr, "[ebreak-handler] non-EBREAK decode, evicting execute segments and retrying PC\n");
+        m.memory.evict_execute_segments();
+        m.cpu.jump(pc);
+        return;
+    }
     if (g_fork_active()) {
-        dbg_fprintf(stderr, "[ebreak-handler] In fork child — forcing exit(127)\n");
+        fprintf(stderr, "[ebreak-handler] In fork child, forcing exit(127)\n");
         g_fork().exit_status = 127;
         g_process_model.push_event(
             ProcessEventKind::Exit,
@@ -6682,12 +7527,11 @@ static void sys_ebreak(Machine& m) {
         return;
     }
     // Jump to RA to skip past the trap (abort/assert/stack_chk_fail)
-    uint64_t ra = m.cpu.reg(1);
     if (ra > 0x1000) {
         m.cpu.jump(ra);
     } else {
         // RA is garbage — just stop
-        dbg_fprintf(stderr, "[ebreak-handler] RA=0x%lx looks invalid, stopping\n", (long)ra);
+        fprintf(stderr, "[ebreak-handler] RA=0x%lx looks invalid, stopping\n", (long)ra);
         m.stop();
     }
 }
@@ -6821,6 +7665,18 @@ static void sys_sendmsg(Machine& m) {
 // past the new binary's BSS segment.
 static void sys_brk(Machine& m) {
     auto new_end = m.sysarg(0);
+    static int brk_debug_budget = 16;
+    auto materialize_brk_growth = [&m](uint64_t start, uint64_t len) {
+        if (len == 0) return;
+        riscv::PageAttributes rw;
+        rw.read = true;
+        rw.write = true;
+        m.memory.set_page_attr(start, len, rw);
+        // Linux guarantees freshly exposed brk pages read back as zeroes.
+        // Reusing the arena without clearing here leaks stale data into musl's
+        // heap metadata and quickly corrupts malloc bin invariants.
+        m.memory.memset(start, 0, len);
+    };
 
     if (!g_exec_ctx.brk_overridden) {
         // Before execve: use g_exec_ctx.brk_current so fork save/restore
@@ -6836,8 +7692,18 @@ static void sys_brk(Machine& m) {
         } else if (new_end > heap_addr + BRK_MAX) {
             m.set_result(g_exec_ctx.brk_current);
         } else {
+            if (new_end > g_exec_ctx.brk_current) {
+                materialize_brk_growth(g_exec_ctx.brk_current, new_end - g_exec_ctx.brk_current);
+            }
             g_exec_ctx.brk_current = new_end;
             m.set_result(g_exec_ctx.brk_current);
+        }
+        if (brk_debug_budget-- > 0) {
+            fprintf(stderr,
+                    "[brk-flow] pre-exec req=0x%lx heap=0x%lx base=0x%lx cur=0x%lx result=0x%lx\n",
+                    (long)new_end, (long)heap_addr, (long)g_exec_ctx.brk_base,
+                    (long)g_exec_ctx.brk_current, (long)m.cpu.reg(10));
+            fflush(stderr);
         }
         return;
     }
@@ -6852,15 +7718,18 @@ static void sys_brk(Machine& m) {
 
     // Make new pages writable if extending
     if (new_end > g_exec_ctx.brk_current) {
-        uint64_t start = g_exec_ctx.brk_current;
-        uint64_t len = new_end - start;
-        riscv::PageAttributes rw;
-        rw.read = true; rw.write = true;
-        m.memory.set_page_attr(start, len, rw);
+        materialize_brk_growth(g_exec_ctx.brk_current, new_end - g_exec_ctx.brk_current);
     }
 
     g_exec_ctx.brk_current = new_end;
     m.set_result(new_end);
+    if (brk_debug_budget-- > 0) {
+        fprintf(stderr,
+                "[brk-flow] post-exec req=0x%lx base=0x%lx cur=0x%lx result=0x%lx mmap=0x%lx\n",
+                (long)m.sysarg(0), (long)g_exec_ctx.brk_base, (long)g_exec_ctx.brk_current,
+                (long)m.cpu.reg(10), (long)m.memory.mmap_address());
+        fflush(stderr);
+    }
 }
 
 // getsockopt, riscv_hwprobe nr constants are in the outer nr namespace (line ~667)

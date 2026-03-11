@@ -64,7 +64,7 @@
 	EXECUTE_CURRENT()
 
 #define QUICK_EXEC_CHECK()                                              \
-	if (UNLIKELY(!(pc >= exec->exec_begin() && pc < exec->exec_end()))) \
+	if (UNLIKELY(exec->is_stale() || !(pc >= exec->exec_begin() && pc < exec->exec_end()))) \
 		MUSTTAIL return next_execute_segment(d, exec, cpu, pc, counter);
 
 #define UNCHECKED_JUMP()                                       \
@@ -161,8 +161,9 @@ namespace riscv
 		cpu.machine().system_call(cpu.reg(REG_ECALL));
 		// Restore max counter
 		counter.retrieve_counters(MACHINE());
-		// Clone-like system calls can change PC
-		if (UNLIKELY(pc != cpu.registers().pc))
+		// Clone-like system calls can change PC, and syscall handlers can
+		// also invalidate the current execute segment.
+		if (UNLIKELY(exec->is_stale() || pc != cpu.registers().pc))
 		{
 			pc = cpu.registers().pc;
 			QUICK_EXEC_CHECK();
@@ -204,7 +205,7 @@ namespace riscv
 		cpu.machine().system(instr);
 		// Restore counters
 		counter.retrieve_max_counter(MACHINE());
-		if (UNLIKELY(pc != cpu.registers().pc))
+		if (UNLIKELY(exec->is_stale() || pc != cpu.registers().pc))
 		{
 			pc = cpu.registers().pc;
 			QUICK_EXEC_CHECK();

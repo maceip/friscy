@@ -272,22 +272,44 @@ function syntheticHttpFetch(sock) {
         packet.set(headerBytes, 0);
         packet.set(respBody, headerBytes.length);
         sock.recv.push(packet);
+        sock.eof = true;
     } catch (e) {
         const errMsg = `HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\n\r\n${String(e?.message || e)}`;
         sock.recv.push(encoder.encode(errMsg));
+        sock.eof = true;
     } finally {
         sock.req = '';
         sock.inflight = false;
     }
 }
 
+function buildDnsQueryUrl(payload) {
+    const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload || 0);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64url = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    return `https://cloudflare-dns.com/dns-query?dns=${b64url}`;
+}
+
+function syntheticDnsFetchSync(payload) {
+    if (typeof XMLHttpRequest !== 'function') return null;
+    try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', buildDnsQueryUrl(payload), false);
+        xhr.responseType = 'arraybuffer';
+        xhr.setRequestHeader('Accept', 'application/dns-message');
+        xhr.send(null);
+        if (xhr.status !== 200 || !xhr.response) return null;
+        const out = new Uint8Array(xhr.response);
+        return out.length ? out : null;
+    } catch (_e) {
+        return null;
+    }
+}
+
 async function syntheticDnsFetch(sock, payload) {
     try {
-        const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload || 0);
-        let bin = '';
-        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-        const b64url = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-        const r = await fetch(`https://cloudflare-dns.com/dns-query?dns=${b64url}`, {
+        const r = await fetch(buildDnsQueryUrl(payload), {
             headers: { Accept: 'application/dns-message' },
         });
         if (!r.ok) return;
@@ -378,6 +400,7 @@ function networkRPC(op, fd, arg1, arg2, data) {
                 port: 0,
                 connected: false,
                 inflight: false,
+                eof: false,
                 type: arg2 | 0,
                 domain: arg1 | 0,
             });
@@ -392,6 +415,7 @@ function networkRPC(op, fd, arg1, arg2, data) {
                 sock.port = parsed.port;
             }
             sock.connected = true;
+            sock.eof = false;
             console.log(`[worker][synth-net] connect fd=${fd} host=${sock.host} port=${sock.port}`);
             return { result: 0, data: null };
         }
@@ -404,9 +428,17 @@ function networkRPC(op, fd, arg1, arg2, data) {
                 console.log(`[worker][synth-net] send fd=${fd} bytes=${payload.length}`);
             }
             if (sock.type === 2) {
-                // UDP path: treat payload as DNS wire query.
-                sock.inflight = true;
-                syntheticDnsFetch(sock, copied).catch(() => {});
+                // UDP DNS needs a response queued before c-ares checks socket
+                // readability again. Prefer a synchronous DoH query in the
+                // worker thread; fall back to async fetch if XHR is unavailable.
+                const syncResp = syntheticDnsFetchSync(copied);
+                if (syncResp && syncResp.length) {
+                    sock.recv.push(syncResp);
+                    sock.inflight = false;
+                } else {
+                    sock.inflight = true;
+                    syntheticDnsFetch(sock, copied).catch(() => {});
+                }
                 return { result: payload.length, data: null };
             }
             // Fire and forget; recv will pick up buffered response.
@@ -415,6 +447,10 @@ function networkRPC(op, fd, arg1, arg2, data) {
         }
         if (op === NET_OP_RECV) {
             if (!sock.recv.length) {
+                if (sock.eof) {
+                    sock.eof = false;
+                    return { result: 0, data: null };
+                }
                 const c = (syntheticRecvLogCount.get(fd) || 0) + 1;
                 syntheticRecvLogCount.set(fd, c);
                 if (c <= 8) {
@@ -432,7 +468,7 @@ function networkRPC(op, fd, arg1, arg2, data) {
             return { result: out.length, data: out };
         }
         if (op === NET_OP_HAS_DATA) {
-            return { result: sock.recv.length > 0 ? 1 : 0, data: null };
+            return { result: (sock.recv.length > 0 || sock.eof) ? 1 : 0, data: null };
         }
         if (op === NET_OP_CLOSE || op === NET_OP_SHUTDOWN) {
             syntheticSockets.delete(fd);
@@ -530,14 +566,37 @@ function getRuntimeFaultInfo() {
     return { kind, pc, data };
 }
 
-function classifyRunFailure(error) {
+function getRuntimeStateSnapshot() {
     const stopped = (typeof emModule?._friscy_stopped === 'function')
         ? !!emModule._friscy_stopped()
         : false;
-    const stopReason = (typeof emModule?._friscy_stop_reason === 'function')
-        ? (emModule._friscy_stop_reason() | 0)
-        : STOP_REASON_NONE;
-    const fault = getRuntimeFaultInfo();
+    const stopReason = getStopReason(emModule?._friscy_stop_reason, emModule?._friscy_stopped);
+    const pc = (typeof emModule?._friscy_get_pc === 'function')
+        ? (emModule._friscy_get_pc() >>> 0)
+        : 0;
+    return {
+        stopped,
+        stopReason,
+        pc,
+        fault: getRuntimeFaultInfo(),
+        processExitStatus: lastProcessExitStatus,
+        processWaitWakeStatus: lastProcessWaitWakeStatus,
+    };
+}
+
+function logRuntimeState(prefix) {
+    try {
+        console.log(`${prefix} ${JSON.stringify(getRuntimeStateSnapshot())}`);
+    } catch (e) {
+        console.log(`${prefix} <state-unavailable:${e?.message || e}>`);
+    }
+}
+
+function classifyRunFailure(error) {
+    const snapshot = getRuntimeStateSnapshot();
+    const stopped = snapshot.stopped;
+    const stopReason = snapshot.stopReason;
+    const fault = snapshot.fault;
     const processExitSuccess = (lastProcessExitStatus === 0) || (lastProcessWaitWakeStatus === 0);
     const processExitFailure =
         (lastProcessExitStatus !== null && lastProcessExitStatus !== 0) ||
@@ -564,6 +623,39 @@ function classifyRunFailure(error) {
             mentionsEbreak,
         },
     };
+}
+
+async function resumeEscapedRunFault(errMsg) {
+    if (typeof emModule?._friscy_resume !== 'function') {
+        return false;
+    }
+
+    logRuntimeState(`[worker] pre-resume escaped callMain fault (${errMsg})`);
+    const loopOutcome = await runResumeLoop({ forceInitialResume: true });
+    drainProcessEvents();
+    logRuntimeState(`[worker] post-runResumeLoop escaped callMain fault (${errMsg}) outcome=${loopOutcome}`);
+
+    if (loopOutcome === 'too_many_faults' || loopOutcome === 'resume_exception' || loopOutcome === 'control_sab_missing') {
+        return false;
+    }
+
+    const after = getRuntimeStateSnapshot();
+    const processExitSuccess = after.processExitStatus === 0 || after.processWaitWakeStatus === 0;
+    const processExitFailure =
+        (after.processExitStatus !== null && after.processExitStatus !== 0) ||
+        (after.processWaitWakeStatus !== null && after.processWaitWakeStatus !== 0);
+    const terminalFault = after.fault.kind !== FRISCY_FAULT_NONE;
+
+    if (processExitFailure || terminalFault) {
+        console.warn(`[worker] escaped callMain fault recovery ended in non-graceful state (${errMsg})`);
+        return false;
+    }
+
+    if (processExitSuccess || !after.stopped) {
+        return true;
+    }
+
+    return false;
 }
 
 function drainProcessEvents() {
@@ -675,8 +767,9 @@ function exportLiveCheckpointBytes() {
 /**
  * Run the resume loop.
  */
-async function runResumeLoop() {
+async function runResumeLoop(options = {}) {
     console.log('[worker] entering resume loop');
+    let forceInitialResume = !!options.forceInitialResume;
     let resumeCount = 0;
     const loopStartMs = Date.now();
     const telemetry = {
@@ -749,11 +842,16 @@ async function runResumeLoop() {
         const stopReason = timesliceResumeEnabled
             ? rawStopReason
             : (rawStopReason & ~STOP_REASON_TIMESLICE);
+        const shouldForceResume = forceInitialResume && stopReason === STOP_REASON_NONE;
 
-        if (stopReason === STOP_REASON_NONE) {
+        if (stopReason === STOP_REASON_NONE && !shouldForceResume) {
             flushTelemetry('finished');
             console.log(`[worker] resume loop: machine finished after ${resumeCount} resumes`);
-            return;
+            return 'finished';
+        }
+        if (shouldForceResume) {
+            forceInitialResume = false;
+            console.log('[worker] resume loop: forcing initial resume with stopReason=0');
         }
         if (!controlView || !controlBytes) break;
 
@@ -961,7 +1059,7 @@ async function runResumeLoop() {
                 if (jitResult.isHalt) {
                     telemetry.jitHalts++;
                     flushTelemetry('jit_halt');
-                    return;
+                    return 'jit_halt';
                 }
 
                 if (jitResult.isSyscall) {
@@ -1005,7 +1103,8 @@ async function runResumeLoop() {
                 break;
             } catch (resumeErr) {
                 telemetry.resumeThrows++;
-                console.error('[worker] friscy_resume threw:', resumeErr?.message || resumeErr);
+                const resumeErrShown = String(resumeErr?.message || resumeErr || '');
+                console.error('[worker] friscy_resume threw:', resumeErrShown);
                 if (stopReason & STOP_REASON_STDIN) {
                     telemetry.recoveredThrows++;
                     stillStopped = 1;
@@ -1015,12 +1114,25 @@ async function runResumeLoop() {
                 const resumeErrMsg = (resumeErr && typeof resumeErr === 'object' && 'message' in resumeErr)
                     ? String(resumeErr.message)
                     : '';
-                if (Array.isArray(resumeErr) || resumeErrText.includes('[array Array]') || resumeErrMsg.includes('[array Array]')) {
+                const escapedArrayThrow =
+                    Array.isArray(resumeErr) ||
+                    resumeErrShown.includes('[array Array]') ||
+                    resumeErrText.includes('[array Array]') ||
+                    resumeErrMsg.includes('[array Array]');
+                if (escapedArrayThrow) {
                     // JSPI/Wasm exception payloads can surface as raw JS arrays.
                     // Treat them as transient stop boundaries instead of hard faults.
                     telemetry.recoveredThrows++;
-                    if (typeof emModule._friscy_recover_fault === 'function') {
-                        try { emModule._friscy_recover_fault(); } catch (_) {}
+                    console.warn(
+                        `[worker] recoverable escaped resume throw shown=${JSON.stringify(resumeErrShown)} text=${JSON.stringify(resumeErrText)} msg=${JSON.stringify(resumeErrMsg)} ctor=${JSON.stringify(resumeErr?.constructor?.name || '')}`
+                    );
+                    const recoverFns = [
+                        emModule._friscy_evict_execute_segments,
+                        emModule._friscy_recover_fault,
+                    ];
+                    for (const fn of recoverFns) {
+                        if (typeof fn !== 'function') continue;
+                        try { fn(); } catch (_) {}
                     }
                     stillStopped = 1;
                     break;
@@ -1041,7 +1153,7 @@ async function runResumeLoop() {
                 }
                 if (faultRetries++ >= 8) {
                     flushTelemetry('too_many_faults');
-                    return;
+                    return 'too_many_faults';
                 }
                 if (typeof emModule._friscy_recover_fault === 'function') {
                     try { emModule._friscy_recover_fault(); } catch (_) {}
@@ -1049,18 +1161,19 @@ async function runResumeLoop() {
                     continue;
                 }
                 flushTelemetry('resume_exception');
-                return;
+                return 'resume_exception';
             }
         }
         maybePostJitStats();
         if (!stillStopped) {
             flushTelemetry('finished_after_resume');
             console.log(`[worker] resume loop: machine finished after ${resumeCount} resumes`);
-            return;
+            return 'finished_after_resume';
         }
     }
 
     flushTelemetry('control_sab_missing');
+    return 'control_sab_missing';
 }
 
 self.addEventListener('error', (e) => {
@@ -1284,12 +1397,22 @@ self.onmessage = async function(e) {
             };
             emModule.hasSocketData = function(fd) {
                 const { result } = networkRPC(NET_OP_HAS_DATA, fd, 0, 0, null);
+                if (result > 0) {
+                    console.log(`[worker][socket-api] hasSocketData fd=${fd} ready=1`);
+                }
                 return result > 0;
             };
             emModule.readSocketData = function(fd, maxLen) {
                 const resp = networkRPC(NET_OP_RECV, fd, maxLen, 0, null);
-                if (resp.result <= 0 || !resp.data) return null;
-                return Array.from(resp.data);
+                if (resp.result > 0 && resp.data) {
+                    console.log(`[worker][socket-api] readSocketData fd=${fd} bytes=${resp.result}`);
+                    return Array.from(resp.data);
+                }
+                if (resp.result === 0) {
+                    console.log(`[worker][socket-api] readSocketData fd=${fd} eof`);
+                    return [];
+                }
+                return null;
             };
             emModule.hasPendingAccept = function(fd) {
                 const { result } = networkRPC(NET_OP_HAS_PENDING_ACCEPT, fd, 0, 0, null);
@@ -1387,22 +1510,39 @@ self.onmessage = async function(e) {
             signalExit(0);
         } catch (e) {
             const errMsg = e?.message || String(e);
+            const errText = String(errMsg);
             const errStack = e?.stack ? `\n${e.stack}` : '';
 
             // Protection faults may escape C++ try/catch in WASM tail-call mode.
             // Try to recover by evicting stale execute segments before classifying.
-            const isProtectionFault = typeof errMsg === 'string' &&
-                (errMsg.includes('Protection fault') || errMsg.includes('MachineException'));
-            if (isProtectionFault && typeof emModule._friscy_recover_fault === 'function') {
-                const recovered = emModule._friscy_recover_fault();
-                if (recovered) {
-                    console.log('[worker] recovered from escaped fault in callMain, entering resume loop');
-                    drainProcessEvents();
-                    await runResumeLoop();
-                    drainProcessEvents();
-                    maybePostJitStats(true);
-                    signalExit(0);
-                    return;
+            const isBadAlloc = errText.includes('bad_alloc');
+            const recoverableRunFault =
+                errText.includes('Protection fault') ||
+                errText.includes('MachineException') ||
+                isBadAlloc
+            ;
+            const recoverFn = isBadAlloc
+                ? emModule._friscy_evict_execute_segments
+                : emModule._friscy_recover_fault;
+            console.log(`[worker] recoverableRunFault=${recoverableRunFault} isBadAlloc=${isBadAlloc} recoverFnType=${typeof recoverFn} err=${errText}`);
+            if (recoverableRunFault && typeof recoverFn === 'function') {
+                try {
+                    logRuntimeState(`[worker] pre-recover escaped callMain fault (${errMsg})`);
+                    const recovered = recoverFn();
+                    console.log(`[worker] recover attempt for escaped callMain failure (${errMsg}) => ${recovered}`);
+                    if (recovered) {
+                        logRuntimeState(`[worker] post-recover escaped callMain fault (${errMsg})`);
+                        console.log(`[worker] recovered from escaped callMain failure (${errMsg}), forcing resume`);
+                        drainProcessEvents();
+                        const recoveredGracefully = await resumeEscapedRunFault(errMsg);
+                        if (recoveredGracefully) {
+                            maybePostJitStats(true);
+                            signalExit(0);
+                            return;
+                        }
+                    }
+                } catch (recoverErr) {
+                    console.warn(`[worker] recovery hook threw after callMain failure (${errMsg}):`, recoverErr?.message || recoverErr);
                 }
             }
 

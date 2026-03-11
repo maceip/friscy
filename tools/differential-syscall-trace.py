@@ -10,7 +10,7 @@ Usage:
     --friscy-rootfs /path/to/rootfs \
     --qemu-rootfs /path/to/rootfs \
     --guest-cmd "/bin/bash -lc 'echo pre; node -e \"console.log(\\\"node-ok\\\")\"; echo post'" \
-    --qemu-rootfs-entry-mode host
+    --qemu-rootfs-entry-mode guest
   python3 tools/differential-syscall-trace.py \
     --differential-tag repro-node-mmap \
     --friscy-rootfs /path/to/rootfs \
@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shlex
 import subprocess
@@ -55,6 +56,14 @@ QEMU_RE = re.compile(
     r"(?P<ret>-?0x[0-9a-fA-F]+|-?\d+)"
     r")?"
 )
+QEMU_EVENT_START_RE = re.compile(
+    r"(?:\[\s*\d+\]\s*)?"
+    r"(?:(?:\d+)\s+)?"
+    r"(?:(?:0x[0-9a-fA-F]+):\s*)?"
+    r"(?:(?:\d+)\s+)?"
+    r"[A-Za-z_][A-Za-z0-9_]*\("
+)
+QEMU_RET_CONT_RE = re.compile(r"^\s*=\s*(?P<ret>-?0x[0-9a-fA-F]+|-?\d+)")
 
 PHASE_ORDER = [
     "fork-save",
@@ -535,11 +544,46 @@ def parse_friscy(text: str, phase_state: PhaseState, symbolizer: Symbolizer) -> 
     return out
 
 
+def _iter_qemu_records(text: str) -> Iterable[Tuple[int, str]]:
+    pending: List[Tuple[int, str]] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        cont = QEMU_RET_CONT_RE.match(stripped)
+        if cont and pending:
+            pending_line, pending_raw = pending.pop(0)
+            yield pending_line, f"{pending_raw} {stripped}"
+            continue
+
+        starts = list(QEMU_EVENT_START_RE.finditer(line))
+        if not starts:
+            continue
+
+        for idx, start in enumerate(starts):
+            end = starts[idx + 1].start() if idx + 1 < len(starts) else len(line)
+            record = line[start.start():end].strip()
+            if not record:
+                continue
+            match = QEMU_RE.search(record)
+            if not match:
+                continue
+            sysname = match.group("name")
+            sysnum = int(match.group("sysnum")) if match.group("sysnum") else syscall_name_map.get(sysname or "")
+            if match.group("ret") is None:
+                # QEMU can interleave multi-threaded strace output so a syscall
+                # begins on one line and its return value lands on a later line.
+                # Keep only known syscalls pending so long-lived waits like
+                # epoll/futex do not steal a focused mmap/mprotect continuation.
+                if sysnum is not None:
+                    pending.append((line_no, record))
+                continue
+            yield line_no, record
+
+
 def parse_qemu(text: str) -> List[QEvent]:
     out: List[QEvent] = []
     idx = 0
     execve_seen = False
-    for line_no, line in enumerate(text.splitlines(), start=1):
+    for line_no, line in _iter_qemu_records(text):
         m = QEMU_RE.search(line)
         if not m:
             continue
@@ -720,6 +764,15 @@ def _qemu_rootfs_node_candidates(rootfs: Path) -> list[str]:
     return found
 
 
+def _ensure_qemu_rootfs_node_alias(rootfs: Path) -> None:
+    target = rootfs / "usr/bin/node"
+    alias = rootfs / "bin/node"
+    if alias.exists() or alias.is_symlink() or not target.exists():
+        return
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    alias.symlink_to(os.path.relpath(target, alias.parent))
+
+
 def _guest_cmd_mentions_node(cmd: str) -> bool:
     pattern = re.compile(r"(?<![A-Za-z0-9_./-])(?:/usr/bin/node|/bin/node|node)(?![A-Za-z0-9_./-])")
     return pattern.search(cmd) is not None
@@ -766,22 +819,27 @@ def _qemu_entry_for_launch(
     return str(qemu_rootfs / entry.lstrip("/"))
 
 
-def _normalize_node_path_for_qemu_rootfs(
+def _guest_node_path_for_qemu_rootfs(node_path: str, qemu_rootfs: Path) -> str:
+    if not node_path.startswith(str(qemu_rootfs)):
+        return node_path
+    try:
+        rel = Path(node_path).resolve(strict=False).relative_to(qemu_rootfs.resolve(strict=False))
+        return "/" + "/".join(rel.parts)
+    except ValueError:
+        return node_path
+
+
+def _qemu_launch_node_path_for_rootfs(
     node_path: str,
     qemu_rootfs: Path,
     host_entry_mode: bool,
 ) -> str:
+    guest_path = _guest_node_path_for_qemu_rootfs(node_path, qemu_rootfs)
     if not host_entry_mode:
-        return node_path
-    if not node_path.startswith("/"):
-        return node_path
-    if node_path.startswith(str(qemu_rootfs)):
-        try:
-            rel = Path(node_path).resolve(strict=False).relative_to(qemu_rootfs.resolve(strict=False))
-            return "/" + "/".join(rel.parts)
-        except ValueError:
-            return node_path
-    return node_path
+        return guest_path
+    if not guest_path.startswith("/"):
+        return guest_path
+    return str(qemu_rootfs / guest_path.lstrip("/"))
 
 
 def _validate_qemu_rootfs(path: Path, guest_argv: Sequence[str], host_entry_mode: bool) -> None:
@@ -821,14 +879,14 @@ def _validate_qemu_rootfs(path: Path, guest_argv: Sequence[str], host_entry_mode
         )
 
 
-def _validate_node_path_for_guest_cmd(
+def _resolve_node_path_for_guest_cmd(
     cmd: str,
     qemu_rootfs: Path,
     node_path: Optional[str],
     host_entry_mode: bool,
-) -> str:
+) -> Optional[str]:
     if not _guest_cmd_mentions_node(cmd):
-        return cmd
+        return None
 
     requested = node_path
     if requested is None:
@@ -839,15 +897,12 @@ def _validate_node_path_for_guest_cmd(
                 "Use a rootfs that includes a node binary."
             )
         requested = candidates[0]
-    else:
-        requested = _normalize_node_path_for_qemu_rootfs(requested, qemu_rootfs, host_entry_mode)
-        if not (qemu_rootfs / requested.lstrip("/")).exists():
-            raise RuntimeError(
-                f"requested --node-path '{requested}' was not found in qemu rootfs {qemu_rootfs}"
-            )
-
-    replacement = _normalize_node_path_for_qemu_rootfs(requested, qemu_rootfs, host_entry_mode=host_entry_mode)
-    return _apply_node_path(cmd, replacement)
+    requested = _guest_node_path_for_qemu_rootfs(requested, qemu_rootfs)
+    if requested.startswith("/") and not (qemu_rootfs / requested.lstrip("/")).exists():
+        raise RuntimeError(
+            f"requested --node-path '{requested}' was not found in qemu rootfs {qemu_rootfs}"
+        )
+    return requested
 
 
 def _normalize_command(cmd: str) -> str:
@@ -965,29 +1020,41 @@ def build_mode_commands(args: argparse.Namespace) -> tuple[str, str]:
     if node_path == "auto":
         node_path = None
 
-    effective_guest_cmd = _apply_node_path(args.guest_cmd, node_path)
-    guest_argv = shlex.split(effective_guest_cmd)
+    guest_argv = shlex.split(args.guest_cmd)
     if not guest_argv:
         raise RuntimeError("--guest-cmd could not be parsed into arguments")
 
     _validate_friscy_rootfs(friscy_rootfs)
     host_entry_mode = args.qemu_rootfs_entry_mode == "host"
-    effective_guest_cmd = _validate_node_path_for_guest_cmd(
-        effective_guest_cmd,
+    _ensure_qemu_rootfs_node_alias(qemu_rootfs)
+    resolved_node_path = _resolve_node_path_for_guest_cmd(
+        args.guest_cmd,
         qemu_rootfs,
         node_path,
         host_entry_mode=host_entry_mode,
     )
-    guest_argv = shlex.split(effective_guest_cmd)
-    _validate_qemu_rootfs(qemu_rootfs, guest_argv, host_entry_mode=host_entry_mode)
+    friscy_guest_cmd = _apply_node_path(args.guest_cmd, resolved_node_path)
+    qemu_guest_cmd = _apply_node_path(
+        args.guest_cmd,
+        None
+        if resolved_node_path is None
+        else _qemu_launch_node_path_for_rootfs(
+            resolved_node_path,
+            qemu_rootfs,
+            host_entry_mode=host_entry_mode,
+        ),
+    )
+    friscy_guest_argv = shlex.split(friscy_guest_cmd)
+    qemu_guest_argv = shlex.split(qemu_guest_cmd)
+    _validate_qemu_rootfs(qemu_rootfs, qemu_guest_argv, host_entry_mode=host_entry_mode)
 
-    guest_entry = guest_argv[0]
+    guest_entry = qemu_guest_argv[0]
     qemu_guest_entry = _qemu_entry_for_launch(guest_entry, qemu_rootfs, host_entry_mode=host_entry_mode)
-    qemu_guest_argv = [qemu_guest_entry, *guest_argv[1:]]
+    qemu_guest_argv = [qemu_guest_entry, *qemu_guest_argv[1:]]
 
     quoted_friscy_rootfs = shlex.quote(str(friscy_rootfs))
     quoted_qemu_rootfs = shlex.quote(str(qemu_rootfs))
-    quoted_guest = [shlex.quote(a) for a in guest_argv]
+    quoted_friscy_guest = [shlex.quote(a) for a in friscy_guest_argv]
     quoted_qemu_guest = [shlex.quote(a) for a in qemu_guest_argv]
 
     friscy_cmd = " ".join(
@@ -996,18 +1063,20 @@ def build_mode_commands(args: argparse.Namespace) -> tuple[str, str]:
             "--rootfs",
             quoted_friscy_rootfs,
             "--differential-syscall-trace",
-            *quoted_guest,
+            *quoted_friscy_guest,
         ]
     )
-    qemu_cmd = " ".join(
-        [
-            shlex.quote(qemu_bin),
-            "-L",
-            quoted_qemu_rootfs,
-            "-strace",
-            *quoted_qemu_guest,
-        ]
-    )
+    qemu_parts = []
+    if host_entry_mode:
+        qemu_parts += ["env", "QEMU_LD_PREFIX=" + str(qemu_rootfs)]
+    qemu_parts += [
+        shlex.quote(qemu_bin),
+        "-L",
+        quoted_qemu_rootfs,
+        "-strace",
+        *quoted_qemu_guest,
+    ]
+    qemu_cmd = " ".join(qemu_parts)
     return friscy_cmd, qemu_cmd
 
 
@@ -1024,8 +1093,9 @@ def parse_args() -> argparse.Namespace:
         default="host",
         help=(
             "How qemu should invoke the rootfs entry when using --qemu-rootfs: "
-            "'host' prefixes qemu rootfs to the guest path; "
-            "'guest' passes entry paths unchanged."
+            "'guest' passes entry paths unchanged so qemu resolves them under -L; "
+            "'host' prefixes qemu rootfs to the guest path and exports QEMU_LD_PREFIX "
+            "so nested execs of host-prefixed guest ELFs keep using the extracted rootfs."
         ),
     )
     p.add_argument("--node-path", help="Replace '/bin/node', '/usr/bin/node', or 'node' in command strings (rootfs + manual modes). Use 'auto' in rootfs mode to pick the first known node path in guest rootfs.")

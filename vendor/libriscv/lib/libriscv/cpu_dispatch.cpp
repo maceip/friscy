@@ -116,6 +116,8 @@ bool CPU<W>::simulate(address_t pc, uint64_t inscounter, uint64_t maxcounter)
 #  endif
 
 continue_segment:
+	if (UNLIKELY(exec->is_stale()))
+		goto new_execute_segment;
 	decoder = &exec_decoder[pc >> DecoderCache<W>::SHIFT];
 
 	pc += decoder->block_bytes();
@@ -156,7 +158,7 @@ INSTRUCTION(RV32I_BC_SYSTEM, rv32i_system) {
 	MACHINE().system(instr);
 	// Restore counters
 	counter.retrieve_counters(MACHINE());
-	if (UNLIKELY(counter.overflowed() || pc != REGISTERS().pc))
+	if (UNLIKELY(counter.overflowed() || exec->is_stale() || pc != REGISTERS().pc))
 	{
 		pc = REGISTERS().pc;
 		goto check_jump;
@@ -200,7 +202,7 @@ INSTRUCTION(RV32I_BC_SYSCALL, rv32i_syscall) {
 	MACHINE().system_call(REG(REG_ECALL));
 	// Restore counters
 	counter.retrieve_counters(MACHINE());
-	if (UNLIKELY(counter.overflowed() || pc != REGISTERS().pc))
+	if (UNLIKELY(counter.overflowed() || exec->is_stale() || pc != REGISTERS().pc))
 	{
 		// System calls are always full-length instructions
 		if constexpr (VERBOSE_JUMPS) {

@@ -88,7 +88,7 @@ set(RISCV_EXPERIMENTAL ON  CACHE BOOL "Enable experimental features")
 # --- Execute segments ---
 # Node.js dynamically links 16+ shared libraries, and V8's JIT compiler
 # generates many code regions. Each needs its own execute segment.
-add_definitions(-DRISCV_MAX_EXECUTE_SEGS=1024)
+add_definitions(-DRISCV_MAX_EXECUTE_SEGS=4096)
 
 # --- VH hypercall syscall range ---
 # VectorHeart harness uses ecalls 600-803. Default RISCV_SYSCALLS_MAX is 512.
@@ -199,7 +199,7 @@ if(EMSCRIPTEN)
     )
 
     # Build consolidated EXPORTED_FUNCTIONS list
-    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response" "_friscy_drain_process_events" "_friscy_get_last_fault_kind" "_friscy_get_last_fault_pc" "_friscy_get_last_fault_data" "_friscy_clear_last_fault" "_friscy_stop_reason" "_friscy_notify_child_exit" "_friscy_recover_fault")
+    set(FRISCY_EXPORTS "_main" "_malloc" "_free" "_friscy_export_tar" "_friscy_export_checkpoint" "_friscy_save_live_checkpoint" "_friscy_stopped" "_friscy_resume" "_friscy_get_pc" "_friscy_set_pc" "_friscy_get_state_ptr" "_friscy_host_fetch_pending" "_friscy_get_fetch_request" "_friscy_get_fetch_request_len" "_friscy_set_fetch_response" "_friscy_drain_process_events" "_friscy_get_last_fault_kind" "_friscy_get_last_fault_pc" "_friscy_get_last_fault_data" "_friscy_clear_last_fault" "_friscy_stop_reason" "_friscy_notify_child_exit" "_friscy_recover_fault" "_friscy_evict_execute_segments")
     if(FRISCY_WIZER)
         list(APPEND FRISCY_EXPORTS "_wizer_init")
         target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)

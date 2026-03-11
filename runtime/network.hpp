@@ -824,13 +824,17 @@ inline void sys_recvfrom(Machine& m) {
     }
 
     // Drain data from JS network bridge buffer via Module.readSocketData.
-    // readSocketData returns an array of bytes or null if no data.
+    // readSocketData returns:
+    //   - byte array: data available
+    //   - []: peer EOF
+    //   - null: no data / would block
     // We write directly into guest memory using the arena pointer.
     auto view = m.memory.memview(buf_ptr, len);
     int bytes_read = EM_ASM_INT({
         if (typeof Module.readSocketData !== 'function') return 0;
         var result = Module.readSocketData($0, $1);
-        if (!result || result.length === 0) return 0;
+        if (result === null) return -11;
+        if (result.length === 0) return 0;
         var off = Number($2);
         for (var i = 0; i < result.length; i++) {
             Module.HEAPU8[off + i] = result[i];
@@ -838,13 +842,13 @@ inline void sys_recvfrom(Machine& m) {
         return result.length;
     }, sockfd, (int)len, view.data());
 
-    if (bytes_read > 0) {
+    if (bytes_read >= 0) {
         m.set_result(bytes_read);
         return;
     }
 
     // No data available
-    m.set_result(-11);  // EAGAIN
+    m.set_result(bytes_read);  // EAGAIN
 #else
     // Native: use real recv
     std::vector<uint8_t> buf(len);

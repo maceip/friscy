@@ -127,6 +127,17 @@ inline void Machine<W>::system_call(size_t sysnum)
 		fprintf(stderr, "sys#%zu(0x%lx,0x%lx,0x%lx) pc=0x%lx",
 			sysnum, (long)entry.a0, (long)entry.a1, (long)entry.a2, (long)cpu.pc());
 	}
+	if (UNLIKELY(cpu.pc() == 0x18035938ULL)) {
+		fprintf(stderr,
+			"[syscall-dispatch] pc=0x%lx sysnum=%zu size=%zu inrange=%d a7=%ld a0=0x%lx ra=0x%lx\n",
+			(long)cpu.pc(),
+			sysnum,
+			syscall_handlers.size(),
+			(int)(sysnum < syscall_handlers.size()),
+			(long)cpu.reg(REG_ECALL),
+			(long)cpu.reg(REG_ARG0),
+			(long)cpu.reg(REG_RA));
+	}
 
 	if (LIKELY(sysnum < syscall_handlers.size())) {
 		auto& handler = Machine::syscall_handlers[RISCV_SPECSAFE(sysnum)];

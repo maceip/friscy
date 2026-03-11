@@ -12,6 +12,28 @@ static constexpr bool MADVISE_ENABLED = false;
 namespace riscv
 {
 	template <int W>
+	void Memory<W>::mark_execute_segments_stale(address_t addr, size_t len) noexcept
+	{
+		auto overlaps = [addr, len] (const auto& segment) noexcept {
+			if (!segment || segment->empty()) return false;
+			const address_t begin = segment->exec_begin();
+			const address_t end = segment->exec_end();
+			address_t addr_end = addr;
+			if (__builtin_add_overflow(addr, len, &addr_end))
+				addr_end = ~address_t(0);
+			return addr < end && begin < addr_end;
+		};
+		if (overlaps(m_main_exec_segment)) {
+			m_main_exec_segment->set_stale(true);
+		}
+		for (auto& segment : m_exec) {
+			if (overlaps(segment)) {
+				segment->set_stale(true);
+			}
+		}
+	}
+
+	template <int W>
 	const Page& Memory<W>::get_readable_pageno(const address_t pageno) const
 	{
 		const auto& page = get_pageno(pageno);
@@ -27,12 +49,18 @@ namespace riscv
 		if (LIKELY(it != m_pages.end())) {
 			Page& page = it->second;
 			if (LIKELY(page.attr.write)) {
+				if (UNLIKELY(page.attr.exec)) {
+					this->mark_execute_segments_stale(pageno * Page::size(), Page::size());
+				}
 				return page;
 			} else if (page.attr.is_cow) {
 				m_page_write_handler(*this, pageno, page);
 				// The page may be read-cached at this time
 				// and the page data has likely changed now.
 				this->invalidate_cache(pageno, &page);
+				if (UNLIKELY(page.attr.exec)) {
+					this->mark_execute_segments_stale(pageno * Page::size(), Page::size());
+				}
 				return page;
 			}
 		} else {
@@ -40,6 +68,9 @@ namespace riscv
 			Page& page = m_page_fault_handler(*this, pageno, init);
 			if (LIKELY(page.attr.write)) {
 				this->invalidate_cache(pageno, &page);
+				if (UNLIKELY(page.attr.exec)) {
+					this->mark_execute_segments_stale(pageno * Page::size(), Page::size());
+				}
 				return page;
 			}
 		}
@@ -52,6 +83,7 @@ namespace riscv
 		auto it = pages().find(pageno);
 		if (it != pages().end()) {
 			auto& page = it->second;
+			const bool old_exec = page.attr.exec;
 			// Keep non-owning and is_cow attributes
 			const bool is_cow = page.attr.is_cow;
 			page.attr.apply_regular_attributes(attr);
@@ -60,6 +92,9 @@ namespace riscv
 				page.attr.is_cow = true;
 				page.attr.write = false;
 			}
+			if (UNLIKELY(old_exec != page.attr.exec)) {
+				this->mark_execute_segments_stale(pageno * Page::size(), Page::size());
+			}
 			return;
 		}
 
@@ -67,7 +102,11 @@ namespace riscv
 		if (flat_readwrite_arena && pageno < this->m_arena.pages)
 		{
 			auto& page = this->create_writable_pageno(pageno);
+			const bool old_exec = page.attr.exec;
 			page.attr.apply_regular_attributes(attr);
+			if (UNLIKELY(old_exec != page.attr.exec)) {
+				this->mark_execute_segments_stale(pageno * Page::size(), Page::size());
+			}
 			return;
 		}
 

@@ -270,6 +270,11 @@ restart_next_execute_segment:
 
 		auto* exec = this->m_exec;
 restart_precise_sim:
+		if (UNLIKELY(exec->is_stale())) {
+			auto new_values = this->next_execute_segment(this->pc());
+			exec = new_values.exec;
+			goto restart_precise_sim;
+		}
 		auto* exec_seg_data = exec->exec_data();
 
 		for (; machine().instruction_counter() < machine().max_instructions();

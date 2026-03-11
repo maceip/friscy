@@ -201,6 +201,7 @@ namespace riscv
 		void  invalidate_reset_cache() const noexcept;
 		void  free_pages(address_t, size_t len);
 		bool  free_pageno(address_t pageno);
+		void  mark_execute_segments_stale(address_t addr, size_t len = 1) noexcept;
 
 		// Event for writing to unused/unknown memory
 		// The old handler is returned, so it can be restored later.
@@ -256,6 +257,8 @@ namespace riscv
 		address_t memory_arena_read_boundary() const noexcept { return this->m_arena.read_boundary; }
 		address_t memory_arena_write_boundary() const noexcept { return this->m_arena.write_boundary; }
 		address_t initial_rodata_end() const noexcept { return this->m_arena.initial_rodata_end; }
+		void set_memory_arena_fast_path_end(address_t end_addr) noexcept;
+		void restore_memory_arena_fast_path() noexcept;
 
 		// Serializes the current memory state to an existing vector
 		// Returns the final size of the serialized state

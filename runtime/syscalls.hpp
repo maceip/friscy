@@ -359,9 +359,16 @@ inline const LiveMmapRegion* live_mmap_find(uint64_t addr) {
 }
 
 inline void enable_lazy_mmap_page_tables(Machine& m) {
-    if (g_lazy_mmap_page_tables_enabled || !m.memory.uses_flat_memory_arena()) return;
+    if (g_lazy_mmap_page_tables_enabled) return;
     g_lazy_mmap_page_tables_enabled = true;
-    m.memory.set_memory_arena_fast_path_end(m.memory.mmap_start());
+    // In arena mode, restrict the fast path so mmap-region accesses go
+    // through the page fault handler for lazy materialization.
+    if (m.memory.uses_flat_memory_arena()) {
+        m.memory.set_memory_arena_fast_path_end(m.memory.mmap_start());
+    }
+    // In non-arena (page-backed) mode, lazy materialization now works via
+    // the page fault handler which creates pages with the live region's
+    // attributes (including exec permission).
 }
 
 inline void reset_lazy_mmap_page_tables(Machine& m) {
@@ -376,23 +383,30 @@ inline void install_live_mmap_page_fault_handler(Machine& m) {
     g_prev_page_fault_handler = m.memory.set_page_fault_handler(
         [] (auto& mem, const auto pageno, bool init) -> riscv::Page& {
             const uint64_t addr = uint64_t(pageno) * riscv::Page::size();
-            if (g_lazy_mmap_page_tables_enabled
-                && mem.uses_flat_memory_arena()
-                && addr >= mem.mmap_start()
-                && addr < mem.memory_arena_size()) {
+            if (g_lazy_mmap_page_tables_enabled && addr >= mem.mmap_start()) {
                 const auto* region = live_mmap_find(addr);
-                if (region == nullptr || !region->lazy || !region->anonymous) {
-                    return g_prev_page_fault_handler(mem, pageno, init);
+                if (region != nullptr && region->lazy && region->anonymous) {
+                    if (mem.uses_flat_memory_arena()
+                        && addr < mem.memory_arena_size()) {
+                        auto* arena = static_cast<riscv::PageData*>(mem.memory_arena_ptr());
+                        if (arena != nullptr) {
+                            // Arena mode: materialize page backed by existing arena data.
+                            // Lazy anonymous mappings are already zero-filled when mapped.
+                            // At first touch the arena may now contain live stack / heap
+                            // data from direct arena writes, so materializing the page must
+                            // preserve the existing bytes instead of blanking the whole page.
+                            return mem.allocate_page(pageno, region->attr, &arena[pageno]);
+                        }
+                    }
+                    // Page-backed (non-arena) mode: create a new zeroed page with
+                    // the region's attributes (including exec). Without this,
+                    // lazy mmap pages are never materialized and execution faults
+                    // with "Execution space protection fault" because get_exec_pageno
+                    // can't find the page in m_pages.
+                    auto& page = g_prev_page_fault_handler(mem, pageno, init);
+                    page.attr.apply_regular_attributes(region->attr);
+                    return page;
                 }
-                auto* arena = static_cast<riscv::PageData*>(mem.memory_arena_ptr());
-                if (arena == nullptr) {
-                    return g_prev_page_fault_handler(mem, pageno, init);
-                }
-                // Lazy anonymous mappings are already zero-filled when mapped.
-                // At first touch the arena may now contain live stack / heap
-                // data from direct arena writes, so materializing the page must
-                // preserve the existing bytes instead of blanking the whole page.
-                return mem.allocate_page(pageno, region->attr, &arena[pageno]);
             }
             return g_prev_page_fault_handler(mem, pageno, init);
         });
@@ -407,11 +421,15 @@ inline void set_materialized_page_attrs_for_range(
     const uint64_t last = (addr + size - 1) >> 12;
     for (auto& [pageno, page] : m.memory.pages()) {
         if (pageno < first || pageno > last) continue;
+        const bool old_exec = page.attr.exec;
         const bool is_cow = page.attr.is_cow;
         page.attr.apply_regular_attributes(attr);
         if (is_cow || (attr.write && page.is_cow_page())) {
             page.attr.is_cow = true;
             page.attr.write = false;
+        }
+        if (old_exec != page.attr.exec) {
+            m.memory.mark_execute_segments_stale(pageno * 4096ULL, 4096);
         }
         m.memory.invalidate_cache(pageno, &page);
     }

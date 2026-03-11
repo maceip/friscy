@@ -5511,6 +5511,8 @@ static void sys_dup3(Machine& m) {
     int oldfd = m.template sysarg<int>(0);
     int newfd = m.template sysarg<int>(1);
     int flags = m.template sysarg<int>(2);
+    constexpr int kFSetFd = 2;
+    constexpr int kFdCloexec = 1;
     if (oldfd == newfd) {
         m.set_result(err::INVAL);
         return;
@@ -5557,10 +5559,10 @@ static void sys_dup3(Machine& m) {
                 return;
             }
             if (flags & O_CLOEXEC) {
-                ::fcntl(dupfd, F_SETFD, FD_CLOEXEC);
+                ::fcntl(dupfd, kFSetFd, kFdCloexec);
             }
             m.fds().translation[newfd] = dupfd;
-            g_fd_cloexec_flags[newfd] = (flags & O_CLOEXEC) ? 1 : 0;
+            g_fd_cloexec_flags[newfd] = (flags & O_CLOEXEC) ? kFdCloexec : 0;
             g_fd_status_flags.erase(newfd);
             m.set_result(newfd);
             return;

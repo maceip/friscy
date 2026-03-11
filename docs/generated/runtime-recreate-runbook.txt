@@ -1,0 +1,243 @@
+RUNTIME FILE INVENTORY
+
+git ls-files AGENTS.md ARCHITECTURE.md package.json docs/RUNNING.md docs/RUN-JOURNAL.md
+git ls-files runtime
+git ls-files vendor/libriscv/lib
+git ls-files friscy-bundle
+git ls-files docs_site
+git ls-files demos/medium
+git ls-files tools | rg 'Dockerfile|friscy-pack|container_to_riscv|setup_native_harness|build_and_test|runtime_compat_sweep|export-checkpoint-browser|test-claude-browser|codex_quick_debug|codex_resume_probe|node_.*checkpoint_chain|claude_tui_gate|tier2-haiku-limerick-browser'
+git ls-files tests | rg 'build_nodejs_claude_rootfs|test_llrt_hostfetch|test_vh_shims|test_phase1_nodejs|test_phase1_nodejs2|test_phase1_nodejs3|test_browser_shell|verify_boot|test_demos|webshell|smoke_phase|bench_browser|test_llrt_fetch'
+
+BOOTSTRAP
+
+git clone https://github.com/maceip/friscy.git
+cd friscy
+bash tools/setup_native_harness.sh
+
+NATIVE BUILD
+
+mkdir -p build-native
+cd build-native
+cmake ../runtime
+make -j"$(nproc)"
+cd ..
+
+WASM BUILD
+
+mkdir -p build-wasm
+docker run --rm -v "$PWD":/src emscripten/emsdk:latest bash -lc 'cd /src && cd build-wasm && emcmake cmake ../runtime && emmake make -j$(nproc)'
+cp build-wasm/friscy.js friscy-bundle/friscy.js
+cp build-wasm/friscy.wasm friscy-bundle/friscy.wasm
+
+AOT AND JIT BUILD
+
+export PATH="$HOME/.cargo/bin:$PATH"
+cd aot && cargo build --release && cd ..
+cd aot-jit && wasm-pack build --target web && cd ..
+
+ROOTFS BUILD
+
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.optimized-alpine -t friscy-alpine . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.claude -t friscy-claude . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.gemini -t friscy-gemini . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.codex -t friscy-codex . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.llrt -t friscy-llrt . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.llrt-debian -t friscy-llrt-debian . --load
+
+ROOTFS TO TARS / BUNDLE ASSETS
+
+bash tools/container_to_riscv.sh friscy-alpine
+bash tools/container_to_riscv.sh friscy-claude
+bash tools/container_to_riscv.sh friscy-gemini
+bash tools/container_to_riscv.sh friscy-codex
+bash tools/container_to_riscv.sh friscy-llrt
+bash tests/build_nodejs_claude_rootfs.sh
+bash tools/friscy-pack
+
+BROWSER SERVERS
+
+cd friscy-bundle && node serve.js 9097
+cd docs_site && node serve.js 9098
+cd demos/medium && node serve.js 8094
+
+BROWSER DEMOS
+
+http://127.0.0.1:9097/index.html?example=alpine&nosw=1
+http://127.0.0.1:9097/index.html?example=nodejs&nosw=1
+http://127.0.0.1:9097/index.html?example=server&nosw=1
+http://127.0.0.1:9097/claude-demo.html?example=claude-demo&nosw=1
+http://127.0.0.1:9097/claude-demo.html?example=codex&nosw=1&noautockpt=1
+http://127.0.0.1:9098/index.html?example=nodejs&nosw=1
+http://127.0.0.1:8094/index.html?example=claude-llrt
+
+NATIVE BASIC RUNS
+
+timeout 120 ./build-native/friscy --rootfs ./codex.tar /bin/bash -lc 'echo pre; /bin/node -e "console.log(\"node-ok\")"; echo post'
+timeout 120 ./build-native/friscy --rootfs ./codex.tar /bin/bash -lc 'cat > /tmp/basic.js <<'"'"'EOF'"'"'
+const nums = [1, 2, 3, 4];
+const sum = nums.reduce((a, b) => a + b, 0);
+console.log(`sum=${sum}`);
+if (sum !== 10) process.exit(1);
+EOF
+exec /bin/node /tmp/basic.js'
+timeout 120 ./build-native/friscy --rootfs ./codex.tar /bin/bash -lc 'cat > /tmp/fetch-aol.js <<'"'"'EOF'"'"'
+const url = "https://www.aol.com";
+const res = await fetch(url, { redirect: "follow" });
+console.log(`status=${res.status}`);
+const text = await res.text();
+console.log(`bytes=${text.length}`);
+console.log(text.slice(0, 80).replace(/\s+/g, " "));
+EOF
+exec /bin/node /tmp/fetch-aol.js'
+
+DIFFERENTIAL TRACE
+
+python3 tools/differential-syscall-trace.py \
+  --diff-tag repro-node-mmap \
+  --friscy-rootfs /home/devuser/friscy/friscy-bundle/rootfs.tar \
+  --qemu-rootfs /tmp/friscy-full-rootfs \
+  --guest-cmd "/bin/bash -lc 'echo pre; /bin/node -e \"console.log(\\\"node-ok\\\")\"; echo post'" \
+  --node-path auto \
+  --focused-diff \
+  --divergence-window 12 \
+  --max-divergences 20 \
+  --friscy-bin /home/devuser/friscy/build-native/friscy \
+  --qemu-bin /usr/bin/qemu-riscv64-static \
+  --friscy-log /home/devuser/friscy/repro-node-mmap.friscy.log \
+  --qemu-log /home/devuser/friscy/repro-node-mmap.qemu.log \
+  --symbol-root /tmp/friscy-full-rootfs \
+  --timeout 120
+
+BROWSER TEST COMMANDS
+
+node tests/verify_boot.js
+node tests/test_demos.cjs
+node tests/test_llrt_hostfetch.cjs
+node tests/test_browser_shell.mjs 9876
+node tools/codex_quick_debug.cjs
+node tools/codex_resume_probe.cjs 9096 codex-version-post.ckpt
+node tools/export-checkpoint-browser.mjs
+node tools/tier2-haiku-limerick-browser.mjs
+node tools/node_codex_checkpoint_chain.mjs
+node tools/node_gemini_checkpoint_chain.mjs
+
+RECENT COMMANDS USED IN THIS DEBUG SESSION
+
+node serve.js 9097
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer');
+const chrome = '/home/devuser/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome';
+const cmd = `/usr/bin/node -e '(async()=>{const res=await fetch("http://www.aol.com",{redirect:"follow"}); console.log("status="+res.status); const text=await res.text(); console.log("bytes="+text.length); console.log(text.slice(0,120).replace(/\s+/g," ")); })().catch(e=>{console.error("ERR="+(e&&e.stack||e)); process.exit(1);})'`;
+const url = 'http://127.0.0.1:9097/index.html?example=nodejs&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=' + Date.now();
+EOF
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer');
+const chrome = '/home/devuser/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome';
+const cmd = `/usr/bin/node -e '(async()=>{const res=await fetch("http://www.aol.com",{redirect:"follow"}); console.log("status="+res.status); const text=await res.text(); console.log("bytes="+text.length); console.log(text.slice(0,120).replace(/\s+/g," ")); })().catch(e=>{console.error("ERR="+(e&&e.stack||e)); process.exit(1);})'`;
+const url = 'http://127.0.0.1:9097/index.html?example=claude-nosnapshot&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=' + Date.now();
+EOF
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer');
+const chrome = '/home/devuser/.cache/puppeteer/chrome-headless-shell/linux-146.0.7680.31/chrome-headless-shell-linux64/chrome-headless-shell';
+const cmd = `/usr/bin/node -e '(async()=>{const res=await fetch("http://httpbin.org/get",{redirect:"follow"}); console.log("status="+res.status); const text=await res.text(); console.log("bytes="+text.length); console.log(text.slice(0,120).replace(/\s+/g," ")); })().catch(e=>{console.error("ERR="+(e&&e.stack||e)); console.error("CAUSE="+(e&&e.cause&&e.cause.stack||e&&e.cause||"")); process.exit(1);})'`;
+const url = 'http://127.0.0.1:9097/index.html?example=claude-nosnapshot&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=' + Date.now();
+EOF
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer');
+const chrome = '/home/devuser/.cache/puppeteer/chrome-headless-shell/linux-146.0.7680.31/chrome-headless-shell-linux64/chrome-headless-shell';
+const guest = `const http=require('http');const body=JSON.stringify({url:'http://www.aol.com',options:{method:'GET'}});const req=http.request({host:'127.0.0.1',port:9097,path:'/__host_fetch',method:'POST',headers:{'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{let buf='';res.on('data',c=>buf+=c);res.on('end',()=>{try{const data=JSON.parse(buf);console.log('status='+data.status);console.log('bytes='+((data.body||'').length));console.log(String(data.body||'').slice(0,120).replace(/\\s+/g,' '));}catch(e){console.error('ERR='+e.stack);process.exit(1);}})});req.on('error',e=>{console.error('ERR='+(e&&e.stack||e));process.exit(1);});req.write(body);req.end();`;
+const cmd = `/usr/bin/node -e ${JSON.stringify(guest)}`;
+const url = 'http://127.0.0.1:9097/index.html?example=claude-nosnapshot&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=' + Date.now();
+EOF
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer');
+const chrome = '/home/devuser/.cache/puppeteer/chrome-headless-shell/linux-146.0.7680.31/chrome-headless-shell-linux64/chrome-headless-shell';
+const guest = `const net=require('net');const payload=JSON.stringify({url:'http://www.aol.com',options:{method:'GET'}});const req='POST /__host_fetch HTTP/1.1\\r\\nHost: 127.0.0.1:9097\\r\\nContent-Type: application/json\\r\\nContent-Length: '+Buffer.byteLength(payload)+'\\r\\nConnection: close\\r\\n\\r\\n'+payload;const sock=net.createConnection({host:'127.0.0.1',port:9097});let buf=Buffer.alloc(0),done=false;function finish(){if(done) return; const s=buf.toString('utf8'); const idx=s.indexOf('\\r\\n\\r\\n'); if(idx<0) return; const head=s.slice(0,idx); const m=head.match(/content-length:\\s*(\\d+)/i); if(!m) return; const len=+m[1]; const body=buf.slice(idx+4); if(body.length<len) return; done=true; try{const data=JSON.parse(body.slice(0,len).toString('utf8')); console.log('status='+data.status); console.log('bytes='+((data.body||'').length)); console.log(String(data.body||'').slice(0,120).replace(/\\s+/g,' ')); process.exit(0);}catch(e){console.error('ERR='+e.stack);process.exit(1);}}sock.on('connect',()=>sock.write(req));sock.on('data',c=>{buf=Buffer.concat([buf,c]);finish();});sock.on('error',e=>{console.error('ERR='+(e&&e.stack||e));process.exit(1);});setTimeout(()=>{console.error('ERR=timeout');process.exit(1);},30000);`;
+const cmd = `/usr/bin/node -e ${JSON.stringify(guest)}`;
+const url = 'http://127.0.0.1:9097/index.html?example=claude-nosnapshot&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=' + Date.now();
+EOF
+docker run --rm -v "$PWD":/src emscripten/emsdk:latest bash -lc 'cd /src && cd build-wasm && emcmake cmake ../runtime && emmake make -j$(nproc)'
+docker run --rm -v "$PWD":/src emscripten/emsdk:latest bash -lc 'cd /src/build-wasm && emmake make -j$(nproc)'
+cp build-wasm/friscy.js friscy-bundle/friscy.js
+cp build-wasm/friscy.wasm friscy-bundle/friscy.wasm
+node serve.js 9098
+NODE_PATH=/home/devuser/projects/friscy-standalone/node_modules node - <<'EOF'
+const puppeteer = require('puppeteer');
+const chrome = '/home/devuser/.cache/puppeteer/chrome-headless-shell/linux-146.0.7680.31/chrome-headless-shell-linux64/chrome-headless-shell';
+const cmd = `/usr/bin/node -e 'console.log("node-ok")'`;
+const url = 'http://127.0.0.1:9098/index.html?example=nodejs&nosw=1&cmd=' + encodeURIComponent(cmd) + '&cb=' + Date.now();
+EOF
+ps -ef | rg 'chrome-linux64/chrome|chromium'
+ulimit -n
+find $HOME -maxdepth 6 \( -path '*/chrome-linux64/chrome' -o -path '*/chrome-headless-shell-linux64/chrome-headless-shell' -o -path '*/chromium/chrome-linux/chrome' \) 2>/dev/null | head -20
+python3 - <<'PY'
+import tarfile
+for path in ['friscy-bundle/nodejs.tar','friscy-bundle/claude-slim.tar','friscy-bundle/claude-slim-snap.tar']:
+    with tarfile.open(path) as tf:
+        names=set(m.name.lstrip('./') for m in tf.getmembers())
+        print(path, 'sh=', 'bin/sh' in names, 'bash=', 'bin/bash' in names, 'node=', ('usr/bin/node' in names or 'bin/node' in names))
+PY
+git status --short runtime/syscalls.hpp runtime/main.cpp runtime/network.hpp friscy-bundle/worker.js vendor/libriscv/lib/libriscv/memory.cpp
+
+FILES CHANGED IN THIS DEBUG SESSION
+
+runtime/syscalls.hpp
+runtime/main.cpp
+runtime/network.hpp
+friscy-bundle/worker.js
+vendor/libriscv/lib/libriscv/memory.cpp
+
+YOUR TASK:
+
+Goal:
+Get browser friscy to run Node-based Claude Code / claude.js on the fast path, not just native friscy.
+
+Current known-good:
+- Native friscy runs bash and Node.
+- Native friscy runs inline Node and file-based JS.
+- Browser worker host-fetch plumbing exists.
+- LLRT browser path has explicit __host_fetch override support.
+
+Current browser gap:
+- Plain browser Node is still not reliably on the host-fetch path.
+- Browser synthetic socket path needed EOF vs EAGAIN separation and DNS timing fixes.
+- After rebuilding wasm with those source fixes, current browser Node regressed to std::bad_alloc even for simple node -e.
+- That means there are now two separate browser blockers:
+  1. browser Node startup / allocation regression in fresh wasm build
+  2. plain browser Node fetch path still not wired to the clean host-fetch override used by LLRT
+
+Fastest path to Claude Code in browser:
+1. Restore browser Node baseline first.
+   - Use the last-known-good browser wasm/bundle that can run node -e "console.log('node-ok')".
+   - Do not continue fetch/debug work on a browser wasm that fails simple Node startup.
+2. Put plain browser Node on explicit host-fetch.
+   - Reuse the LLRT pattern from runtime/claude-repl-llrt.js.
+   - Add a Node preload shim loaded by NODE_OPTIONS that overrides globalThis.fetch to call the existing host-fetch bridge directly.
+   - Prefer this over relying on undici + synthetic TCP/DNS.
+3. Verify smallest browser cases in order.
+   - node -e "console.log('node-ok')"
+   - node -e "await fetch('http://127.0.0.1:PORT/__host_fetch-proxy-test')"
+   - node -e "await fetch('http://www.aol.com')"
+   - claude-fast.js
+   - claude-repl.js / Claude Code browser entrypoint
+4. Only after fetch works on explicit host-fetch, return to raw browser socket correctness.
+   - Raw DNS/TCP correctness is lower priority than getting Claude Code functional.
+
+Files to focus on for that task:
+- runtime/main.cpp
+- runtime/syscalls.hpp
+- runtime/network.hpp
+- runtime/claude-repl-llrt.js
+- friscy-bundle/worker.js
+- friscy-bundle/app.ts
+- friscy-bundle/manifest.json
+- docs_site/worker.js
+- docs_site/app.js
+
+Immediate next commands:
+- git checkout -- friscy-bundle/friscy.js friscy-bundle/friscy.wasm
+- node friscy-bundle/serve.js 9097
+- verify browser node baseline with node -e console.log
+- add preload-based fetch override for plain Node
+- rerun browser node fetch to aol

@@ -1,0 +1,271 @@
+RUNTIME FILE INVENTORY
+
+This handoff is based on merged upstream state:
+- master @ 334e41b3
+- merged commits:
+  - 6b9b6c69 fix(runtime): preserve guest argv and harden VFS-backed syscalls
+  - 6d75e9bf fix(test-node): preserve guest argv ordering
+  - 334e41b3 fix(runtime): build dup3 cloexec path on origin/master
+
+Important scope note:
+- The merged runtime delta on master is only:
+  - runtime/main.cpp
+  - runtime/syscalls.hpp
+  - tests/test_node.js
+- Wider browser/allocator experiments mentioned below remain useful investigation context, but should not be assumed to be merged unless independently verified in git history.
+
+Repo inventory commands that still match current tree:
+
+git ls-files AGENTS.md ARCHITECTURE.md package.json docs/RUNNING.md docs/RUN-JOURNAL.md
+git ls-files runtime
+git ls-files vendor/libriscv/lib
+git ls-files friscy-bundle
+git ls-files docs_site
+git ls-files demos/medium
+git ls-files tools | rg 'Dockerfile|friscy-pack|container_to_riscv|setup_native_harness|build_and_test|runtime_compat_sweep|export-checkpoint-browser|test-claude-browser|codex_quick_debug|codex_resume_probe|node_.*checkpoint_chain|claude_tui_gate|tier2-haiku-limerick-browser'
+git ls-files tests | rg 'build_nodejs_claude_rootfs|test_llrt_hostfetch|test_vh_shims|test_phase1_nodejs|test_phase1_nodejs2|test_phase1_nodejs3|test_browser_shell|verify_boot|test_demos|webshell|smoke_phase|bench_browser|test_llrt_fetch'
+
+Notable inventory updates versus older notes:
+- tools/Dockerfile.llrt-debian is gone
+- tools/Dockerfile.nodejs exists
+- tests/test_llrt_fetch.js exists
+- friscy-bundle/app.js and friscy-bundle/app.ts both exist
+
+BOOTSTRAP
+
+git clone https://github.com/maceip/friscy.git
+cd friscy
+git lfs pull
+bash tools/setup_native_harness.sh
+
+Why git lfs pull matters:
+- Several bundled tar assets may check out as tiny pointer files if LFS content is not materialized.
+- Before assuming a tarball is usable, verify it is not just ~130 bytes.
+
+Quick asset sanity checks:
+
+ls -lh docs_site/codex.tar docs_site/rootfs.tar friscy-bundle/nodejs.tar friscy-bundle/claude-slim.tar
+file docs_site/codex.tar docs_site/rootfs.tar friscy-bundle/nodejs.tar friscy-bundle/claude-slim.tar
+
+NATIVE BUILD
+
+mkdir -p build-native
+cd build-native
+cmake ../runtime
+make -j"$(nproc)"
+cd ..
+
+WASM BUILD
+
+mkdir -p build-wasm
+docker run --rm -v "$PWD":/src emscripten/emsdk:latest bash -lc 'cd /src && cd build-wasm && emcmake cmake ../runtime && emmake make -j$(nproc)'
+cp build-wasm/friscy.js friscy-bundle/friscy.js
+cp build-wasm/friscy.wasm friscy-bundle/friscy.wasm
+
+AOT AND JIT BUILD
+
+export PATH="$HOME/.cargo/bin:$PATH"
+cd aot && cargo build --release && cd ..
+cd aot-jit && wasm-pack build --target web && cd ..
+
+ROOTFS BUILD
+
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.optimized-alpine -t friscy-alpine . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.claude -t friscy-claude . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.gemini -t friscy-gemini . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.codex -t friscy-codex . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.llrt -t friscy-llrt . --load
+docker buildx build --platform linux/riscv64 -f tools/Dockerfile.nodejs -t friscy-nodejs . --load
+
+ROOTFS TO TARS / BUNDLE ASSETS
+
+bash tools/container_to_riscv.sh friscy-alpine
+bash tools/container_to_riscv.sh friscy-claude
+bash tools/container_to_riscv.sh friscy-gemini
+bash tools/container_to_riscv.sh friscy-codex
+bash tools/container_to_riscv.sh friscy-llrt
+bash tools/container_to_riscv.sh friscy-nodejs
+bash tests/build_nodejs_claude_rootfs.sh
+bash tools/friscy-pack
+
+BROWSER SERVERS
+
+node friscy-bundle/serve.js 9097
+node docs_site/serve.js 9098
+node demos/medium/serve.js 8094
+
+BROWSER DEMOS
+
+http://127.0.0.1:9097/index.html?example=alpine&nosw=1
+http://127.0.0.1:9097/index.html?example=nodejs&nosw=1
+http://127.0.0.1:9097/index.html?example=server&nosw=1
+http://127.0.0.1:9097/claude-demo.html?example=claude-demo&nosw=1
+http://127.0.0.1:9097/claude-demo.html?example=codex&nosw=1&noautockpt=1
+http://127.0.0.1:9098/index.html?example=nodejs&nosw=1
+http://127.0.0.1:8094/index.html?example=claude-llrt
+
+NATIVE BASIC RUNS
+
+Use a real materialized rootfs tar, not an LFS pointer. Examples:
+- ./codex.tar if you have one locally materialized
+- ./docs_site/rootfs.tar after a successful build/pack
+- ./friscy-bundle/nodejs.tar for node-specific testing if materialized
+
+Example commands:
+
+timeout 120 ./build-native/friscy --rootfs ./codex.tar /bin/bash -lc 'echo pre; /bin/node -e "console.log(\"node-ok\")"; echo post'
+timeout 120 ./build-native/friscy --rootfs ./codex.tar /bin/bash -lc 'cat > /tmp/basic.js <<'"'"'EOF'"'"'
+const nums = [1, 2, 3, 4];
+const sum = nums.reduce((a, b) => a + b, 0);
+console.log(`sum=${sum}`);
+if (sum !== 10) process.exit(1);
+EOF
+exec /bin/node /tmp/basic.js'
+timeout 120 ./build-native/friscy --rootfs ./codex.tar /bin/bash -lc 'cat > /tmp/fetch-aol.js <<'"'"'EOF'"'"'
+const url = "https://www.aol.com";
+const res = await fetch(url, { redirect: "follow" });
+console.log(`status=${res.status}`);
+const text = await res.text();
+console.log(`bytes=${text.length}`);
+console.log(text.slice(0, 80).replace(/\s+/g, " "));
+EOF
+exec /bin/node /tmp/fetch-aol.js'
+
+If ./codex.tar is absent on your machine, substitute the actual local tar path.
+
+DIFFERENTIAL TRACE
+
+Use a real rootfs tar and a real unpacked qemu rootfs. Do not assume friscy-bundle/rootfs.tar or docs_site/rootfs.tar are materialized unless you verified them.
+
+Example template:
+
+python3 tools/differential-syscall-trace.py \
+  --diff-tag repro-node-mmap \
+  --friscy-rootfs /absolute/path/to/materialized/rootfs.tar \
+  --qemu-rootfs /tmp/friscy-full-rootfs \
+  --guest-cmd "/bin/bash -lc 'echo pre; /bin/node -e \"console.log(\\\"node-ok\\\")\"; echo post'" \
+  --node-path auto \
+  --focused-diff \
+  --divergence-window 12 \
+  --max-divergences 20 \
+  --friscy-bin /absolute/path/to/build-native/friscy \
+  --qemu-bin /usr/bin/qemu-riscv64-static \
+  --friscy-log /absolute/path/to/repro-node-mmap.friscy.log \
+  --qemu-log /absolute/path/to/repro-node-mmap.qemu.log \
+  --symbol-root /tmp/friscy-full-rootfs \
+  --timeout 120
+
+BROWSER TEST COMMANDS
+
+node tests/verify_boot.js
+node tests/test_demos.cjs
+node tests/test_llrt_hostfetch.cjs
+node tests/test_llrt_fetch.js
+node tests/test_browser_shell.mjs 9876
+node tools/codex_quick_debug.cjs
+node tools/codex_resume_probe.cjs 9096 codex-version-post.ckpt
+node tools/export-checkpoint-browser.mjs
+node tools/tier2-haiku-limerick-browser.mjs
+node tools/node_codex_checkpoint_chain.mjs
+node tools/node_gemini_checkpoint_chain.mjs
+
+CURRENT VERIFIED MASTER BASELINE
+
+Verified merged fixes on master:
+- runtime/main.cpp
+  - guest argv parsing no longer drops/duplicates entry-path handling
+  - argv[0] is normalized correctly for guest processes
+- runtime/syscalls.hpp
+  - VFS-backed and host-backed fd behavior is hardened for close/fcntl/dup/dup3
+  - current origin/master mmap/process-model path was preserved during merge
+- tests/test_node.js
+  - guest argv ordering fix is merged
+
+What should be treated as merged fact:
+- native argv handling fixes are in master
+- fd syscall hardening is in master
+
+What should NOT be treated as merged fact without checking history:
+- browser allocator experiments
+- worker.js recovery experiments
+- vendor/libriscv memory-path edits
+- runtime/network.hpp changes
+- tools/differential-syscall-trace.py local debugging tweaks beyond what is already in master
+
+CURRENT BROWSER TASK STATUS
+
+Still relevant as investigation direction:
+- Goal remains: get browser friscy to run Node-based Claude Code / claude.js on the fast path, not just native friscy
+- Native friscy is the reference behavior
+- Browser worker / wasm memory behavior is still a likely bottleneck area
+- Plain browser Node should eventually be moved onto an explicit host-fetch override path, similar in spirit to the LLRT path
+
+But treat the following as hypotheses from the prior debug session, not guaranteed current truth:
+- exact browser failure shape around std::bad_alloc then repeated MachineException Out of memory
+- the claim that browser Node reaches exec and then fails only in wasm allocator state
+- any assumption that worker.js or vendor/libriscv memory changes are already present on master
+
+FILES TO FOCUS ON FOR THE NEXT BROWSER PASS
+
+These files still exist and are the right search area for the browser task:
+- runtime/main.cpp
+- runtime/syscalls.hpp
+- runtime/network.hpp
+- runtime/CMakeLists.txt
+- runtime/claude-repl-llrt.js
+- friscy-bundle/worker.js
+- friscy-bundle/app.ts
+- friscy-bundle/manifest.json
+- docs_site/worker.js
+- docs_site/app.js
+- vendor/libriscv/lib/libriscv/memory.cpp
+- vendor/libriscv/lib/libriscv/memory.hpp
+
+IMMEDIATE NEXT COMMANDS
+
+sed -n '1,260p' runtime/CMakeLists.txt
+sed -n '1,260p' vendor/libriscv/lib/libriscv/memory.cpp
+sed -n '1,220p' vendor/libriscv/lib/libriscv/memory.hpp
+node friscy-bundle/serve.js 9097
+
+Then verify in this order:
+- browser node -e "console.log('node-ok')"
+- browser /bin/bash -lc 'echo pre; /usr/bin/node -e "console.log(\"node-ok\")"; echo post'
+- browser node fetch to local host-fetch test endpoint
+- browser node fetch to http://www.aol.com
+- claude-fast.js
+- claude-repl.js / Claude Code browser entrypoint
+
+If browser wasm memory still looks like the primary issue:
+- inspect allocator / arena sizing in runtime/CMakeLists.txt plus vendor/libriscv/lib/libriscv/memory.cpp and memory.hpp
+- rebuild wasm
+- copy build-wasm/friscy.js and build-wasm/friscy.wasm into friscy-bundle
+
+RECENT COMMANDS FROM THE PRIOR DEBUG SESSION
+
+These are historical context only. They are not part of the merged baseline:
+- Puppeteer-driven browser node/claude-nosnapshot runs
+- manual host_fetch net/http probes
+- wasm rebuild/copy loops
+- assorted chrome process discovery and tar inspection commands
+
+FILES CHANGED IN THE MERGED MASTER STATE FOR THIS HANDOFF
+
+runtime/main.cpp
+runtime/syscalls.hpp
+tests/test_node.js
+
+FILES THAT WERE TOUCHED DURING INVESTIGATION BUT ARE NOT PART OF THE MERGED HANDOFF UNLESS YOU SEE THEM IN GIT HISTORY
+
+runtime/network.hpp
+friscy-bundle/worker.js
+vendor/libriscv/lib/libriscv/memory.cpp
+runtime/CMakeLists.txt
+vendor/libriscv/lib/libriscv/bytecode_impl.cpp
+vendor/libriscv/lib/libriscv/cpu.cpp
+vendor/libriscv/lib/libriscv/cpu_dispatch.cpp
+vendor/libriscv/lib/libriscv/machine_inline.hpp
+vendor/libriscv/lib/libriscv/memory.hpp
+vendor/libriscv/lib/libriscv/memory_rw.cpp
+vendor/libriscv/lib/libriscv/tailcall_dispatch.cpp
+tools/differential-syscall-trace.py

@@ -1,0 +1,85 @@
+FRISCY QUICK HANDOFF
+
+Current upstream state:
+- master @ 334e41b3
+
+Merged in master:
+- runtime/main.cpp
+- runtime/syscalls.hpp
+- tests/test_node.js
+
+What landed:
+- guest argv parsing / argv[0] handling fix
+- hardened VFS + host-fd behavior for close/fcntl/dup/dup3
+- test_node guest argv ordering fix
+
+What did NOT land as part of this merge:
+- browser allocator experiments
+- worker.js browser recovery experiments
+- vendor/libriscv memory-path edits
+- runtime/network.hpp changes
+
+First setup steps:
+
+git clone https://github.com/maceip/friscy.git
+cd friscy
+git lfs pull
+bash tools/setup_native_harness.sh
+
+Important:
+- Do not assume bundled tarballs are materialized.
+- Verify tar assets are not tiny LFS pointer files before using them.
+
+Useful checks:
+
+ls -lh docs_site/codex.tar docs_site/rootfs.tar friscy-bundle/nodejs.tar friscy-bundle/claude-slim.tar
+file docs_site/codex.tar docs_site/rootfs.tar friscy-bundle/nodejs.tar friscy-bundle/claude-slim.tar
+
+Native build:
+
+mkdir -p build-native
+cd build-native
+cmake ../runtime
+make -j"$(nproc)"
+cd ..
+
+Wasm build:
+
+mkdir -p build-wasm
+docker run --rm -v "$PWD":/src emscripten/emsdk:latest bash -lc 'cd /src && cd build-wasm && emcmake cmake ../runtime && emmake make -j$(nproc)'
+cp build-wasm/friscy.js friscy-bundle/friscy.js
+cp build-wasm/friscy.wasm friscy-bundle/friscy.wasm
+
+Browser servers:
+
+node friscy-bundle/serve.js 9097
+node docs_site/serve.js 9098
+node demos/medium/serve.js 8094
+
+Current browser task direction:
+- Native friscy is the reference behavior.
+- Browser Node / Claude fast-path work is still open.
+- Start with wasm allocator / arena sizing review:
+  - runtime/CMakeLists.txt
+  - vendor/libriscv/lib/libriscv/memory.cpp
+  - vendor/libriscv/lib/libriscv/memory.hpp
+- Then verify:
+  - browser node -e "console.log('node-ok')"
+  - browser bash -> node -> post
+  - browser fetch via explicit host-fetch path
+
+Files to inspect next:
+- runtime/main.cpp
+- runtime/syscalls.hpp
+- runtime/network.hpp
+- runtime/CMakeLists.txt
+- runtime/claude-repl-llrt.js
+- friscy-bundle/worker.js
+- friscy-bundle/app.ts
+- docs_site/worker.js
+- docs_site/app.js
+- vendor/libriscv/lib/libriscv/memory.cpp
+- vendor/libriscv/lib/libriscv/memory.hpp
+
+If you need the full version:
+- /home/devuser/handoff.got.txt

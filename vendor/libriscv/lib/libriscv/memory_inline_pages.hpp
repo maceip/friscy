@@ -45,7 +45,13 @@ inline const Page& Memory<W>::get_exec_pageno(const address_t pageno) const
 	if (LIKELY(it != m_pages.end())) {
 		return it->second;
 	}
-	CPU<W>::trigger_exception(EXECUTION_SPACE_PROTECTION_FAULT, pageno * Page::size());
+	// Fall through to the page read handler instead of throwing immediately.
+	// In page-backed (non-arena) mode with lazy mmap, pages may not yet be
+	// materialized in m_pages. The read handler will create the page via the
+	// page fault handler, and callers check page.attr.exec afterward.
+	// This also prevents uncatchable exceptions during WASM tail-call dispatch
+	// where C++ try/catch cannot intercept throws from tail-called handlers.
+	return m_page_readf_handler(*this, pageno);
 }
 
 template <int W>

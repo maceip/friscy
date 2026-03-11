@@ -1,4 +1,4 @@
-const CACHE_NAME = 'friscy-cache-v31';
+const CACHE_NAME = 'friscy-cache-v32';
 const CACHE_ASSETS = [
   './',
   './index.html',

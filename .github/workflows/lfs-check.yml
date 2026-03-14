@@ -5,11 +5,13 @@ on:
     paths:
       - friscy-bundle/**
       - .gitattributes
+      - .github/workflows/lfs-check.yml
   push:
     branches: [master]
     paths:
       - friscy-bundle/**
       - .gitattributes
+      - .github/workflows/lfs-check.yml
 
 jobs:
   lfs-check:
@@ -17,7 +19,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: true
+          lfs: false
+
+      - name: Fetch LFS objects
+        continue-on-error: true
+        id: lfs-pull
+        run: git lfs pull
+
+      - name: Report LFS fetch status
+        if: steps.lfs-pull.outcome == 'failure'
+        run: |
+          echo "::warning::git lfs pull failed — this may be a bandwidth/quota issue."
+          echo "Will still check for pointer stubs (they indicate a problem either way)."
 
       - name: Verify no LFS pointer stubs in friscy-bundle
         run: |

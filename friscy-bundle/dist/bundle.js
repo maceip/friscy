@@ -14844,6 +14844,25 @@ void main() {
     } else {
       rootfs = await fetchWithProgress(rootfsUrl);
     }
+    const MIN_ROOTFS_BYTES = 1024 * 1024;
+    if (rootfs.byteLength < MIN_ROOTFS_BYTES) {
+      const hint = new TextDecoder().decode(new Uint8Array(rootfs, 0, Math.min(rootfs.byteLength, 80)));
+      const isLfsPointer = hint.startsWith("version https://git-lfs");
+      console.error(`[friscy] rootfs too small (${rootfs.byteLength} bytes). LFS pointer: ${isLfsPointer}. Content: ${hint}`);
+      if ("caches" in window) {
+        const names = await caches.keys();
+        await Promise.all(names.map((n) => caches.delete(n)));
+        console.log("[friscy] Purged all SW caches, reloading...");
+      }
+      if (navigator.serviceWorker) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+        console.log("[friscy] Unregistered service workers");
+      }
+      setProgress(0, "Cache corrupted \u2014 reloading...", "Stale cached data detected. Reloading with fresh files...");
+      setTimeout(() => window.location.reload(), 1500);
+      return;
+    }
     let checkpointData = null;
     const checkpointUrl = exampleCfg.checkpoint;
     if (checkpointUrl) {

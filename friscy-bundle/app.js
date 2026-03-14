@@ -1043,6 +1043,29 @@ async function main() {
         rootfs = await fetchWithProgress(rootfsUrl);
     }
 
+    // Guard: detect corrupted/stub rootfs (e.g. cached Git LFS pointers).
+    // Real rootfs tarballs are at least 1 MB; LFS pointers are ~130 bytes.
+    const MIN_ROOTFS_BYTES = 1024 * 1024; // 1 MB
+    if (rootfs.byteLength < MIN_ROOTFS_BYTES) {
+        const hint = new TextDecoder().decode(new Uint8Array(rootfs, 0, Math.min(rootfs.byteLength, 80)));
+        const isLfsPointer = hint.startsWith('version https://git-lfs');
+        console.error(`[friscy] rootfs too small (${rootfs.byteLength} bytes). LFS pointer: ${isLfsPointer}. Content: ${hint}`);
+        // Purge the service worker cache and reload to get the real file
+        if ('caches' in window) {
+            const names = await caches.keys();
+            await Promise.all(names.map(n => caches.delete(n)));
+            console.log('[friscy] Purged all SW caches, reloading...');
+        }
+        if (navigator.serviceWorker) {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(regs.map(r => r.unregister()));
+            console.log('[friscy] Unregistered service workers');
+        }
+        setProgress(0, 'Cache corrupted — reloading...', 'Stale cached data detected. Reloading with fresh files...');
+        setTimeout(() => window.location.reload(), 1500);
+        return;
+    }
+
     // Load checkpoint if specified in manifest
     let checkpointData: ArrayBuffer | null = null;
     const checkpointUrl = exampleCfg.checkpoint;

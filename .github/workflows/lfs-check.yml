@@ -23,12 +23,11 @@ jobs:
         run: |
           echo "Scanning friscy-bundle/ for unresolved Git LFS pointers..."
           fail=0
-          # Check every LFS-tracked file that lives under friscy-bundle/
-          for f in $(git lfs ls-files -n | grep '^friscy-bundle/'); do
-            if [ ! -f "$f" ]; then
-              echo "WARN: $f listed in LFS but missing from working tree"
-              continue
-            fi
+          count=0
+          # Find all files matching LFS-tracked patterns in friscy-bundle/
+          for f in friscy-bundle/*.wasm friscy-bundle/*.tar friscy-bundle/*.ckpt; do
+            [ -f "$f" ] || continue
+            count=$((count + 1))
             if head -c 40 "$f" | grep -q 'version https://git-lfs'; then
               echo "FAIL: $f is an unresolved LFS pointer ($(wc -c < "$f") bytes)"
               fail=1
@@ -36,6 +35,13 @@ jobs:
               echo "OK:   $f ($(stat --format=%s "$f") bytes)"
             fi
           done
+
+          echo ""
+          echo "Checked $count files."
+
+          if [ "$count" -eq 0 ]; then
+            echo "WARNING: No LFS-tracked files found in friscy-bundle/"
+          fi
 
           if [ "$fail" -eq 1 ]; then
             echo ""

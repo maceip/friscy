@@ -32,15 +32,22 @@ jobs:
         run: |
           echo "Checking that all LFS-tracked files in friscy-bundle/ are resolved..."
           fail=0
-          for f in $(git lfs ls-files -n | grep '^friscy-bundle/'); do
+          count=0
+          for f in friscy-bundle/*.wasm friscy-bundle/*.tar friscy-bundle/*.ckpt; do
+            [ -f "$f" ] || continue
+            count=$((count + 1))
             if head -c 40 "$f" | grep -q 'version https://git-lfs'; then
-              echo "ERROR: $f is an unresolved LFS pointer"
+              echo "ERROR: $f is an unresolved LFS pointer ($(wc -c < "$f") bytes)"
               fail=1
             else
               size=$(stat --format=%s "$f")
               echo "OK: $f ($size bytes)"
             fi
           done
+          echo "Checked $count files."
+          if [ "$count" -eq 0 ]; then
+            echo "WARNING: No LFS-tracked files found in friscy-bundle/"
+          fi
           if [ "$fail" -eq 1 ]; then
             echo ""
             echo "Deploy blocked: LFS files were not resolved."

@@ -33,8 +33,11 @@ jobs:
           set -euo pipefail
           mkdir -p friscy-bundle
           curl -fL --retry 3 --retry-delay 2 \
+            -o friscy-bundle/friscy.js \
+            "https://github.com/maceip/friscy/releases/download/runtime-rootfs-assets-20260313/friscy-runtime-good.js"
+          curl -fL --retry 3 --retry-delay 2 \
             -o friscy-bundle/friscy.wasm \
-            "https://maceip.github.io/friscy/friscy.wasm"
+            "https://github.com/maceip/friscy/releases/download/runtime-rootfs-assets-20260313/friscy-runtime-good.wasm"
           curl -fL --retry 3 --retry-delay 2 \
             -o friscy-bundle/claude-real.tar \
             "https://github.com/maceip/friscy/releases/download/runtime-rootfs-assets-20260313/claude-real.tar"
@@ -50,6 +53,7 @@ jobs:
           echo "Checking hydrated runtime assets in friscy-bundle/..."
           fail=0
           for f in \
+            friscy-bundle/friscy.js \
             friscy-bundle/friscy.wasm \
             friscy-bundle/claude-real.tar \
             friscy-bundle/codex-real.tar \

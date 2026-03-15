@@ -48,11 +48,14 @@
 #include <string>
 #include <cstring>
 #include <cstdlib>
+#include <new>
+#include <atomic>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <emscripten/stack.h>
 #else
 #include <signal.h>
 #include <execinfo.h>
@@ -66,6 +69,84 @@ static void segfault_handler(int sig) {
 #endif
 
 using Machine = riscv::Machine<riscv::RISCV64>;
+
+#ifdef __EMSCRIPTEN__
+static std::atomic<uint64_t> g_last_new_size {0};
+static std::atomic<uint64_t> g_last_new_retaddr0 {0};
+static std::atomic<uint64_t> g_last_new_retaddr1 {0};
+static std::atomic<uint64_t> g_last_new_retaddr2 {0};
+static std::atomic<uint32_t> g_last_new_aligned {0};
+static std::atomic<uint32_t> g_new_fail_latch {0};
+
+static inline void friscy_record_last_new(uint64_t size, bool aligned) noexcept {
+    uint32_t expected = 0;
+    if (!g_new_fail_latch.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+        return;
+    }
+    g_last_new_size.store(size, std::memory_order_relaxed);
+    g_last_new_retaddr0.store((uint64_t)(uintptr_t)__builtin_return_address(0), std::memory_order_relaxed);
+    g_last_new_retaddr1.store((uint64_t)(uintptr_t)__builtin_return_address(1), std::memory_order_relaxed);
+    g_last_new_retaddr2.store((uint64_t)(uintptr_t)__builtin_return_address(2), std::memory_order_relaxed);
+    g_last_new_aligned.store(aligned ? 1u : 0u, std::memory_order_relaxed);
+}
+
+[[noreturn]] static inline void friscy_throw_bad_alloc_after_new_handler() {
+    if (auto* handler = std::get_new_handler()) {
+        handler();
+    }
+    throw std::bad_alloc();
+}
+
+void* operator new(std::size_t size) {
+    const std::size_t request = (size == 0) ? 1 : size;
+    void* p = std::malloc(request);
+    if (p == nullptr) {
+        friscy_record_last_new(request, false);
+        if (g_new_fail_latch.load(std::memory_order_relaxed) == 1) {
+            char cs[3072] = {};
+            const int got = emscripten_get_callstack(EM_LOG_C_STACK, cs, sizeof(cs));
+            if (got > 0) {
+                fprintf(stderr, "[alloc-fail] new-callstack=%s\n", cs);
+            }
+        }
+        friscy_throw_bad_alloc_after_new_handler();
+    }
+    return p;
+}
+void* operator new[](std::size_t size) {
+    return ::operator new(size);
+}
+void* operator new(std::size_t size, std::align_val_t align) {
+    const std::size_t request = (size == 0) ? 1 : size;
+    void* p = nullptr;
+    if (posix_memalign(&p, static_cast<std::size_t>(align), request) != 0) {
+        p = nullptr;
+    }
+    if (p == nullptr) {
+        friscy_record_last_new(request, true);
+        if (g_new_fail_latch.load(std::memory_order_relaxed) == 1) {
+            char cs[3072] = {};
+            const int got = emscripten_get_callstack(EM_LOG_C_STACK, cs, sizeof(cs));
+            if (got > 0) {
+                fprintf(stderr, "[alloc-fail] new-callstack=%s\n", cs);
+            }
+        }
+        friscy_throw_bad_alloc_after_new_handler();
+    }
+    return p;
+}
+void* operator new[](std::size_t size, std::align_val_t align) {
+    return ::operator new(size, align);
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+#endif
 
 // Configuration
 static constexpr uint64_t MAX_INSTRUCTIONS = UINT64_MAX;  // no limit
@@ -177,12 +258,119 @@ static void dump_exec_bytes(Machine& machine, uint64_t pc, const char* tag) {
     }
 }
 
+// Ensure there is a live execute segment at the current PC before entering
+// the first simulation chunk. Browser non-arena runs have shown stale/empty
+// startup execute state at dynamic linker handoff boundaries.
+static bool ensure_startup_execute_segment(Machine& machine, const char* phase) {
+    auto pc = machine.cpu.pc();
+    try {
+        if (machine.cpu.current_execute_segment().empty()
+            || !machine.cpu.current_execute_segment().is_within(pc)) {
+            dbg_cout << "[friscy] Priming execute segment for startup phase=" << phase
+                     << " pc=0x" << std::hex << pc << std::dec << "\n";
+            machine.cpu.next_execute_segment(pc);
+            return true;
+        }
+    } catch (const riscv::MachineException& e) {
+        dbg_cerr << "[friscy] Failed initial execute segment for startup phase="
+                 << phase << " at pc=0x" << std::hex << pc
+                 << " what=" << e.what() << std::dec << "\n";
+        try {
+            if (pc != 0) {
+                riscv::PageAttributes attr;
+                attr.read = true;
+                attr.write = true;
+                attr.exec = true;
+                machine.memory.set_page_attr(pc & ~0xFFFULL, 4096, attr);
+                machine.cpu.next_execute_segment(pc);
+                dbg_cout << "[friscy] Recovered execute segment after forcing exec perms, phase="
+                         << phase << "\n";
+                return true;
+            }
+        } catch (const riscv::MachineException&) {
+            dbg_cerr << "[friscy] Execute segment recovery still failing for phase="
+                     << phase << " pc=0x" << std::hex << pc << std::dec << "\n";
+            throw;
+        }
+    }
+    return false;
+}
+
 #ifdef __EMSCRIPTEN__
 static Machine* g_machine = nullptr;
 #ifdef __EMSCRIPTEN__
 static std::vector<uint8_t> g_last_checkpoint_export;
 static std::vector<uint8_t> g_live_checkpoint_export;
 #endif
+static std::atomic<uint32_t> g_alloc_fail_dump_count {0};
+
+static void dump_alloc_failure_state(const char* reason) noexcept {
+    const uint32_t dump_idx = g_alloc_fail_dump_count.fetch_add(1, std::memory_order_relaxed);
+    const bool detailed = (dump_idx < 4);
+    fprintf(stderr, "[alloc-fail] reason=%s\n", reason ? reason : "(unknown)");
+    fprintf(stderr,
+            "[alloc-fail] last-new size=0x%llx ret0=0x%llx ret1=0x%llx ret2=0x%llx aligned=%u\n",
+            (unsigned long long)g_last_new_size.load(std::memory_order_relaxed),
+            (unsigned long long)g_last_new_retaddr0.load(std::memory_order_relaxed),
+            (unsigned long long)g_last_new_retaddr1.load(std::memory_order_relaxed),
+            (unsigned long long)g_last_new_retaddr2.load(std::memory_order_relaxed),
+            (unsigned)g_last_new_aligned.load(std::memory_order_relaxed));
+    if (detailed) {
+        char callstack[3072] = {};
+        const int got = emscripten_get_callstack(EM_LOG_C_STACK, callstack, sizeof(callstack));
+        if (got > 0) {
+            fprintf(stderr, "[alloc-fail] cstack=%s\n", callstack);
+        }
+    }
+    fprintf(stderr,
+            "[alloc-fail] execseg req=%llu ok=%llu fail=%llu free=%llu live=%llu peak=%llu last_req=0x%llx last_fail=0x%llx\n",
+            (unsigned long long)riscv::g_execseg_alloc_diag.alloc_requests,
+            (unsigned long long)riscv::g_execseg_alloc_diag.alloc_successes,
+            (unsigned long long)riscv::g_execseg_alloc_diag.alloc_failures,
+            (unsigned long long)riscv::g_execseg_alloc_diag.free_calls,
+            (unsigned long long)riscv::g_execseg_alloc_diag.bytes_live,
+            (unsigned long long)riscv::g_execseg_alloc_diag.bytes_peak,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_request_len,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_fail_len);
+    if (g_machine) {
+        fprintf(stderr,
+                "[alloc-fail] pc=0x%llx mmap=0x%llx mmap_start=0x%llx pages=%llu owned=%llu exec_segments=%llu live_mmaps=%zu mem_total=%llu\n",
+                (unsigned long long)g_machine->cpu.pc(),
+                (unsigned long long)g_machine->memory.mmap_address(),
+                (unsigned long long)g_machine->memory.mmap_start(),
+                (unsigned long long)g_machine->memory.pages_active(),
+                (unsigned long long)g_machine->memory.owned_pages_active(),
+                (unsigned long long)g_machine->memory.execute_segments_count(),
+                syscalls::g_live_mmap_regions.size(),
+                (unsigned long long)g_machine->memory.memory_usage_total());
+    }
+    if (detailed) {
+        constexpr int SYSCALL_RING_DUMP = 64;
+        const int base = riscv::g_syscall_ring_idx - SYSCALL_RING_DUMP;
+        for (int i = 0; i < SYSCALL_RING_DUMP; i++) {
+            const int idx = (base + i + riscv::SYSCALL_RING_SIZE * 16) % riscv::SYSCALL_RING_SIZE;
+            const auto& e = riscv::g_syscall_ring[idx];
+            if (e.pc == 0 && e.sysnum == 0 && e.a0 == 0 && e.a1 == 0 && e.a2 == 0 && e.result == 0) {
+                continue;
+            }
+            fprintf(stderr,
+                    "[alloc-fail-sysring] slot=%d sys#%zu a0=0x%llx a1=0x%llx a2=0x%llx ret=%lld pc=0x%llx\n",
+                    i,
+                    e.sysnum,
+                    (unsigned long long)e.a0,
+                    (unsigned long long)e.a1,
+                    (unsigned long long)e.a2,
+                    (long long)e.result,
+                    (unsigned long long)e.pc);
+        }
+    } else if (dump_idx == 4) {
+        fprintf(stderr, "[alloc-fail] suppressing repeated syscall ring dumps\n");
+    }
+}
+
+static void friscy_new_failure_handler() noexcept {
+    dump_alloc_failure_state("operator new");
+}
 
 extern "C" {
 // Returns 1 if machine is stopped waiting for stdin, 0 otherwise.
@@ -221,6 +409,129 @@ EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_elf_loader_stage() {
 }
 EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_elf_loader_vaddr() {
     return (uint32_t)dynlink::g_elf_loader_debug_vaddr;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_mmap_address() {
+    return g_machine ? (uint32_t)g_machine->memory.mmap_address() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_mmap_start() {
+    return g_machine ? (uint32_t)g_machine->memory.mmap_start() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_arena_bytes_used() {
+    return g_machine ? (uint32_t)g_machine->arena().bytes_used() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_arena_bytes_free() {
+    return g_machine ? (uint32_t)g_machine->arena().bytes_free() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_arena_chunks_used() {
+    return g_machine ? (uint32_t)g_machine->arena().chunks_used() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_pages_active() {
+    return g_machine ? (uint32_t)g_machine->memory.pages_active() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_owned_pages_active() {
+    return g_machine ? (uint32_t)g_machine->memory.owned_pages_active() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execute_segments_count() {
+    return g_machine ? (uint32_t)g_machine->memory.execute_segments_count() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_memory_usage_total() {
+    return g_machine ? (uint32_t)g_machine->memory.memory_usage_total() : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_live_mmap_regions_count() {
+    return (uint32_t)syscalls::g_live_mmap_regions.size();
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_new_size() {
+    return (uint32_t)g_last_new_size.load(std::memory_order_relaxed);
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_new_retaddr() {
+    return (uint32_t)g_last_new_retaddr0.load(std::memory_order_relaxed);
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_new_retaddr1() {
+    return (uint32_t)g_last_new_retaddr1.load(std::memory_order_relaxed);
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_new_retaddr2() {
+    return (uint32_t)g_last_new_retaddr2.load(std::memory_order_relaxed);
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_last_new_aligned() {
+    return (uint32_t)g_last_new_aligned.load(std::memory_order_relaxed);
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_alloc_requests() {
+    return (uint32_t)riscv::g_execseg_alloc_diag.alloc_requests;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_alloc_successes() {
+    return (uint32_t)riscv::g_execseg_alloc_diag.alloc_successes;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_alloc_failures() {
+    return (uint32_t)riscv::g_execseg_alloc_diag.alloc_failures;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_live_bytes() {
+    return (uint32_t)riscv::g_execseg_alloc_diag.bytes_live;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_peak_bytes() {
+    return (uint32_t)riscv::g_execseg_alloc_diag.bytes_peak;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_last_request_len() {
+    return (uint32_t)riscv::g_execseg_alloc_diag.last_request_len;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_last_request_likely_jit() {
+    return (uint32_t)(riscv::g_execseg_alloc_diag.last_request_likely_jit ? 1u : 0u);
+}
+EMSCRIPTEN_KEEPALIVE uint32_t friscy_get_execseg_last_fail_len() {
+    return (uint32_t)riscv::g_execseg_alloc_diag.last_fail_len;
+}
+EMSCRIPTEN_KEEPALIVE void friscy_dump_execseg_alloc_diag() {
+    fprintf(stderr,
+            "[execseg-diag] req=%llu ok=%llu fail=%llu free=%llu bytes_live=%llu bytes_peak=%llu "
+            "last_req_len=0x%llx last_req_vaddr=0x%llx last_req_exlen=0x%llx "
+            "last_fail_len=0x%llx last_fail_vaddr=0x%llx last_fail_exlen=0x%llx\n",
+            (unsigned long long)riscv::g_execseg_alloc_diag.alloc_requests,
+            (unsigned long long)riscv::g_execseg_alloc_diag.alloc_successes,
+            (unsigned long long)riscv::g_execseg_alloc_diag.alloc_failures,
+            (unsigned long long)riscv::g_execseg_alloc_diag.free_calls,
+            (unsigned long long)riscv::g_execseg_alloc_diag.bytes_live,
+            (unsigned long long)riscv::g_execseg_alloc_diag.bytes_peak,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_request_len,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_request_vaddr,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_request_exec_len,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_fail_len,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_fail_vaddr,
+            (unsigned long long)riscv::g_execseg_alloc_diag.last_fail_exec_len);
+    const uint32_t total_events = riscv::g_execseg_alloc_ring_idx;
+    const uint32_t to_dump = (total_events < 96u) ? total_events : 96u;
+    for (uint32_t i = 0; i < to_dump; i++) {
+        const uint32_t idx =
+            (total_events + riscv::EXECSEG_ALLOC_RING_SIZE - to_dump + i) % riscv::EXECSEG_ALLOC_RING_SIZE;
+        const auto& e = riscv::g_execseg_alloc_ring[idx];
+        if (e.phase == 0) continue;
+        fprintf(stderr,
+                "[execseg-ring] slot=%u phase=%u len=0x%llx vaddr=0x%llx exlen=0x%llx likely_jit=%u\n",
+                i,
+                (unsigned)e.phase,
+                (unsigned long long)e.pagedata_len,
+                (unsigned long long)e.vaddr,
+                (unsigned long long)e.exec_len,
+                (unsigned)e.likely_jit);
+    }
+}
+EMSCRIPTEN_KEEPALIVE void friscy_dump_syscall_ring() {
+    constexpr int RING = riscv::SYSCALL_RING_SIZE;
+    const int base = riscv::g_syscall_ring_idx - RING;
+    for (int i = 0; i < RING; i++) {
+        const int idx = (base + i + RING * 16) % RING;
+        const auto& e = riscv::g_syscall_ring[idx];
+        if (e.pc == 0 && e.sysnum == 0 && e.a0 == 0 && e.a1 == 0 && e.a2 == 0 && e.result == 0) {
+            continue;
+        }
+        fprintf(stderr,
+                "[syscall-ring] slot=%d sys#%zu a0=0x%lx a1=0x%lx a2=0x%lx ret=%ld pc=0x%lx\n",
+                i,
+                e.sysnum,
+                (long)e.a0,
+                (long)e.a1,
+                (long)e.a2,
+                (long)e.result,
+                (long)e.pc);
+    }
 }
 EMSCRIPTEN_KEEPALIVE void friscy_clear_last_fault() {
     g_last_fault_kind = FRISCY_FAULT_NONE;
@@ -367,19 +678,6 @@ EMSCRIPTEN_KEEPALIVE int friscy_resume() {
                 g_last_fault_kind = FRISCY_FAULT_EBREAK;
                 if (syscalls::g_fork_active()) {
                     dbg_cerr << "[resume] EBREAK in fork child — forcing child exit\n";
-                    // Dump last 32 syscalls for debugging
-                    dbg_cerr << "[syscall-ring] last 32 syscalls before crash:\n";
-                    for (int j = 0; j < 32; j++) {
-                        int idx = (riscv::g_syscall_ring_idx - 32 + j + 1024) % 32;
-                        auto& e = riscv::g_syscall_ring[idx];
-                        if (e.pc != 0)
-                            dbg_cerr << "  [" << j << "] sys#" << e.sysnum
-                                      << " a0=0x" << std::hex << e.a0
-                                      << " a1=0x" << e.a1
-                                      << " a2=0x" << e.a2
-                                      << " => " << std::dec << e.result
-                                      << " pc=0x" << std::hex << e.pc << std::dec << "\n";
-                    }
                     syscalls::g_fork().exit_status = 127;
                     syscalls::g_process_model.push_event(
                         syscalls::ProcessEventKind::Exit,
@@ -732,6 +1030,119 @@ static void setup_virtual_files() {
         "};\n"
     );
 
+    // Explicit host-fetch preload for plain Node.js guest execution.
+    // Loaded via NODE_OPTIONS="-r /etc/https-hostfetch-preload.js".
+    g_vfs.add_virtual_file("/etc/https-hostfetch-preload.js",
+        "'use strict';\n"
+        "(function(){\n"
+        "  const bridge = process.env.FRISCY_HOST_FETCH || '';\n"
+        "  if (!bridge) return;\n"
+        "  const net = require('net');\n"
+        "  const { URL } = require('url');\n"
+        "  const originalFetch = globalThis.fetch;\n"
+        "  function headersToObject(h) {\n"
+        "    const out = {};\n"
+        "    if (!h) return out;\n"
+        "    if (Array.isArray(h)) {\n"
+        "      for (const pair of h) if (pair && pair.length >= 2) out[String(pair[0])] = String(pair[1]);\n"
+        "      return out;\n"
+        "    }\n"
+        "    if (typeof h.forEach === 'function') {\n"
+        "      h.forEach((v, k) => { out[String(k)] = String(v); });\n"
+        "      return out;\n"
+        "    }\n"
+        "    for (const [k, v] of Object.entries(h)) out[String(k)] = String(v);\n"
+        "    return out;\n"
+        "  }\n"
+        "  class SimpleHeaders {\n"
+        "    constructor(obj) { this._obj = headersToObject(obj); }\n"
+        "    get(name) { const key = String(name).toLowerCase(); for (const [k,v] of Object.entries(this._obj)) if (k.toLowerCase() === key) return v; return null; }\n"
+        "    forEach(fn) { for (const [k, v] of Object.entries(this._obj)) fn(v, k, this); }\n"
+        "    entries() { return Object.entries(this._obj)[Symbol.iterator](); }\n"
+        "    [Symbol.iterator]() { return this.entries(); }\n"
+        "  }\n"
+        "  class SimpleResponse {\n"
+        "    constructor(data) {\n"
+        "      this.status = data.status || 0;\n"
+        "      this.statusText = data.statusText || '';\n"
+        "      this.ok = this.status >= 200 && this.status < 300;\n"
+        "      this.headers = new SimpleHeaders(data.headers || {});\n"
+        "      this._body = String(data.body || '');\n"
+        "    }\n"
+        "    async text() { return this._body; }\n"
+        "    async json() { return JSON.parse(this._body); }\n"
+        "    async arrayBuffer() { return Buffer.from(this._body, 'utf8'); }\n"
+        "  }\n"
+        "  function bodyToString(body) {\n"
+        "    if (body == null) return undefined;\n"
+        "    if (typeof body === 'string') return body;\n"
+        "    if (Buffer.isBuffer(body)) return body.toString('utf8');\n"
+        "    if (body instanceof Uint8Array) return Buffer.from(body).toString('utf8');\n"
+        "    return String(body);\n"
+        "  }\n"
+        "  globalThis.fetch = async function(input, init) {\n"
+        "    const reqUrl = typeof input === 'string'\n"
+        "      ? input\n"
+        "      : (input && typeof input.url === 'string')\n"
+        "        ? input.url\n"
+        "        : String(input);\n"
+        "    if (!/^https?:/i.test(reqUrl)) {\n"
+        "      if (typeof originalFetch === 'function') return originalFetch(input, init);\n"
+        "      throw new Error('host fetch preload only supports http(s) URLs');\n"
+        "    }\n"
+        "    const method = (init && init.method) || (input && input.method) || 'GET';\n"
+        "    const headers = headersToObject((init && init.headers) || (input && input.headers));\n"
+        "    const body = bodyToString((init && Object.prototype.hasOwnProperty.call(init, 'body')) ? init.body : (input && input.body));\n"
+        "    const payload = JSON.stringify({ url: reqUrl, options: { method, headers, ...(body !== undefined ? { body } : {}) } });\n"
+        "    const target = new URL(bridge);\n"
+        "    return await new Promise((resolve, reject) => {\n"
+        "      const host = target.hostname;\n"
+        "      const port = Number(target.port || 80);\n"
+        "      const path = (target.pathname || '/') + (target.search || '');\n"
+        "      const reqText = 'POST ' + path + ' HTTP/1.1\\r\\n'\n"
+        "        + 'Host: ' + host + ':' + port + '\\r\\n'\n"
+        "        + 'Content-Type: application/json\\r\\n'\n"
+        "        + 'Content-Length: ' + Buffer.byteLength(payload) + '\\r\\n'\n"
+        "        + 'Connection: close\\r\\n\\r\\n'\n"
+        "        + payload;\n"
+        "      const sock = net.createConnection({ host, port });\n"
+        "      const chunks = [];\n"
+        "      let done = false;\n"
+        "      function finish() {\n"
+        "        if (done) return;\n"
+        "        const buf = Buffer.concat(chunks);\n"
+        "        const sep = buf.indexOf('\\\\r\\\\n\\\\r\\\\n');\n"
+        "        if (sep < 0) return;\n"
+        "        const head = buf.slice(0, sep).toString('utf8');\n"
+        "        const m = head.match(/content-length:\\\\s*(\\\\d+)/i);\n"
+        "        const bodyBuf = buf.slice(sep + 4);\n"
+        "        const need = m ? Number(m[1]) : bodyBuf.length;\n"
+        "        if (bodyBuf.length < need) return;\n"
+        "        done = true;\n"
+        "        try {\n"
+        "          const data = JSON.parse(bodyBuf.slice(0, need).toString('utf8') || '{}');\n"
+        "          resolve(new SimpleResponse(data));\n"
+        "        } catch (err) {\n"
+        "          reject(err);\n"
+        "        }\n"
+        "        try { sock.destroy(); } catch (_) {}\n"
+        "      }\n"
+        "      sock.on('connect', () => sock.write(reqText));\n"
+        "      sock.on('data', (chunk) => { chunks.push(Buffer.from(chunk)); finish(); });\n"
+        "      sock.on('error', (err) => { if (!done) { done = true; reject(err); } });\n"
+        "      sock.on('end', finish);\n"
+        "      setTimeout(() => {\n"
+        "        if (!done) {\n"
+        "          done = true;\n"
+        "          try { sock.destroy(); } catch (_) {}\n"
+        "          reject(new Error('host fetch timeout'));\n"
+        "        }\n"
+        "      }, 30000);\n"
+        "    });\n"
+        "  };\n"
+        "})();\n"
+    );
+
     // dns-test.js: Minimal DNS resolution test to isolate DNS callback issues
     g_vfs.add_virtual_file("/usr/local/bin/dns-test.js",
         "'use strict';\n"
@@ -749,6 +1160,40 @@ static void setup_virtual_files() {
         "});\n"
         "console.error('[dns-test] dns.lookup called, waiting for callback...');\n"
         "setTimeout(() => { console.error('[dns-test] Timeout!'); process.exit(1); }, 30000);\n"
+    );
+
+    // fetch-probe.js: Minimal fetch smoke for browser preload debugging.
+    g_vfs.add_virtual_file("/usr/local/bin/fetch-probe.js",
+        "'use strict';\n"
+        "(async()=>{\n"
+        "  const url = process.env.FETCH_PROBE_URL || 'http://127.0.0.1:9097/manifest.json';\n"
+        "  const res = await fetch(url, { redirect: 'follow' });\n"
+        "  process.stdout.write('status=' + res.status + '\\n');\n"
+        "  const text = await res.text();\n"
+        "  process.stdout.write('bytes=' + text.length + '\\n');\n"
+        "})().catch((e)=>{\n"
+        "  process.stderr.write('ERR=' + ((e && e.stack) || e) + '\\n');\n"
+        "  process.exit(1);\n"
+        "});\n"
+    );
+
+    // http-probe.js: Minimal Node core HTTP smoke.
+    g_vfs.add_virtual_file("/usr/local/bin/http-probe.js",
+        "'use strict';\n"
+        "const http = require('http');\n"
+        "const url = process.env.HTTP_PROBE_URL || 'http://127.0.0.1:9097/manifest.json';\n"
+        "http.get(url, (res) => {\n"
+        "  let body = '';\n"
+        "  res.setEncoding('utf8');\n"
+        "  res.on('data', (chunk) => { body += chunk; });\n"
+        "  res.on('end', () => {\n"
+        "    process.stdout.write('status=' + res.statusCode + '\\n');\n"
+        "    process.stdout.write('bytes=' + body.length + '\\n');\n"
+        "  });\n"
+        "}).on('error', (e) => {\n"
+        "  process.stderr.write('ERR=' + ((e && e.stack) || e) + '\\n');\n"
+        "  process.exit(1);\n"
+        "});\n"
     );
 
     // claude-fast.js: Lightweight direct API client that bypasses the full
@@ -1151,6 +1596,10 @@ int main(int argc, char** argv) {
     if (perf_stats) {
         syscalls::reset_mmap_rails();
     }
+#ifdef __EMSCRIPTEN__
+    g_new_fail_latch.store(0, std::memory_order_relaxed);
+    std::set_new_handler(friscy_new_failure_handler);
+#endif
 
     static std::unique_ptr<Machine> machine_ptr;
     auto run_started_at = std::chrono::steady_clock::now();
@@ -1415,8 +1864,10 @@ int main(int argc, char** argv) {
 #endif
         }
 #if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+        // Keep arena disabled for browser builds to avoid reserving a contiguous
+        // >1GiB guest buffer that can trigger bad_alloc during Node boot.
         machine_opts.use_memory_arena = false;
-        machine_opts.memory_max = 1024ULL << 20; // 1GiB page-backed budget
+        machine_opts.memory_max = 3072ULL << 20; // 3GiB page-backed budget
 #endif
         dbg_cout << "[friscy-debug] Machine options: empty_machine"
 #if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
@@ -1425,7 +1876,7 @@ int main(int argc, char** argv) {
                   << "\n";
         machine_ptr = std::make_unique<Machine>(machine_opts);
         machine_ptr->set_options(std::make_shared<riscv::MachineOptions<riscv::RISCV64>>(machine_opts));
-#elif defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD) || defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+#elif defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
         riscv::MachineOptions<riscv::RISCV64> machine_opts{};
         machine_opts.use_shared_execute_segments = false;
         if (syscalls::g_safe_mode) {
@@ -1440,17 +1891,34 @@ int main(int argc, char** argv) {
         machine_opts.load_program = false;
 #endif
 #if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+        // Keep arena disabled for browser builds to avoid reserving a contiguous
+        // >1GiB guest buffer that can trigger bad_alloc during Node boot.
         machine_opts.use_memory_arena = false;
-        machine_opts.memory_max = 1024ULL << 20; // 1GiB page-backed budget
+        machine_opts.memory_max = 3072ULL << 20; // 3GiB page-backed budget
 #endif
         dbg_cout << "[friscy-debug] Machine options:"
 #if defined(FRISCY_EXPERIMENT_NO_PROGRAM_LOAD)
                   << " no_program_load"
 #endif
-#if defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
-                  << " no_arena"
-#endif
                   << "\n";
+        machine_ptr = std::make_unique<Machine>(binary, machine_opts);
+        machine_ptr->set_options(std::make_shared<riscv::MachineOptions<riscv::RISCV64>>(machine_opts));
+#elif defined(FRISCY_EXPERIMENT_DISABLE_ARENA)
+        riscv::MachineOptions<riscv::RISCV64> machine_opts{};
+        machine_opts.use_shared_execute_segments = false;
+        if (syscalls::g_safe_mode) {
+            machine_opts.use_shared_execute_segments = false;
+#ifdef RISCV_BINARY_TRANSLATION
+            machine_opts.translate_enabled = false;
+            machine_opts.translation_cache = false;
+            machine_opts.translate_future_segments = false;
+#endif
+        }
+        // Keep arena disabled for browser builds to avoid reserving a contiguous
+        // >1GiB guest buffer that can trigger bad_alloc during Node boot.
+        machine_opts.use_memory_arena = false;
+        machine_opts.memory_max = 3072ULL << 20; // 3GiB page-backed budget
+        dbg_cout << "[friscy-debug] Machine options: no_arena\n";
         machine_ptr = std::make_unique<Machine>(binary, machine_opts);
         machine_ptr->set_options(std::make_shared<riscv::MachineOptions<riscv::RISCV64>>(machine_opts));
 #else
@@ -1474,16 +1942,18 @@ int main(int argc, char** argv) {
         dbg_cout << "[friscy-debug] Machine constructed (pc=0x"
                   << std::hex << machine.cpu.pc() << std::dec << ")\n";
         syscalls::install_live_mmap_page_fault_handler(machine);
-        if (exec_info.type == elf::ET_DYN && machine.memory.uses_flat_memory_arena()) {
+        if (exec_info.type == elf::ET_DYN) {
             g_startup_stage = 20;
             const auto [exec_lo, exec_hi] = elf::get_load_range(binary);
             const uint64_t entry_addr = machine.memory.start_address();
             const uint64_t mapped_lo = entry_addr - (exec_info.entry_point - exec_lo);
-            // The constructor-loaded PIE image is not reliable enough for the
-            // main executable's writable PT_LOAD pages under our arena setup.
-            // Recopy the main ELF segments at the same mapped base so GOT/data
-            // contents come from the file image before the interpreter runs.
-            dynlink::load_elf_segments(machine, binary, mapped_lo);
+            if (machine.memory.uses_flat_memory_arena()) {
+                // The constructor-loaded PIE image is not reliable enough for the
+                // main executable's writable PT_LOAD pages under our arena setup.
+                // Recopy the main ELF segments at the same mapped base so GOT/data
+                // contents come from the file image before the interpreter runs.
+                dynlink::load_elf_segments(machine, binary, mapped_lo);
+            }
             g_startup_stage = 21;
             const auto* ehdr = reinterpret_cast<const elf::Elf64_Ehdr*>(binary.data());
             const uint64_t load_bias = mapped_lo - exec_lo;
@@ -1666,7 +2136,7 @@ int main(int argc, char** argv) {
             "TZ=UTC",
         };
 #ifdef __EMSCRIPTEN__
-        env.push_back("NODE_OPTIONS=--jitless --v8-pool-size=0 --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js");
+        env.push_back("NODE_OPTIONS=--jitless --v8-pool-size=0 --no-experimental-strip-types --max-old-space-size=256 -r /etc/dns-preload.js -r /etc/https-hostfetch-preload.js");
         env.push_back("NODE_COMPILE_CACHE=/tmp/node-compile-cache");
         env.push_back("UV_THREADPOOL_SIZE=1");
 #endif
@@ -1901,6 +2371,7 @@ int main(int argc, char** argv) {
                      << " for pc=0x" << machine.cpu.pc() << std::dec << "\n";
             machine.memory.evict_execute_segments();
         }
+        ensure_startup_execute_segment(machine, use_dynamic_linker ? "dynamic_start" : "startup");
         g_pre_run_pc = (uint32_t)machine.cpu.pc();
         g_pre_run_exec_begin = (uint32_t)machine.cpu.current_execute_segment().exec_begin();
         g_pre_run_exec_empty = machine.cpu.current_execute_segment().empty() ? 1u : 0u;
@@ -2460,7 +2931,14 @@ int main(int argc, char** argv) {
 #endif
             } catch (const std::exception& e) {
                 dbg_cerr << "[friscy] std::exception: " << e.what()
-                          << " pc=0x" << std::hex << machine.cpu.pc() << std::dec << "\n";
+                          << " pc=0x" << std::hex << machine.cpu.pc()
+                          << " ra=0x" << machine.cpu.reg(riscv::REG_RA)
+                          << " sp=0x" << machine.cpu.reg(riscv::REG_SP)
+                          << " mmap=0x" << machine.memory.mmap_address()
+                          << " brk_base=0x" << syscalls::g_exec_ctx.brk_base
+                          << " brk_cur=0x" << syscalls::g_exec_ctx.brk_current
+                          << " live_mmaps=" << std::dec << syscalls::g_live_mmap_regions.size()
+                          << "\n";
                 return 1;
             }
         }

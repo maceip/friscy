@@ -352,11 +352,12 @@ namespace riscv
 			throw MachineException(INVALID_PROGRAM,
 				"Program produced empty decoder cache");
 		}
+		const size_t decoder_cache_bytes = n_pages * sizeof(DecoderCache<W>);
 		// Here we allocate the decoder cache which is page-sized
 		auto* decoder_cache = exec.create_decoder_cache(
-			new DecoderCache<W> [n_pages], n_pages);
+			new DecoderCache<W> [n_pages], n_pages, decoder_cache_bytes);
 		// Clear the decoder cache! (technically only needed when binary translation is enabled)
-		std::memset(decoder_cache, 0, n_pages * sizeof(DecoderCache<W>));
+		std::memset(decoder_cache, 0, decoder_cache_bytes);
 		// Get a base address relative pointer to the decoder cache
 		// Eg. exec_decoder[pbase] is the first entry in the decoder cache
 		// so that PC with a simple shift can be used as a direct index.
@@ -567,6 +568,32 @@ namespace riscv
 		if (UNLIKELY(__builtin_add_overflow(pbase, plen, &pbase2)))
 			throw MachineException(INVALID_PROGRAM, "Segment virtual base was bogus");
 #endif
+		// In wasm browser mode, avoid retaining duplicate decode segments for the
+		// exact same immutable execute range. This prevents runaway slot churn.
+#ifdef __EMSCRIPTEN__
+		if (!is_likely_jit) {
+			auto try_reuse = [&](std::shared_ptr<DecodedExecuteSegment<W>>& seg) -> bool {
+				if (!seg) return false;
+				if (seg->exec_begin() != vaddr || seg->exec_end() != vaddr + exlen) return false;
+				const uint8_t* seg_data = seg->exec_data(pbase);
+				if (seg_data == nullptr) return false;
+				// If bytes are unchanged, stale state is likely from decoder invalidation
+				// heuristics rather than real code mutation. Reuse existing segment.
+				if (std::memcmp(seg_data + prelen, vdata, exlen) != 0) return false;
+				if (seg->is_stale()) seg->set_stale(false);
+				return true;
+			};
+			if (try_reuse(m_main_exec_segment)) {
+				return *m_main_exec_segment;
+			}
+			for (auto& seg : m_exec) {
+				if (try_reuse(seg)) {
+					return *seg;
+				}
+			}
+		}
+#endif
+
 		// Create the whole executable memory range
 		auto current_exec = std::make_shared<DecodedExecuteSegment<W>>(pbase, plen, vaddr, exlen);
 
@@ -637,6 +664,83 @@ namespace riscv
 		if (!m_main_exec_segment) {
 			return m_main_exec_segment;
 		}
+		const address_t current_pc = machine().cpu.pc();
+		DecodedExecuteSegment<W>* current_exec_ptr = &machine().cpu.current_execute_segment();
+#ifdef __EMSCRIPTEN__
+		static address_t wasm_recent_pcs[4] = {};
+		static unsigned wasm_recent_pc_idx = 0;
+		wasm_recent_pcs[wasm_recent_pc_idx++ % 4] = current_pc;
+#endif
+		auto try_release_segment = [&](size_t idx) -> bool {
+			if (idx >= m_exec.size()) return false;
+			auto& segment = m_exec[idx];
+			if (!segment) return false;
+			const SegmentKey key = SegmentKey::from(*segment, memory_arena_size());
+			segment = nullptr;
+			shared_execute_segments<W>.remove_if_unique(key);
+			return true;
+		};
+		// Reclaim stale execute segments before allocating another slot.
+		// Node/musl startup can repeatedly invalidate nearby code pages; if we
+		// only append, stale segments accumulate and drive wasm heap growth.
+		for (size_t i = 0; i < m_exec.size(); i++) {
+			auto& segment = m_exec[i];
+			if (segment && segment->is_stale()) {
+				(void)try_release_segment(i);
+			}
+		}
+		if (m_main_exec_segment && m_main_exec_segment->is_stale()) {
+			const SegmentKey key = SegmentKey::from(*m_main_exec_segment, memory_arena_size());
+			m_main_exec_segment = nullptr;
+			shared_execute_segments<W>.remove_if_unique(key);
+		}
+#ifdef __EMSCRIPTEN__
+		// Browser wasm32 has a hard 4GiB linear-memory ceiling. Keep execute-segment
+		// slot count bounded so decoder cache growth cannot run away indefinitely.
+		constexpr size_t WASM_EXECSEG_SLOT_CAP = 560;
+		size_t live_count = 0;
+		bool has_empty_slot = false;
+		for (const auto& segment : m_exec) {
+			if (segment) live_count++;
+			else has_empty_slot = true;
+		}
+		if (!has_empty_slot && live_count >= WASM_EXECSEG_SLOT_CAP) {
+			auto pick_candidate = [&](bool avoid_hot_pcs, bool avoid_current_pc_range) -> size_t {
+				size_t candidate_idx = m_exec.size();
+				for (size_t i = 0; i < m_exec.size(); i++) {
+					auto& segment = m_exec[i];
+					if (!segment) continue;
+					if (segment.get() == current_exec_ptr) continue;
+					if (avoid_current_pc_range && segment->is_within(current_pc)) continue;
+					if (avoid_hot_pcs) {
+						bool touches_hot_pc = false;
+						for (address_t hot_pc : wasm_recent_pcs) {
+							if (hot_pc != 0 && segment->is_within(hot_pc)) {
+								touches_hot_pc = true;
+								break;
+							}
+						}
+						if (touches_hot_pc) continue;
+					}
+					candidate_idx = i; // oldest acceptable segment
+					break;
+				}
+				return candidate_idx;
+			};
+			size_t candidate_idx = pick_candidate(true, true);
+			if (candidate_idx == m_exec.size()) candidate_idx = pick_candidate(true, false);
+			if (candidate_idx == m_exec.size()) candidate_idx = pick_candidate(false, false);
+			if (candidate_idx != m_exec.size() && try_release_segment(candidate_idx)) {
+				live_count--;
+				has_empty_slot = true;
+			}
+		}
+#endif
+		for (auto& segment : m_exec) {
+			if (!segment) {
+				return segment;
+			}
+		}
 		if (LIKELY(m_exec.size() < RISCV_MAX_EXECUTE_SEGS)) {
 			m_exec.push_back(nullptr);
 			return m_exec.back();
@@ -682,6 +786,11 @@ namespace riscv
 	void Memory<W>::evict_execute_segment(DecodedExecuteSegment<W>& segment)
 	{
 		const SegmentKey key = SegmentKey::from(segment, memory_arena_size());
+		if (m_main_exec_segment.get() == &segment) {
+			m_main_exec_segment = nullptr;
+			shared_execute_segments<W>.remove_if_unique(key);
+			return;
+		}
 		for (auto& seg : m_exec) {
 			if (seg.get() == &segment) {
 				seg = nullptr;

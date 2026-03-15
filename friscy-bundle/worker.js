@@ -566,6 +566,34 @@ function getRuntimeFaultInfo() {
     return { kind, pc, data };
 }
 
+function getMemoryPressureSnapshot() {
+    const wasmHeapBytes = emModule?.HEAPU8?.buffer?.byteLength || 0;
+    const wasmHeapPages = wasmHeapBytes > 0 ? Math.floor(wasmHeapBytes / 65536) : 0;
+    const wasmHeapMiB = wasmHeapBytes > 0 ? Number((wasmHeapBytes / (1024 * 1024)).toFixed(2)) : 0;
+
+    let jsHeapUsedBytes = null;
+    let jsHeapTotalBytes = null;
+    let jsHeapLimitBytes = null;
+    try {
+        if (typeof performance !== 'undefined' && performance && performance.memory) {
+            jsHeapUsedBytes = Number(performance.memory.usedJSHeapSize || 0);
+            jsHeapTotalBytes = Number(performance.memory.totalJSHeapSize || 0);
+            jsHeapLimitBytes = Number(performance.memory.jsHeapSizeLimit || 0);
+        }
+    } catch (_e) {
+        // Some browser/worker runtimes do not expose performance.memory.
+    }
+
+    return {
+        wasmHeapBytes,
+        wasmHeapPages,
+        wasmHeapMiB,
+        jsHeapUsedBytes,
+        jsHeapTotalBytes,
+        jsHeapLimitBytes,
+    };
+}
+
 function getRuntimeStateSnapshot() {
     const stopped = (typeof emModule?._friscy_stopped === 'function')
         ? !!emModule._friscy_stopped()
@@ -595,6 +623,75 @@ function getRuntimeStateSnapshot() {
     const preRunPcPageFlags = (typeof emModule?._friscy_get_pre_run_pc_page_flags === 'function')
         ? (emModule._friscy_get_pre_run_pc_page_flags() >>> 0)
         : 0;
+    const mmapAddress = (typeof emModule?._friscy_get_mmap_address === 'function')
+        ? (emModule._friscy_get_mmap_address() >>> 0)
+        : 0;
+    const mmapStart = (typeof emModule?._friscy_get_mmap_start === 'function')
+        ? (emModule._friscy_get_mmap_start() >>> 0)
+        : 0;
+    const arenaBytesUsed = (typeof emModule?._friscy_get_arena_bytes_used === 'function')
+        ? (emModule._friscy_get_arena_bytes_used() >>> 0)
+        : 0;
+    const arenaBytesFree = (typeof emModule?._friscy_get_arena_bytes_free === 'function')
+        ? (emModule._friscy_get_arena_bytes_free() >>> 0)
+        : 0;
+    const arenaChunksUsed = (typeof emModule?._friscy_get_arena_chunks_used === 'function')
+        ? (emModule._friscy_get_arena_chunks_used() >>> 0)
+        : 0;
+    const pagesActive = (typeof emModule?._friscy_get_pages_active === 'function')
+        ? (emModule._friscy_get_pages_active() >>> 0)
+        : 0;
+    const ownedPagesActive = (typeof emModule?._friscy_get_owned_pages_active === 'function')
+        ? (emModule._friscy_get_owned_pages_active() >>> 0)
+        : 0;
+    const executeSegmentsCount = (typeof emModule?._friscy_get_execute_segments_count === 'function')
+        ? (emModule._friscy_get_execute_segments_count() >>> 0)
+        : 0;
+    const memoryUsageTotal = (typeof emModule?._friscy_get_memory_usage_total === 'function')
+        ? (emModule._friscy_get_memory_usage_total() >>> 0)
+        : 0;
+    const liveMmapRegionsCount = (typeof emModule?._friscy_get_live_mmap_regions_count === 'function')
+        ? (emModule._friscy_get_live_mmap_regions_count() >>> 0)
+        : 0;
+    const lastNewSize = (typeof emModule?._friscy_get_last_new_size === 'function')
+        ? (emModule._friscy_get_last_new_size() >>> 0)
+        : 0;
+    const lastNewRetaddr = (typeof emModule?._friscy_get_last_new_retaddr === 'function')
+        ? (emModule._friscy_get_last_new_retaddr() >>> 0)
+        : 0;
+    const lastNewRetaddr1 = (typeof emModule?._friscy_get_last_new_retaddr1 === 'function')
+        ? (emModule._friscy_get_last_new_retaddr1() >>> 0)
+        : 0;
+    const lastNewRetaddr2 = (typeof emModule?._friscy_get_last_new_retaddr2 === 'function')
+        ? (emModule._friscy_get_last_new_retaddr2() >>> 0)
+        : 0;
+    const lastNewAligned = (typeof emModule?._friscy_get_last_new_aligned === 'function')
+        ? !!(emModule._friscy_get_last_new_aligned() >>> 0)
+        : false;
+    const execsegAllocRequests = (typeof emModule?._friscy_get_execseg_alloc_requests === 'function')
+        ? (emModule._friscy_get_execseg_alloc_requests() >>> 0)
+        : 0;
+    const execsegAllocSuccesses = (typeof emModule?._friscy_get_execseg_alloc_successes === 'function')
+        ? (emModule._friscy_get_execseg_alloc_successes() >>> 0)
+        : 0;
+    const execsegAllocFailures = (typeof emModule?._friscy_get_execseg_alloc_failures === 'function')
+        ? (emModule._friscy_get_execseg_alloc_failures() >>> 0)
+        : 0;
+    const execsegLiveBytes = (typeof emModule?._friscy_get_execseg_live_bytes === 'function')
+        ? (emModule._friscy_get_execseg_live_bytes() >>> 0)
+        : 0;
+    const execsegPeakBytes = (typeof emModule?._friscy_get_execseg_peak_bytes === 'function')
+        ? (emModule._friscy_get_execseg_peak_bytes() >>> 0)
+        : 0;
+    const execsegLastRequestLen = (typeof emModule?._friscy_get_execseg_last_request_len === 'function')
+        ? (emModule._friscy_get_execseg_last_request_len() >>> 0)
+        : 0;
+    const execsegLastRequestLikelyJit = (typeof emModule?._friscy_get_execseg_last_request_likely_jit === 'function')
+        ? !!(emModule._friscy_get_execseg_last_request_likely_jit() >>> 0)
+        : false;
+    const execsegLastFailLen = (typeof emModule?._friscy_get_execseg_last_fail_len === 'function')
+        ? (emModule._friscy_get_execseg_last_fail_len() >>> 0)
+        : 0;
     return {
         stopped,
         stopReason,
@@ -606,6 +703,30 @@ function getRuntimeStateSnapshot() {
         preRunExecBegin,
         preRunExecEmpty,
         preRunPcPageFlags,
+        mmapAddress,
+        mmapStart,
+        arenaBytesUsed,
+        arenaBytesFree,
+        arenaChunksUsed,
+        pagesActive,
+        ownedPagesActive,
+        executeSegmentsCount,
+        memoryUsageTotal,
+        liveMmapRegionsCount,
+        lastNewSize,
+        lastNewRetaddr,
+        lastNewRetaddr1,
+        lastNewRetaddr2,
+        lastNewAligned,
+        execsegAllocRequests,
+        execsegAllocSuccesses,
+        execsegAllocFailures,
+        execsegLiveBytes,
+        execsegPeakBytes,
+        execsegLastRequestLen,
+        execsegLastRequestLikelyJit,
+        execsegLastFailLen,
+        memory: getMemoryPressureSnapshot(),
         fault: getRuntimeFaultInfo(),
         processExitStatus: lastProcessExitStatus,
         processWaitWakeStatus: lastProcessWaitWakeStatus,
@@ -666,6 +787,13 @@ function classifyRunFailure(error) {
         diagnostics: {
             stopped,
             stopReason,
+            startupStage: snapshot.startupStage,
+            elfLoaderStage: snapshot.elfLoaderStage,
+            elfLoaderVaddr: snapshot.elfLoaderVaddr,
+            preRunPc: snapshot.preRunPc,
+            preRunExecBegin: snapshot.preRunExecBegin,
+            preRunExecEmpty: snapshot.preRunExecEmpty,
+            preRunPcPageFlags: snapshot.preRunPcPageFlags,
             faultKind: fault.kind,
             faultPc: fault.pc,
             faultData: fault.data,
@@ -1157,7 +1285,15 @@ async function runResumeLoop(options = {}) {
             } catch (resumeErr) {
                 telemetry.resumeThrows++;
                 const resumeErrShown = String(resumeErr?.message || resumeErr || '');
-                console.error('[worker] friscy_resume threw:', resumeErrShown);
+                const throwSnapshot = getRuntimeStateSnapshot();
+                console.error('[worker] friscy_resume threw:', resumeErrShown, JSON.stringify({
+                    pc: throwSnapshot.pc,
+                    startupStage: throwSnapshot.startupStage,
+                    elfLoaderStage: throwSnapshot.elfLoaderStage,
+                    elfLoaderVaddr: throwSnapshot.elfLoaderVaddr,
+                    memory: throwSnapshot.memory,
+                    fault: throwSnapshot.fault,
+                }));
                 if (stopReason & STOP_REASON_STDIN) {
                     telemetry.recoveredThrows++;
                     stillStopped = 1;
@@ -1534,6 +1670,7 @@ self.onmessage = async function(e) {
             }
             if (msg.rootfsData) {
                 emModule.FS.writeFile('/rootfs.tar', new Uint8Array(msg.rootfsData));
+                console.log(`[worker] rootfs loaded bytes=${msg.rootfsData.byteLength} memory=${JSON.stringify(getMemoryPressureSnapshot())}`);
             }
 
             if (msg.checkpointData) {
@@ -1542,7 +1679,9 @@ self.onmessage = async function(e) {
                 console.log('[worker] Checkpoint loaded (' + msg.checkpointData.byteLength + ' bytes)');
             }
 
+            console.log(`[worker] pre-callMain memory=${JSON.stringify(getMemoryPressureSnapshot())} args=${JSON.stringify(args)}`);
             await emModule.callMain(args);
+            console.log(`[worker] post-callMain memory=${JSON.stringify(getMemoryPressureSnapshot())}`);
             // Drain any process lifecycle events produced during normal run completion.
             drainProcessEvents();
             if (emModule._friscy_stopped && emModule._friscy_stopped()) {
@@ -1577,7 +1716,9 @@ self.onmessage = async function(e) {
             const recoverFn = isBadAlloc
                 ? emModule._friscy_evict_execute_segments
                 : emModule._friscy_recover_fault;
-            console.log(`[worker] recoverableRunFault=${recoverableRunFault} isBadAlloc=${isBadAlloc} recoverFnType=${typeof recoverFn} err=${errText}`);
+            console.log(
+                `[worker] recoverableRunFault=${recoverableRunFault} isBadAlloc=${isBadAlloc} recoverFnType=${typeof recoverFn} err=${errText} memory=${JSON.stringify(getMemoryPressureSnapshot())}`
+            );
             if (recoverableRunFault && typeof recoverFn === 'function') {
                 try {
                     logRuntimeState(`[worker] pre-recover escaped callMain fault (${errMsg})`);

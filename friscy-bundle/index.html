@@ -560,16 +560,15 @@
         <button id="search-close" title="Close (Escape)">&#x2715;</button>
     </div>
     <div class="tab-bar">
-        <button class="tab active" id="tab-alpine" data-example="alpine" title="Alpine Linux shell">
-            <img src="./alpine.svg" alt="" class="tab-icon">Alpine
+        <button class="tab active" id="tab-claude" data-example="claude-tui" title="Claude shell">
+            <img src="./claude-sparkle.svg" alt="" class="tab-icon">Claude
         </button>
-        <button class="tab" id="tab-nodejs" data-example="nodejs" title="Interactive Node.js REPL">
-            <img src="./nnode.svg" alt="" class="tab-icon">Node.js
+        <button class="tab" id="tab-gemini" data-example="gemini-tui" title="Gemini shell">
+            <img src="./webmcp-icon.svg" alt="" class="tab-icon">Gemini
         </button>
-        <button class="tab" id="tab-server" data-example="server" title="HTTP echo server on port 8080">
-            <img src="./golang.svg" alt="" class="tab-icon">Go Server
+        <button class="tab" id="tab-codex" data-example="codex" title="Codex shell">
+            <img src="./riscv.svg" alt="" class="tab-icon">Codex
         </button>
-
     </div>
     <div class="tab-strip-border"></div>
     <div id="terminal-container">
@@ -602,11 +601,11 @@
             </div>
             <div id="dual-terminal-container">
                 <div class="dual-pane primary">
-                    <div class="pane-label">Go Echo Server · port 8080</div>
+                    <div class="pane-label">Primary shell</div>
                     <div id="terminal-server" class="dual-term"></div>
                 </div>
                 <div class="dual-pane companion">
-                    <div class="pane-label">Alpine Shell · wget client</div>
+                    <div class="pane-label">Companion shell</div>
                     <div id="terminal-companion" class="dual-term"></div>
                 </div>
             </div>
@@ -656,6 +655,16 @@
         }
     </script>
 
+    <script>
+        // Make Claude the default landing example for GitHub Pages.
+        (function ensureDefaultExample() {
+            const u = new URL(location.href);
+            if (!u.searchParams.has('example')) {
+                u.searchParams.set('example', 'claude-tui');
+                location.replace(u.toString());
+            }
+        })();
+    </script>
     <script src="dist/bundle.js"></script>
 </body>
 </html>

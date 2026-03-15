@@ -545,3 +545,29 @@
 - Post-rebuild sanity check:
   - reran Gemini hard gate after wasm rebuild/sync.
   - result: PASS (`gemini-hard-gate-postrebuild.ckpt`, `85610364` bytes), fresh boot `20022ms`, resume `4367ms`.
+
+## 2026-03-15T04:15:00Z Browser runtime fix diary (Claude/Gemini/Codex)
+- Goal: finish wasm runtime stabilization, keep only contract guards, and move Pages default demos to real Claude/Gemini/Codex shells.
+- Decoder cache and fault-path cleanup:
+  - removed high-volume temporary diagnostics in `friscy-bundle/worker.js`, `runtime/main.cpp`, and `vendor/libriscv/lib/libriscv/decoder_cache.cpp`.
+  - retained OPFS return-contract guards (`[vh-opfs-contract]`) in `runtime/syscalls.hpp`, `runtime/vh_harness.hpp`, and `runtime/library_vectorheart.js`.
+- Matrix validation:
+  - ran `node tests/webshell_refresh_matrix_checkpoints.mjs`.
+  - all target profiles passed after manifest routing fix:
+    - `claude-version-post.ckpt` `149852420` bytes
+    - `codex-version-post.ckpt` `95640864` bytes
+    - `gemini-version-post.ckpt` `3550680` bytes
+- Root cause + regression note:
+  - an intermediate wasm rebuild regressed to `Execution space protection fault` because build profile flags drifted (`FRISCY_FORCE_WASM_ARENA=OFF` vs working `ON` profile).
+  - restored known-good bundle artifacts and kept runtime stable before proceeding.
+- Pages/profile switch:
+  - updated `friscy-bundle/manifest.json` to route `claude-tui`, `codex`, and `gemini-tui` to `claude-real.tar`, `codex-real.tar`, and `gemini-real.tar`.
+  - updated `friscy-bundle/index.html` tabs/default route to Claude/Gemini/Codex.
+  - removed hardcoded Anthropic key from `friscy-bundle/manifest.json` (set to empty/placeholder).
+- Release publishing:
+  - uploaded/verified real rootfs assets on release tag `runtime-rootfs-assets-20260313`:
+    - `claude-real.tar` sha256 `e08f11c373deb91f52cb1517a2e657810b72189fd9b3a063c4ae7f35230d5aa7`
+    - `codex-real.tar` sha256 `c86dac63e76b96f9c31b7635f1318d1ad923c94bfa246d87e37c417e7628e67a`
+    - `gemini-real.tar` sha256 `a25066e47d96617c99a9d66a1d3ed3202141131176db9c9eb10d5dfaf90b24c5`
+- Git safety follow-up:
+  - restored accidentally dropped `codex.tar` LFS pointer (without smudging large object) to keep repository history coherent.

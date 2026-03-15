@@ -28,17 +28,33 @@ jobs:
         with:
           lfs: false
 
-      - name: Fetch LFS objects
-        run: git lfs pull
-
-      - name: Validate LFS files are resolved (not pointer stubs)
+      - name: Hydrate required runtime assets (no LFS fetch)
         run: |
-          echo "Checking that all LFS-tracked files in friscy-bundle/ are resolved..."
+          set -euo pipefail
+          mkdir -p friscy-bundle
+          curl -fL --retry 3 --retry-delay 2 \
+            -o friscy-bundle/friscy.wasm \
+            "https://maceip.github.io/friscy/friscy.wasm"
+          curl -fL --retry 3 --retry-delay 2 \
+            -o friscy-bundle/claude-real.tar \
+            "https://github.com/maceip/friscy/releases/download/runtime-rootfs-assets-20260313/claude-real.tar"
+          curl -fL --retry 3 --retry-delay 2 \
+            -o friscy-bundle/codex-real.tar \
+            "https://github.com/maceip/friscy/releases/download/runtime-rootfs-assets-20260313/codex-real.tar"
+          curl -fL --retry 3 --retry-delay 2 \
+            -o friscy-bundle/gemini-real.tar \
+            "https://github.com/maceip/friscy/releases/download/runtime-rootfs-assets-20260313/gemini-real.tar"
+
+      - name: Validate required assets are real binaries
+        run: |
+          echo "Checking hydrated runtime assets in friscy-bundle/..."
           fail=0
-          count=0
-          for f in friscy-bundle/*.wasm friscy-bundle/*.tar friscy-bundle/*.ckpt; do
+          for f in \
+            friscy-bundle/friscy.wasm \
+            friscy-bundle/claude-real.tar \
+            friscy-bundle/codex-real.tar \
+            friscy-bundle/gemini-real.tar; do
             [ -f "$f" ] || continue
-            count=$((count + 1))
             if head -c 40 "$f" | grep -q 'version https://git-lfs'; then
               echo "ERROR: $f is an unresolved LFS pointer ($(wc -c < "$f") bytes)"
               fail=1
@@ -47,14 +63,9 @@ jobs:
               echo "OK: $f ($size bytes)"
             fi
           done
-          echo "Checked $count files."
-          if [ "$count" -eq 0 ]; then
-            echo "WARNING: No LFS-tracked files found in friscy-bundle/"
-          fi
           if [ "$fail" -eq 1 ]; then
             echo ""
-            echo "Deploy blocked: LFS files were not resolved."
-            echo "Run 'git lfs pull' and re-push, or check LFS bandwidth."
+            echo "Deploy blocked: required runtime assets were unresolved."
             exit 1
           fi
 

@@ -474,11 +474,57 @@ These enable SharedArrayBuffer. Without them, the entire architecture doesn't wo
 
 ---
 
-## Key References
+## Repos to Pull From (as of March 2026)
 
-- [WALI](https://github.com/arjunr2/WALI) — Syscall API spec + server-side runtime (MIT license)
-- [WasmLinux](https://github.com/okuoku/wasmlinux-project) — LKL kernel compiled to Wasm (reference implementation)
-- [LKL](https://github.com/lkl/linux) — Linux Kernel Library
-- [Loupe](https://dl.acm.org/doi/10.1145/3617232.3624861) — Dynamic syscall scoping methodology
-- [Browsix-Wasm](https://www.usenix.org/conference/atc19/presentation/jangda) — Wasm perf benchmarks, SAB syscall channel design
-- [Wasm memory-control proposal](https://github.com/WebAssembly/memory-control) — Future native mmap support in Wasm
+### Directly use (submodule or fork)
+
+| Repo | What | Why | Status |
+|---|---|---|---|
+| [arjunr2/WALI](https://github.com/arjunr2/WALI) | Syscall API spec + WAMR-based runtime | Defines the syscall interface contract. ~150 host functions mapping 1-to-1 to Linux syscalls. MIT license. 108 stars. Has a Rust target upstream (`wasm32-wali-linux-musl` in rustc). | Active — 33 commits as of Jan 2026, EuroSys 2025 paper |
+| [arjunr2/wali-musl](https://github.com/arjunr2/wali-musl) | musl libc patched for WALI | musl with syscall entry points wired to WALI imports. Use this as the libc for all compiled programs. | Active — companion to WALI |
+| [lkl/linux](https://github.com/lkl/linux) | Linux Kernel Library | The kernel compiled as a linkable library. `arch/lkl` is the architecture port. API is Linux syscall interface. Use as the kernel for the browser backend. | Active — lkl-docker updated Feb 2026 |
+| [mirror/busybox](https://github.com/mirror/busybox) | BusyBox source | Already supports NOMMU cross-compilation. Provides sh + coreutils. | Actively maintained upstream |
+| [nodejs/node](https://github.com/nodejs/node) | Node.js source (v20 LTS) | Fork v20.x branch, configure for Emscripten build with jitless V8. | Actively maintained upstream |
+
+### Use as reference implementation (study, adapt, don't submodule)
+
+| Repo | What | Learn from it |
+|---|---|---|
+| [joelseverin/linux-wasm](https://github.com/joelseverin/linux-wasm) | Full Linux kernel as Wasm arch target | **Best reference for kernel-to-Wasm.** Adds Wasm as a proper `arch/` in the kernel. Each process = Web Worker. Creative solution for scheduling (spin up a "CPU" per task, never preempt). Includes patched LLVM, musl, BusyBox build scripts. Has a [live demo](https://joelseverin.github.io/linux-wasm/). Boots in <1s. Announced Nov 2025, covered by [Phoronix](https://www.phoronix.com/news/Linux-Kernel-WebAssembly) and [LWN](https://lwn.net/Articles/1044787/). |
+| [okuoku/wasmlinux-project](https://github.com/okuoku/wasmlinux-project) | LKL kernel + musl + BusyBox → Wasm | **Best reference for LKL-to-Wasm specifically.** Uses pipeline: clang → wasm → wasm2c → Emscripten (needed for setjmp/longjmp). Has companion repos for [musl](https://github.com/okuoku/wasmlinux-musl) and [BusyBox](https://github.com/okuoku/wasmlinux-busybox) ports. Early PoC, 75 stars. [Live demo](https://wasmlinux-demo.pages.dev/). |
+| [k8188219/busybox_wasm](https://github.com/k8188219/busybox_wasm) | BusyBox compiled to Wasm via Emscripten | Build script reference for BusyBox → Wasm. Based on BusyBox v1.32.0. Currently no `sh`/`ash` (we'd need to add that). Shows which Emscripten flags work. |
+| [3p3r/busybox-wasm](https://github.com/3p3r/busybox-wasm) | BusyBox Wasm build scripts | Alternative build approach — not a full fork of BusyBox, just a build script overlay. Easier to upgrade BusyBox versions. |
+| [plasma-umass/browsix](https://github.com/plasma-umass/browsix) | Unix in the browser (2017) | **Process model reference.** TypeScript kernel, Worker-per-process, fork via memory copy, pipe via kernel-mediated buffer. Abandoned but architecture is proven (ASPLOS 2017 paper). ~1.5K stars. |
+
+### Specs and proposals to track
+
+| Repo | What | Relevance |
+|---|---|---|
+| [WebAssembly/memory-control](https://github.com/WebAssembly/memory-control) | memory.map, memory.unmap, memory.protect, memory.discard | Would replace the userspace mmap shim entirely when it ships |
+| [WebAssembly/threads](https://github.com/WebAssembly/threads) | Shared-everything threads proposal | Would enable pthreads within a single Wasm instance (no Worker overhead) |
+| [aspect-build/aspect-cli](https://github.com/aspect-build) | Bazel build rules for JS/Wasm | Build tooling reference (not directly related to runtime) |
+
+### Decision: joelseverin/linux-wasm vs okuoku/wasmlinux-project
+
+Both port the Linux kernel to Wasm. Key differences:
+
+| | joelseverin/linux-wasm | okuoku/wasmlinux-project |
+|---|---|---|
+| Approach | Wasm as a proper `arch/` in the kernel | LKL (kernel as library) |
+| Scheduling | 1 Web Worker per task (creative, scales) | Single-threaded runner |
+| Build pipeline | LLVM patches + direct Wasm | clang → wasm → wasm2c → Emscripten |
+| Maturity | PoC, boots + runs shell, crashes eventually | PoC, boots + runs BusyBox |
+| setjmp/longjmp | Uses LLVM patches | Uses wasm2c + Emscripten workaround |
+| Community | LWN coverage, HN discussion, growing | Smaller, author-driven |
+
+**Recommendation**: Start with **okuoku/wasmlinux-project** (LKL approach) because LKL's library model maps better to our architecture — the kernel is a callable library, not a standalone OS. Study **joelseverin/linux-wasm** for the Worker-per-process scheduling model and LLVM patches. If LKL's limitations become blocking, consider switching to joelseverin's approach.
+
+---
+
+## Papers & References
+
+- [WALI: Empowering WebAssembly with Thin Kernel Interfaces](https://dl.acm.org/doi/10.1145/3689031.3717470) — EuroSys 2025
+- [Browsix-Wasm / Not So Fast](https://www.usenix.org/conference/atc19/presentation/jangda) — ATC 2019. Wasm perf benchmarks, SAB syscall channel
+- [Loupe](https://dl.acm.org/doi/10.1145/3617232.3624861) — ASPLOS 2024. Dynamic syscall scoping
+- [Browsix](https://browsix.org/powers2017-browsix.pdf) — ASPLOS 2017. Unix process model in browser
+- [Wasm memory-control proposal](https://github.com/WebAssembly/memory-control) — Future native mmap

@@ -13,6 +13,8 @@ This plan describes a new project that:
 
 **Priority**: Browser backend (LKL + mmap shim) is the focus. Server backend (WALI passthrough) is designed for but implemented later.
 
+**This is a greenfield project — new repo, new codebase.** friscy is not being modified. The only things carried forward are reusable browser infrastructure (WebTransport bridge, SAB protocol, xterm.js terminal, Go proxy) which get copied into the new project.
+
 ---
 
 ## System Architecture
@@ -303,6 +305,71 @@ Everything else (libriscv, rv2wasm, JIT manager, AOT compiler) is not used.
 6. `bash -c "node claude.js 'write a haiku'"` → haiku output (full pipeline)
 7. Performance: `claude --version` < 15s (vs ~40s friscy)
 8. Same .wasm binaries produce identical results on browser and server backends
+
+## Required & Targeted Wasm/Browser Features
+
+These are the modern browser capabilities this architecture depends on or benefits from. Browsix (2017) didn't have any of them — they're the reason this design is viable now.
+
+### Required (must have)
+
+| Feature | What it enables | Browser support |
+|---|---|---|
+| **SharedArrayBuffer** | Syscall channel between program Workers and kernel Worker. Atomics.wait/notify for blocking. | All major browsers with COOP/COEP headers |
+| **Atomics.wait / Atomics.notify** | Blocking syscalls in Workers without spinning | All major browsers |
+| **Bulk memory operations** (`memory.copy`, `memory.fill`) | Fast fork() via memory copy, memset for mmap zeroing | All major browsers |
+| **WebAssembly.compileStreaming** | Stream-compile node.wasm (~50-80MB) while downloading, not after | All major browsers |
+| **Web Workers** | One Worker per process — process isolation model | All major browsers |
+
+### Strongly recommended (use if available, degrade gracefully)
+
+| Feature | What it enables | Browser support |
+|---|---|---|
+| **memory64** | >4GB address space for V8's pointer cage. Without it, must use `v8_enable_pointer_compression` and stay under 4GB. | Chrome 133+, Firefox 134+, Safari 18.2+ |
+| **JSPI** (JS Promise Integration) | Node.js libuv async I/O: Wasm suspends on Promise, resumes on resolve. Without it, must use Asyncify (10-30% overhead). | Chrome 126+, Firefox behind flag |
+| **Wasm SIMD** (`v128` ops) | Accelerate memory copies for fork(), bulk data operations, crypto | All major browsers |
+| **Wasm tail calls** (`return_call`) | Efficient dispatch loops in LKL kernel and V8 Ignition interpreter | Chrome 112+, Firefox 121+, Safari 18+ |
+| **Wasm exception handling** (`try_table`, `exnref`) | LKL kernel uses setjmp/longjmp internally; Wasm exceptions avoid costly JS boundary crossing for these | Chrome 127+, Firefox 129+, Safari 18+ |
+| **Atomics.waitAsync** | Kernel on main thread can await Worker results without blocking the UI thread | All major browsers |
+| **OPFS** (Origin Private File System) | Cache compiled .wasm modules and rootfs for instant second-load. Persistent VFS storage. | All major browsers |
+
+### Future (watch and adopt when available)
+
+| Feature | What it enables | Status |
+|---|---|---|
+| **memory-control proposal** (`memory.map`, `memory.unmap`, `memory.protect`, `memory.discard`) | Native mmap semantics in Wasm — would replace the userspace mmap shim entirely | [Phase 1 proposal](https://github.com/WebAssembly/memory-control) |
+| **Wasm threads proposal** (shared-everything) | True shared-memory threads within a single Wasm instance — would enable pthreads without separate Workers | Active development |
+| **Wasm GC** | Could help with managed-language interop if we ever target non-C/C++ programs | Shipping in Chrome/Firefox |
+| **Component Model** | Clean inter-module linking — could replace manual dynamic linking of .wasm "shared libraries" | Active development |
+| **WasmFX** (typed continuations / effect handlers) | Elegant stack switching for coroutines, green threads, signal delivery | Early proposal |
+
+### Compile flags (Emscripten)
+
+All .wasm binaries (kernel, busybox, node) should be compiled with:
+```
+-msimd128                    # SIMD for fast memory ops
+-mtail-call                  # tail calls for dispatch loops
+-mbulk-memory                # memory.copy / memory.fill
+-matomics                    # atomic ops for SAB coordination
+-fwasm-exceptions            # native Wasm exceptions (not JS)
+-sWASM_LEGACY_EXCEPTIONS=0   # no legacy exception mode
+-sSHARED_MEMORY=1            # enable SharedArrayBuffer
+-sALLOW_MEMORY_GROWTH=1      # dynamic memory growth
+```
+
+For memory64 targets, add:
+```
+-sMEMORY64=1                 # 64-bit memory indexing
+```
+
+### Required HTTP headers
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: credentialless
+```
+These enable SharedArrayBuffer. Without them, the entire architecture doesn't work.
+
+---
 
 ## Key References
 

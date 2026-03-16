@@ -2,18 +2,16 @@
 
 ## Context
 
-friscy's RISC-V emulation approach hits a fundamental ceiling: ~3.4B emulated instructions for `claude --version`, with V8 running jitless through an ISA translation layer. No amount of JIT optimization eliminates the per-instruction emulation tax.
+Running large Node.js applications (Claude, Codex, Gemini CLI — each ~20MB of JavaScript) in a browser requires a Linux-compatible environment that doesn't pay a per-instruction emulation tax. ISA emulation approaches (RISC-V, x86) hit a fundamental ceiling because every guest CPU instruction must be decoded and translated, costing billions of emulation events for real workloads.
 
-This plan describes a new project that:
-1. Compiles programs (bash, Node.js/V8) from C/C++ source directly to Wasm — zero ISA emulation
+This is a greenfield project that eliminates ISA emulation entirely:
+1. Compiles programs (bash, Node.js/V8) from C/C++ source directly to Wasm — zero CPU emulation
 2. Runs a real Linux kernel (LKL) compiled to Wasm in the browser for battle-tested syscall handling
 3. Implements userspace mmap/munmap/mprotect shim (the kernel can't do virtual memory in Wasm, but V8 needs the mmap API)
 4. Uses WALI's syscall API spec as the interface, enabling a second server-side backend where syscalls pass through to a real Linux kernel
 5. A middleware layer selects the backend; programs and users see identical behavior either way
 
 **Priority**: Browser backend (LKL + mmap shim) is the focus. Server backend (WALI passthrough) is designed for but implemented later.
-
-**This is a greenfield project — new repo, new codebase.** friscy is not being modified. The only things carried forward are reusable browser infrastructure (WebTransport bridge, SAB protocol, xterm.js terminal, Go proxy) which get copied into the new project.
 
 ---
 
@@ -82,9 +80,9 @@ Compile the Linux kernel via [LKL (Linux Kernel Library)](https://github.com/lkl
 - Demand paging → not needed (Wasm linear memory is always committed)
 
 **Kernel I/O backends** (bridge kernel to browser APIs):
-- Block device → in-memory tar rootfs (same concept as friscy's VFS)
-- Network → WebTransport bridge (reuse from friscy)
-- Console → SharedArrayBuffer stdin/stdout ring buffer (reuse from friscy)
+- Block device → in-memory tar rootfs
+- Network → WebTransport bridge to external proxy
+- Console → SharedArrayBuffer stdin/stdout ring buffer
 - Random → browser crypto.getRandomValues()
 - Clock → performance.now()
 
@@ -202,7 +200,7 @@ Kernel Worker receives syscall:
 - V8 flags: `--jitless`, `v8_enable_pointer_compression=true` (or memory64), `icu_small=true`
 - libuv: JSPI-based async I/O (suspend Wasm on Promise, resume on resolve)
 - OpenSSL: BoringSSL or Emscripten's port
-- DNS: hypercall to browser (same as friscy)
+- DNS: hypercall to browser
 - Difficulty: High — V8 Torque builtins need C++ fallback stubs
 - Output: node.wasm (~50-80MB, gzips to ~10-15MB)
 - The mmap shim (Component 2) is critical for V8 — without it V8 cannot initialize
@@ -227,20 +225,6 @@ The middleware selects backend at launch. In server mode:
 **Rootfs consistency**: Both backends should use the same rootfs.tar, at least initially. Security and customer validation concerns require that the environment is identical regardless of backend. Whether the server backend can optionally use its own filesystem is a future decision that needs more thought.
 
 **Startup model**: Offline-first with server acceleration. Browser backend is the default and must work standalone. Server backend is an optional accelerator when available. The reverse (server-first with browser fallback) is also useful and the middleware should support both modes, but offline-first is the priority for MVP.
-
----
-
-## What Gets Reused From friscy
-
-| Component | friscy source | Reuse |
-|---|---|---|
-| WebTransport bridge | `network_bridge.js` | Direct — kernel's network backend |
-| Network RPC | `network_rpc_host.js` | Direct |
-| SAB stdin/stdout | `index.html`, `worker.js` | Direct — kernel's console backend |
-| Terminal UI | `index.html` (xterm.js) | Direct |
-| Go WebTransport proxy | proxy server | Direct |
-
-Everything else (libriscv, rv2wasm, JIT manager, AOT compiler) is not used.
 
 ---
 
@@ -303,7 +287,7 @@ Everything else (libriscv, rv2wasm, JIT manager, AOT compiler) is not used.
 4. `node -e "require('fs').readdirSync('/')"` → rootfs listing (Node.js fs → kernel VFS)
 5. `node -e "fetch('https://httpbin.org/get')"` → HTTP response (kernel net → WebTransport)
 6. `bash -c "node claude.js 'write a haiku'"` → haiku output (full pipeline)
-7. Performance: `claude --version` < 15s (vs ~40s friscy)
+7. Performance: `claude --version` < 15s
 8. Same .wasm binaries produce identical results on browser and server backends
 
 ## Required & Targeted Wasm/Browser Features

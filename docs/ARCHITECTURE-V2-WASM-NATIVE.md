@@ -538,6 +538,8 @@ If Wasm had `memory.map(offset, len, prot, flags)`, `memory.unmap(offset, len)`,
 
 The [memory-control proposal](https://github.com/WebAssembly/memory-control) exists but is Phase 1. Lobbying for this is the single highest-leverage standards effort.
 
+**How browsers would change:** The memory-control proposal has a [`virtual` sub-proposal](https://github.com/WebAssembly/memory-control/blob/main/proposals/memory-control/virtual.md) that specifies exactly this. It adds three new Wasm instructions: `memory.map` (commit pages with a protection level: `none`, `read`, or `readwrite`), `memory.unmap` (decommit pages), and `memory.protect` (change protection on mapped pages). On instantiation, the engine would reserve the full address space with `mmap(MAP_FIXED, PROT_NONE)` on Unix or `VirtualAlloc(MEM_RESERVE)` on Windows, but commit nothing. Each `memory.map` call commits pages via `mmap(MAP_FIXED, <prot>)` or `VirtualAlloc(MEM_COMMIT)`. This maps directly onto OS primitives every browser engine already uses internally — V8, SpiderMonkey, and JavaScriptCore all manage virtual memory reservations for their own heaps. The hard part is spec design, not implementation: the [`memory.discard`](https://github.com/WebAssembly/memory-control/blob/main/proposals/memory-control/discard.md) sub-instruction (semantically `madvise(MADV_DONTNEED)`) is the simplest piece and may ship first. SpiderMonkey already has a prototype using opcode `0xfc 0x12`. The blocker is consensus — some Wasm hosts (embedded, serverless) don't want to expose virtual memory at all, and the proposal must accommodate them with a graceful fallback. Champions: Ryan Hunt (Mozilla), Jakob Kummerow (Google). Phase 1 as of March 2026.
+
 ### 2. Shared-everything threads (not just shared memory) — **ELIMINATES WORKER-PER-PROCESS OVERHEAD**
 
 **Impact: Large.** Today, each "process" must be a separate Web Worker because Wasm instances can't share mutable state except through SharedArrayBuffer. Every fork() or exec() means:
@@ -553,7 +555,9 @@ If Wasm had real threads with shared linear memory within a single instance:
 - The kernel, shell, and node all share memory naturally
 - Process isolation is still provided by Wasm's type safety — you don't need separate instances for sandboxing
 
-The [shared-everything threads proposal](https://github.com/WebAssembly/threads) is in active development. This would make the architecture dramatically simpler and faster.
+The [shared-everything threads proposal](https://github.com/WebAssembly/shared-everything-threads) is in active development. This would make the architecture dramatically simpler and faster.
+
+**How browsers would change:** The [shared-everything-threads proposal](https://github.com/WebAssembly/shared-everything-threads) extends the existing threads spec (Phase 4, shipping in all browsers) with `shared` annotations on tables, functions, globals, and GC types — not just memory. Browser engines would need to: (1) allow multiple threads to call into the same Wasm instance's functions concurrently (today each instance is single-threaded), (2) implement thread-local globals (`thread_local` storage per Worker/thread), (3) add sequentially consistent and release-acquire atomic access instructions for shared Wasm GC objects, and (4) implement managed waiter queues (a futex-like wait/notify mechanism that works with GC references, not just linear memory). V8, SpiderMonkey, and JSC already have multi-threaded runtimes — the engine infrastructure exists, but the Wasm type system needs to be extended to express which data is safe to share. This is described as a "gargantuan umbrella" effort. Champions: Conrad Watt (Cambridge), Andrew Brown (Intel), Thomas Lively (Google). Phase 1 as of March 2026, expected to advance to Phase 2 around the WASI 0.3/1.0 milestone. Chrome has a [tracking entry](https://chromestatus.com/feature/5163209685467136).
 
 ### 3. Larger default linear memory or multiple memories — **REMOVES THE 4GB CEILING**
 
@@ -565,6 +569,8 @@ The [shared-everything threads proposal](https://github.com/WebAssembly/threads)
 What we'd want: either make memory64 zero-overhead (engines optimize 64-bit addresses to 32-bit when the heap is <4GB), or allow multiple linear memories that can be independently sized and mapped.
 
 memory64 exists today, but engines haven't optimized the "small heap with 64-bit pointers" case yet. The address masking overhead is ~5-15% on memory-intensive workloads. If engines special-cased heaps under 4GB to use 32-bit addressing with 64-bit pointers, this cost vanishes.
+
+**How browsers would change:** Two things already exist that partially solve this. First, [memory64](https://github.com/WebAssembly/memory64) shipped in Chrome 133+, Firefox 134+, and Safari 18.2+ as part of [Wasm 3.0](https://webassembly.org/news/2025-09-17-wasm-3.0/) (September 2025) — so the >4GB address space is available today. Second, [multi-memory](https://github.com/WebAssembly/multi-memory) reached Phase 5 (fully standardized) and ships in Chrome and Firefox, with Safari expected in 2026. The missing piece is **engine optimization for memory64 small heaps**. As [SpiderMonkey's blog explains](https://spidermonkey.dev/blog/2025/01/15/is-memory64-actually-worth-using.html), 32-bit Wasm gets free bounds-check elimination because engines reserve 4GB of virtual address space and any 32-bit index lands inside it. Memory64 can't do this trick — every load/store needs an explicit bounds check, adding ~10-15% overhead. The fix is an engine-internal optimization: when a memory64 heap is actually <4GB, use the same 4GB-reservation trick with 32-bit addressing internally while exposing 64-bit pointers to Wasm code. This is a JIT compiler change inside V8/SpiderMonkey/JSC — no spec change needed, just engine work. Until then, the practical workaround is `v8_enable_pointer_compression=true` on wasm32 to stay under 4GB.
 
 ### 4. `setjmp`/`longjmp` as Wasm primitives — **UNBLOCKS DIRECT KERNEL COMPILATION**
 
@@ -580,6 +586,8 @@ If Wasm had `stack.save()` → token and `stack.restore(token)` instructions:
 - No wasm2c detour
 - The [WasmFX typed continuations proposal](https://github.com/WebAssembly/stack-switching) would solve this — it's designed for exactly these stack-switching patterns
 
+**How browsers would change:** The [stack-switching proposal](https://github.com/WebAssembly/stack-switching) (aka WasmFX / typed continuations) is at **Phase 3** and is actively being implemented in Chrome (V8) and Firefox (SpiderMonkey). It adds new Wasm instructions: `cont.new` (create a continuation from a function ref), `resume` (resume a suspended continuation), `suspend` (suspend execution up to the nearest handler), and `switch` (symmetric switching between two continuations). The key engine change is managing multiple Wasm execution stacks — today each Wasm instance has one stack; with this proposal, engines allocate and switch between multiple stacks, each representing a continuation. For setjmp/longjmp specifically: `setjmp` would create a continuation (`cont.new`), and `longjmp` would `resume` it, unwinding back to the save point. This is more general than setjmp — it's a universal mechanism for coroutines, async/await, generators, and green threads. The engine work is substantial (stack allocation, stack walking for GC, debugger integration with multiple stacks) but V8 and SpiderMonkey are already doing it. Led by Sam Lindley (Edinburgh), Daniel Hillerström, and Andreas Rossberg. The academic foundation is the OOPSLA 2023 paper ["Continuing WebAssembly with Effect Handlers"](https://dl.acm.org/doi/10.1145/3622814), with formal verification work in a [November 2025 draft](https://homepages.inf.ed.ac.uk/slindley/papers/iris-wasmfx-draft-november2025.pdf). See also [wasmfx.dev](https://wasmfx.dev/).
+
 ### 5. Synchronous I/O from Workers without JSPI — **SIMPLIFIES THE BLOCKING MODEL**
 
 **Impact: Moderate.** Workers can block on `Atomics.wait()`, but they can't make synchronous calls to browser APIs (fetch, WebTransport, IndexedDB). JSPI partially solves this by suspending the Wasm stack on a Promise, but:
@@ -590,6 +598,8 @@ If Wasm had `stack.save()` → token and `stack.restore(token)` instructions:
 What we'd want: a way for a Worker to make a blocking call to a browser API that suspends only the calling Wasm function, not the entire stack. Something like `Atomics.waitOnPromise(promise)` — block the Worker until a Promise resolves, return the result synchronously.
 
 This would eliminate the entire SAB-based RPC layer for network I/O. Instead of Worker → SAB → main thread → fetch → SAB → Worker, it's just Worker → blocking fetch → result.
+
+**How browsers would change:** The closest existing proposal is [JSPI (JS Promise Integration)](https://github.com/WebAssembly/js-promise-integration), which reached **Phase 4** (standardized, April 2025) and ships in Chrome 137+ and Firefox 139+. JSPI lets a Wasm function call a JS import that returns a Promise, and the Wasm stack suspends until the Promise resolves. This is close to what we want, but has limitations: it suspends the *entire* Wasm call stack (not just the calling function), it can't be used from SharedArrayBuffer-backed threads, and re-entrancy is the caller's problem. Safari [removed their objection](https://github.com/web-platform-tests/interop/issues/1093) in late 2025 and has someone assigned to implement it. What we'd *really* want beyond JSPI is something like `Atomics.waitOnPromise(promise)` — a primitive that blocks a Worker thread until a Promise resolves, returning the result synchronously. No TC39 proposal for this exists yet. [`Atomics.waitAsync`](https://github.com/tc39/proposal-atomics-wait-async) (shipping in all browsers, part of ES2024) solves the opposite direction: letting the main thread wait asynchronously. The gap is: there's no way to wait *synchronously* on an *async* result from a Worker. For now, the SAB RPC pattern (Worker → Atomics.wait, main thread → do async work → Atomics.notify) remains the only option for truly blocking I/O from a Worker.
 
 ### 6. Faster Worker spawn and Wasm module transfer — **MAKES FORK/EXEC FAST**
 
@@ -602,6 +612,8 @@ What we'd want:
 
 `WebAssembly.compileStreaming` + OPFS caching gets us partway there, but the Worker startup cost remains. A pre-compiled module cache that persists across page loads and can be instantiated without re-validation would make exec() near-instant.
 
+**How browsers would change:** Two existing proposals help here. First, the [TC39 ESM Phase Imports proposal](https://github.com/tc39/proposal-esm-phase-imports) (building on [Source Phase Imports](https://github.com/tc39/proposal-source-phase-imports), Stage 3) enables `import source myModule from "./worker.wasm"` — a static import that gives you a compiled module handle you can pass directly to `new Worker(myModule)`. This makes worker creation statically analyzable and enables bundlers to pre-compile worker modules. Node.js is already [implementing this](https://github.com/nodejs/node/pull/56919). Second, the [Wasm ESM Integration proposal](https://github.com/WebAssembly/esm-integration) lets `.wasm` files be imported like ES modules, meaning the browser can compile and cache them using the same module caching infrastructure it uses for JS. The engine change we'd want beyond these: a persistent compiled-module cache keyed by content hash, stored in OPFS or the HTTP cache, that skips revalidation on subsequent page loads. V8's code cache already does this for JS — extending it to Wasm modules with a stable serialization format would make `exec()` near-instant after first load. Chrome has partial support via `WebAssembly.compileStreaming` caching, but it's not guaranteed across navigations.
+
 ### 7. Hardware-enforced memory protection within linear memory — **REAL GUARD PAGES**
 
 **Impact: Small-moderate.** V8 uses mprotect(PROT_NONE) to create guard pages for stack overflow detection and heap boundary checks. Our mmap shim can track these in software, but can't actually trap on access — we'd need to instrument every memory access with a bounds check, which is prohibitively expensive.
@@ -613,17 +625,19 @@ memory.protect(offset, len, NONE)  // any access to [offset, offset+len) traps
 
 This is part of the memory-control proposal but worth calling out separately — even without full mmap, just having `memory.protect` for guard pages would make V8 significantly more correct and let us drop the `--jitless` requirement sooner.
 
+**How browsers would change:** This is the [`static-protection` sub-proposal](https://github.com/WebAssembly/memory-control/blob/main/proposals/memory-control/static-protection.md) within memory-control. It splits Wasm linear memory into three ordered sections: no-access (traps on any read/write), read-only (traps on write), and read-write. The ordering constraint (no-access < read-only < read-write) is deliberate — it means protection can be enforced with just two bounds checks per access, not a per-page lookup. On hardware with virtual memory (all modern browsers), the engine maps the no-access region as `PROT_NONE` and the read-only region as `PROT_READ` using the OS — zero runtime cost, hardware traps on violation. On hosts without virtual memory (embedded), the bounds-check fallback still works correctly, just with a small overhead. This is the most implementation-friendly piece of the memory-control proposal because it doesn't require dynamic `mmap`/`munmap` — the protection boundaries are set at instantiation time. Browser engines already set up guard pages around Wasm memory (for bounds-check elimination); extending this to support configurable guard regions within the memory is a modest change to the memory allocation path. This sub-proposal could realistically ship independently of the full `virtual` mode, giving us guard pages years before full mmap support lands.
+
 ### Summary: Priority Order for Standards Advocacy
 
-| Priority | Proposal | Impact on this project | Current status |
-|---|---|---|---|
-| 1 | memory-control (mmap/mprotect/munmap) | Eliminates hardest component | Phase 1 |
-| 2 | Shared-everything threads | Eliminates Worker-per-process model | Active development |
-| 3 | memory64 engine optimization | Removes 4GB address space workarounds | memory64 shipped, optimization pending |
-| 4 | Stack switching / WasmFX | Unblocks direct kernel compilation | Phase 1 |
-| 5 | Synchronous Worker I/O | Simplifies blocking/networking | No proposal yet |
-| 6 | Fast Worker + module caching | Makes fork/exec fast | Partial (OPFS exists) |
-| 7 | memory.protect (subset of #1) | Real guard pages for V8 | Part of memory-control |
+| Priority | Proposal | Impact on this project | Current status | Link |
+|---|---|---|---|---|
+| 1 | memory-control (mmap/mprotect/munmap) | Eliminates hardest component | Phase 1 | [WebAssembly/memory-control](https://github.com/WebAssembly/memory-control) |
+| 2 | Shared-everything threads | Eliminates Worker-per-process model | Phase 1, advancing | [WebAssembly/shared-everything-threads](https://github.com/WebAssembly/shared-everything-threads) |
+| 3 | memory64 engine optimization | Removes 4GB address space workarounds | Shipped (Wasm 3.0), engine optimization pending | [SpiderMonkey analysis](https://spidermonkey.dev/blog/2025/01/15/is-memory64-actually-worth-using.html) |
+| 4 | Stack switching / WasmFX | Unblocks direct kernel compilation | **Phase 3**, V8 + SpiderMonkey implementing | [WebAssembly/stack-switching](https://github.com/WebAssembly/stack-switching) |
+| 5 | JSPI + synchronous Worker I/O | Simplifies blocking/networking | JSPI **Phase 4** (shipped Chrome 137+); sync-on-Promise: no proposal | [WebAssembly/js-promise-integration](https://github.com/WebAssembly/js-promise-integration) |
+| 6 | Fast Worker + module caching | Makes fork/exec fast | ESM Source Phase Imports at TC39 Stage 3 | [tc39/proposal-source-phase-imports](https://github.com/tc39/proposal-source-phase-imports) |
+| 7 | memory.protect (subset of #1) | Real guard pages for V8 | Part of memory-control Phase 1 | [static-protection sub-proposal](https://github.com/WebAssembly/memory-control/blob/main/proposals/memory-control/static-protection.md) |
 
 If only one thing ships, make it **memory-control**. It single-handedly removes the project's riskiest component and closes the biggest gap between browser and native execution.
 

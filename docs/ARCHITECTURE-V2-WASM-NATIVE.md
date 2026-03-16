@@ -228,6 +228,125 @@ The middleware selects backend at launch. In server mode:
 
 ---
 
+## Project Structure
+
+```
+project-root/
+├── docs/
+│   └── ARCHITECTURE.md              # this file
+│
+├── kernel/                           # LKL kernel compiled to Wasm
+│   ├── lkl/                         # LKL source (git submodule of github.com/lkl/linux)
+│   ├── backends/                    # Kernel I/O backends for browser
+│   │   ├── block.c                  # In-memory tar block device
+│   │   ├── console.c               # SAB-based stdin/stdout
+│   │   ├── net.c                    # WebTransport network backend
+│   │   └── random.c                # crypto.getRandomValues() bridge
+│   ├── CMakeLists.txt               # Build: LKL → Wasm (via wasm2c + Emscripten or direct)
+│   └── kernel.wasm                  # Output
+│
+├── mmap-shim/                        # Userspace mmap/munmap/mprotect
+│   ├── mmap.c                       # Allocator in Wasm linear memory
+│   ├── mmap.h                       # API
+│   └── tests/                       # mmap test suite (standalone, no kernel needed)
+│
+├── middleware/                       # Syscall dispatch + backend selection
+│   ├── syscall.h                    # WALI-spec syscall interface (C header)
+│   ├── syscall_browser.c           # Browser backend: route to LKL kernel + mmap shim
+│   ├── syscall_server.c            # Server backend: WALI passthrough (future)
+│   ├── process.js                   # Process manager: Worker lifecycle, exec(), fork()
+│   ├── fd_table.js                  # File descriptor table (inherited across fork/exec)
+│   └── loader.js                    # Backend detection + initialization
+│
+├── programs/                         # Wasm-compiled userspace programs
+│   ├── busybox/
+│   │   ├── busybox/                 # Busybox source (git submodule)
+│   │   ├── config                   # Busybox .config (NOMMU, selected applets)
+│   │   ├── Makefile                 # Build: busybox → busybox.wasm
+│   │   └── busybox.wasm             # Output
+│   └── node/
+│       ├── node/                    # Node.js source (git submodule, v20 LTS)
+│       ├── v8_patches/              # V8 patches for Wasm target (jitless, builtins)
+│       ├── libuv_jspi.c             # libuv port using JSPI for async
+│       ├── Makefile                 # Build: node → node.wasm
+│       └── node.wasm                # Output (~50-80MB)
+│
+├── runtime/                          # Browser runtime (JS/TS)
+│   ├── index.html                   # Entry point, xterm.js terminal
+│   ├── kernel_worker.js             # Worker running LKL kernel.wasm
+│   ├── process_worker.js            # Worker template for user processes
+│   ├── sab_protocol.js             # SharedArrayBuffer layout + helpers
+│   ├── network_bridge.js           # WebTransport → kernel network backend
+│   └── opfs_cache.js               # OPFS-based .wasm module cache
+│
+├── rootfs/                           # Root filesystem
+│   ├── Makefile                     # Build: assemble rootfs.tar from programs/ outputs
+│   ├── overlay/                     # Static files: /etc/passwd, /etc/hostname, etc.
+│   └── rootfs.tar                   # Output
+│
+├── proxy/                            # WebTransport → TCP proxy (Go)
+│   ├── main.go
+│   └── Dockerfile
+│
+├── tests/
+│   ├── test_echo.js                 # echo hello | cat
+│   ├── test_node_hello.js           # node -e "console.log(1+1)"
+│   ├── test_mmap.js                 # mmap shim correctness
+│   ├── test_pipe.js                 # pipe between processes
+│   ├── test_exec.js                 # bash exec node
+│   └── test_e2e.js                  # Full pipeline: bash → node → claude
+│
+├── Makefile                          # Top-level: build kernel, programs, rootfs, bundle
+├── package.json                      # Dev server, test runner
+└── .github/
+    └── workflows/
+        └── ci.yml                   # Build + test on push
+```
+
+### Getting Started (Bootstrap)
+
+```bash
+# 1. Create the repo
+mkdir <project-name> && cd <project-name>
+git init
+
+# 2. Copy this architecture doc
+mkdir docs
+cp ARCHITECTURE.md docs/
+
+# 3. Add LKL as a submodule
+git submodule add https://github.com/lkl/linux.git kernel/lkl
+
+# 4. Add busybox as a submodule
+git submodule add https://github.com/mirror/busybox.git programs/busybox/busybox
+
+# 5. Add Node.js as a submodule (v20 LTS branch)
+git submodule add -b v20.x https://github.com/nodejs/node.git programs/node/node
+
+# 6. Install Emscripten (needed for all Wasm compilation)
+git clone https://github.com/emscripten-core/emsdk.git
+cd emsdk && ./emsdk install latest && ./emsdk activate latest
+source ./emsdk_env.sh
+cd ..
+
+# 7. Scaffold the project
+mkdir -p kernel/backends mmap-shim/tests middleware programs runtime rootfs/overlay proxy tests
+
+# 8. Start with Phase 1: get LKL kernel compiling to Wasm
+# Reference: https://github.com/okuoku/wasmlinux-project
+```
+
+### Build Order
+
+1. **kernel.wasm** — LKL compiled to Wasm (Phase 1)
+2. **busybox.wasm** — busybox compiled to Wasm, linked against middleware syscall shim (Phase 2)
+3. **mmap shim** — standalone tests first, then integrated (Phase 3)
+4. **node.wasm** — Node.js compiled to Wasm, depends on mmap shim (Phase 4)
+5. **rootfs.tar** — assembled from busybox.wasm + node.wasm + overlay files
+6. **runtime bundle** — HTML + JS + kernel.wasm + rootfs.tar (Phase 5)
+
+---
+
 ## Implementation Phases
 
 ### Phase 1: LKL Kernel to Wasm (3-4 weeks)

@@ -521,6 +521,114 @@ Both port the Linux kernel to Wasm. Key differences:
 
 ---
 
+## If We Had a Magic Wand: Browser/Wasm Changes That Would Transform This
+
+This section describes what we'd ask browser vendors and the Wasm CG to change if we could wave a magic wand. Ordered by impact — the first item alone would eliminate entire layers of this architecture.
+
+### 1. Native `mmap`/`mprotect`/`munmap` in Wasm (memory-control proposal) — **ELIMINATES THE MMAP SHIM**
+
+**Impact: Massive.** The single hardest engineering problem in this entire project is the userspace mmap shim. V8 makes ~thousands of mmap calls during startup with subtle expectations about address placement, guard pages, MAP_FIXED semantics, and PROT_NONE regions. Our shim has to faithfully reimplement all of it as a userspace allocator — a fragile surface area that will generate the majority of bugs.
+
+If Wasm had `memory.map(offset, len, prot, flags)`, `memory.unmap(offset, len)`, and `memory.protect(offset, len, prot)` as native instructions:
+- The entire mmap shim (Component 2) disappears
+- V8's memory management works unmodified
+- Fork becomes cheaper (COW semantics possible with `memory.map` + shared backing)
+- `--jitless` might no longer be necessary — V8 could mprotect code pages to PROT_EXEC and JIT normally
+- The gap between browser and server backends shrinks dramatically
+
+The [memory-control proposal](https://github.com/WebAssembly/memory-control) exists but is Phase 1. Lobbying for this is the single highest-leverage standards effort.
+
+### 2. Shared-everything threads (not just shared memory) — **ELIMINATES WORKER-PER-PROCESS OVERHEAD**
+
+**Impact: Large.** Today, each "process" must be a separate Web Worker because Wasm instances can't share mutable state except through SharedArrayBuffer. Every fork() or exec() means:
+- Spawning a new Worker (~5-50ms)
+- Compiling/instantiating a new Wasm module in that Worker
+- Copying linear memory for fork (~10-50ms for a large V8 heap)
+- Cross-Worker syscall RPCs through SAB with Atomics round-trips
+
+If Wasm had real threads with shared linear memory within a single instance:
+- fork() becomes a new thread, not a new Worker — microseconds, not milliseconds
+- pthreads works natively (Node.js worker_threads, V8 internal threading)
+- Syscall dispatch is a function call, not an SAB round-trip
+- The kernel, shell, and node all share memory naturally
+- Process isolation is still provided by Wasm's type safety — you don't need separate instances for sandboxing
+
+The [shared-everything threads proposal](https://github.com/WebAssembly/threads) is in active development. This would make the architecture dramatically simpler and faster.
+
+### 3. Larger default linear memory or multiple memories — **REMOVES THE 4GB CEILING**
+
+**Impact: Large for V8, moderate otherwise.** The wasm32 4GB address space limit is a hard constraint. V8 wants a 4GB pointer cage just for itself, plus heap, plus stack, plus kernel data structures. We're forced into either:
+- memory64 (supported but adds 8-byte pointer overhead everywhere)
+- Aggressive pointer compression (`v8_enable_pointer_compression`) to stay under 4GB
+- Splitting V8's address space across multiple Wasm memories (fragile, non-standard)
+
+What we'd want: either make memory64 zero-overhead (engines optimize 64-bit addresses to 32-bit when the heap is <4GB), or allow multiple linear memories that can be independently sized and mapped.
+
+memory64 exists today, but engines haven't optimized the "small heap with 64-bit pointers" case yet. The address masking overhead is ~5-15% on memory-intensive workloads. If engines special-cased heaps under 4GB to use 32-bit addressing with 64-bit pointers, this cost vanishes.
+
+### 4. `setjmp`/`longjmp` as Wasm primitives — **UNBLOCKS DIRECT KERNEL COMPILATION**
+
+**Impact: Moderate.** The Linux kernel uses `setjmp`/`longjmp` pervasively (error recovery, context switching). Wasm has no native equivalent. Current workarounds:
+- Emscripten Asyncify: instruments all functions with save/restore points (~10-30% code size and perf overhead)
+- wasm2c: compile Wasm to C, then compile C with Emscripten (gains setjmp support but adds a translation layer)
+- Wasm exceptions: can emulate longjmp via throw/catch, but doesn't handle the save/restore of registers that setjmp needs
+- LLVM patches (joelseverin): custom LLVM backend that emits setjmp-compatible Wasm (not upstreamable)
+
+If Wasm had `stack.save()` → token and `stack.restore(token)` instructions:
+- LKL compiles directly to Wasm with no intermediate steps
+- No Asyncify overhead
+- No wasm2c detour
+- The [WasmFX typed continuations proposal](https://github.com/WebAssembly/stack-switching) would solve this — it's designed for exactly these stack-switching patterns
+
+### 5. Synchronous I/O from Workers without JSPI — **SIMPLIFIES THE BLOCKING MODEL**
+
+**Impact: Moderate.** Workers can block on `Atomics.wait()`, but they can't make synchronous calls to browser APIs (fetch, WebTransport, IndexedDB). JSPI partially solves this by suspending the Wasm stack on a Promise, but:
+- JSPI suspends the *entire* Wasm call stack, not just the current coroutine
+- Only one suspension per call chain
+- Can't be used from SharedArrayBuffer-backed threads
+
+What we'd want: a way for a Worker to make a blocking call to a browser API that suspends only the calling Wasm function, not the entire stack. Something like `Atomics.waitOnPromise(promise)` — block the Worker until a Promise resolves, return the result synchronously.
+
+This would eliminate the entire SAB-based RPC layer for network I/O. Instead of Worker → SAB → main thread → fetch → SAB → Worker, it's just Worker → blocking fetch → result.
+
+### 6. Faster Worker spawn and Wasm module transfer — **MAKES FORK/EXEC FAST**
+
+**Impact: Moderate.** Spawning a Web Worker takes 5-50ms depending on browser and platform. For a shell running `ls | grep | wc`, that's three Workers spawned sequentially. Each one also needs a compiled Wasm module transferred via `postMessage`.
+
+What we'd want:
+- Worker pool with pre-warmed Wasm instances (partially achievable today with workarounds)
+- `WebAssembly.Module` that's already compiled and cached in the module store, instantiable in <1ms in any Worker
+- Or: a Worker spawn API that accepts a Wasm module directly instead of a JS script URL
+
+`WebAssembly.compileStreaming` + OPFS caching gets us partway there, but the Worker startup cost remains. A pre-compiled module cache that persists across page loads and can be instantiated without re-validation would make exec() near-instant.
+
+### 7. Hardware-enforced memory protection within linear memory — **REAL GUARD PAGES**
+
+**Impact: Small-moderate.** V8 uses mprotect(PROT_NONE) to create guard pages for stack overflow detection and heap boundary checks. Our mmap shim can track these in software, but can't actually trap on access — we'd need to instrument every memory access with a bounds check, which is prohibitively expensive.
+
+What we'd want: a way to mark regions of linear memory as inaccessible that triggers a Wasm trap on access, like:
+```
+memory.protect(offset, len, NONE)  // any access to [offset, offset+len) traps
+```
+
+This is part of the memory-control proposal but worth calling out separately — even without full mmap, just having `memory.protect` for guard pages would make V8 significantly more correct and let us drop the `--jitless` requirement sooner.
+
+### Summary: Priority Order for Standards Advocacy
+
+| Priority | Proposal | Impact on this project | Current status |
+|---|---|---|---|
+| 1 | memory-control (mmap/mprotect/munmap) | Eliminates hardest component | Phase 1 |
+| 2 | Shared-everything threads | Eliminates Worker-per-process model | Active development |
+| 3 | memory64 engine optimization | Removes 4GB address space workarounds | memory64 shipped, optimization pending |
+| 4 | Stack switching / WasmFX | Unblocks direct kernel compilation | Phase 1 |
+| 5 | Synchronous Worker I/O | Simplifies blocking/networking | No proposal yet |
+| 6 | Fast Worker + module caching | Makes fork/exec fast | Partial (OPFS exists) |
+| 7 | memory.protect (subset of #1) | Real guard pages for V8 | Part of memory-control |
+
+If only one thing ships, make it **memory-control**. It single-handedly removes the project's riskiest component and closes the biggest gap between browser and native execution.
+
+---
+
 ## Papers & References
 
 - [WALI: Empowering WebAssembly with Thin Kernel Interfaces](https://dl.acm.org/doi/10.1145/3689031.3717470) — EuroSys 2025

@@ -12,14 +12,20 @@
 #include <string.h>
 
 int main(int argc, char* argv[]) {
-    // Initialize V8
-    std::unique_ptr<v8::Platform> platform = v8::platform::NewDefaultPlatform();
-    v8::V8::InitializePlatform(platform.get());
-
-    // Set flags before initialization
+    // Set flags FIRST — before platform creation.
+    // --single-threaded tells V8 not to expect concurrent access.
+    // --jitless disables JIT (no executable memory in Wasm).
+    // --no-snapshot since we don't have a pre-built snapshot blob.
     const char* v8_flags = "--jitless --no-snapshot --single-threaded";
     v8::V8::SetFlagsFromString(v8_flags, strlen(v8_flags));
     v8::V8::SetFlagsFromCommandLine(&argc, argv, true);
+
+    // Use the single-threaded platform — no worker threads.
+    // NewDefaultPlatform() spawns OS threads which fail under Emscripten.
+    // NewSingleThreadedDefaultPlatform() runs all tasks on the calling thread.
+    std::unique_ptr<v8::Platform> platform =
+        v8::platform::NewSingleThreadedDefaultPlatform();
+    v8::V8::InitializePlatform(platform.get());
 
     v8::V8::Initialize();
 

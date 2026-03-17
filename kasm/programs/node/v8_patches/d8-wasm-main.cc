@@ -10,16 +10,18 @@
 #include "libplatform/libplatform.h"
 #include <stdio.h>
 #include <string.h>
+#include <memory>
 
 int main(int argc, char* argv[]) {
-    // Initialize V8
-    std::unique_ptr<v8::Platform> platform = v8::platform::NewDefaultPlatform();
-    v8::V8::InitializePlatform(platform.get());
-
-    // Set flags before initialization
-    const char* v8_flags = "--jitless --no-snapshot --single-threaded";
+    // Set flags FIRST (before platform creation, so single-threaded is in effect)
+    // Note: --jitless implies --no-interpreted-frames-native-stack (they're incompatible)
+    const char* v8_flags = "--jitless --single-threaded --no-interpreted-frames-native-stack";
     v8::V8::SetFlagsFromString(v8_flags, strlen(v8_flags));
     v8::V8::SetFlagsFromCommandLine(&argc, argv, true);
+
+    // Initialize V8 with single-threaded platform (no worker threads)
+    std::unique_ptr<v8::Platform> platform = v8::platform::NewSingleThreadedDefaultPlatform();
+    v8::V8::InitializePlatform(platform.get());
 
     v8::V8::Initialize();
 

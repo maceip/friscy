@@ -1,8 +1,26 @@
 const kernelModule = require('./kernel.js');
+const fs = require('fs');
+const path = require('path');
 
 console.log("Starting Kernel...");
 
-kernelModule().then(Module => {
+const rootfsImage = path.join(__dirname, 'rootfs', 'rootfs.ext4');
+
+kernelModule({
+    preRun: [Module => {
+        if (!fs.existsSync(rootfsImage)) {
+            console.log(`Rootfs image not found at ${rootfsImage}; booting without preloaded disk`);
+            return;
+        }
+
+        const image = fs.readFileSync(rootfsImage);
+        const ptr = Module._malloc(image.length);
+        const heap = new Uint8Array(Module.wasmMemory.buffer, ptr, image.length);
+        heap.set(image);
+        Module._kasm_set_root_disk(ptr, BigInt(image.length));
+        console.log(`Preloaded rootfs.ext4 (${image.length} bytes)`);
+    }],
+}).then(Module => {
     console.log("Kernel Module Instantiated");
     
     const cap = 4096;

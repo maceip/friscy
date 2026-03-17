@@ -1,10 +1,14 @@
 #include <lkl_host.h>
 #include <string.h>
+#include <emscripten.h>
 
 struct mem_disk {
     void *data;
     unsigned long long size;
 };
+
+static struct mem_disk root_mem_disk;
+int lkl_disk_add(struct lkl_disk *disk);
 
 static int mem_get_capacity(struct lkl_disk disk, unsigned long long *res) {
     struct mem_disk *md = (struct mem_disk *)disk.handle;
@@ -52,3 +56,27 @@ struct lkl_dev_blk_ops mem_blk_ops = {
     .get_capacity = mem_get_capacity,
     .request = mem_request,
 };
+
+EMSCRIPTEN_KEEPALIVE
+int kasm_set_root_disk(void *data, unsigned long long size) {
+    root_mem_disk.data = data;
+    root_mem_disk.size = size;
+    return 0;
+}
+
+int kasm_root_disk_ready(void) {
+    return root_mem_disk.data != NULL && root_mem_disk.size != 0;
+}
+
+int kasm_add_root_disk(void) {
+    struct lkl_disk disk = {
+        .handle = &root_mem_disk,
+        .ops = &mem_blk_ops,
+    };
+
+    if (!kasm_root_disk_ready()) {
+        return -1;
+    }
+
+    return lkl_disk_add(&disk);
+}

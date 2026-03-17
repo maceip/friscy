@@ -12,6 +12,10 @@ wasmlinux/
 # Node
 node_modules/
 
+# Binary filesystem images
+*.ext4
+*.img
+
 # Build artifacts and logs
 build/
 *.o

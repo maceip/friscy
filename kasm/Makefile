@@ -13,13 +13,14 @@ LKL_LIB_DIR = $(LKL_DIR)/tools/lkl/lib
 
 # Compiler Flags
 CFLAGS = -O3 -g -Wall -fvisibility=default \
+	-DLKL_HOST_CONFIG_POSIX \
 	-sWASM_LEGACY_EXCEPTIONS=0 -sSHARED_MEMORY=1 \
 	-mbulk-memory -matomics -msimd128 -pthread
 
 LDFLAGS = -O3 -g -sWASM_LEGACY_EXCEPTIONS=0 -sSHARED_MEMORY=1 \
 	-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB \
 	-sALLOW_TABLE_GROWTH=1 -sINITIAL_TABLE=65536 \
-	-sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_main', '_malloc', '_free', '_kasm_set_console_ring', '_kasm_syscall']" \
+	-sMODULARIZE=1 -sEXPORTED_FUNCTIONS="['_main', '_malloc', '_free', '_kasm_set_console_ring', '_kasm_syscall', '_kasm_set_root_disk']" \
 	-sEXPORTED_RUNTIME_METHODS="['wasmMemory', 'wasmTable', 'ccall', 'cwrap']" \
 	-Wl,--shared-memory -pthread -Wl,--allow-multiple-definition -sERROR_ON_UNDEFINED_SYMBOLS=0
 
@@ -39,16 +40,25 @@ kernel/initcalls_gen.c: kernel/lkl/vmlinux.o kernel/extract_initcalls.py
 
 LKL_LIB_SRCS = $(LKL_LIB_DIR)/fs.c $(LKL_LIB_DIR)/utils.c
 
-kernel: kernel/initcalls_gen.c
+rootfs/rootfs.ext4:
+	$(MAKE) -C rootfs create-ext4
+
+kernel: rootfs/rootfs.ext4 kernel/initcalls_gen.c
 	@echo "Building kernel..."
 	$(EMCC) $(CFLAGS) $(KERNEL_LDFLAGS) \
 		-Ikernel \
 		-Ikernel/lkl/tools/lkl/include \
 		-Ikernel/lkl/usr/include \
+		-Ikernel/lkl/arch/lkl/include/uapi \
+		-Ikernel/lkl/include/uapi \
 		kernel/main.c \
+		kernel/bootstrap.c \
 		kernel/initcalls_gen.c \
 		kernel/syscall_dispatch.c \
 		kernel/backends/block.c \
+		kernel/lkl/tools/lkl/lib/iomem.c \
+		kernel/lkl/tools/lkl/lib/virtio.c \
+		kernel/lkl/tools/lkl/lib/virtio_blk.c \
 		kernel/backends/net.c \
 		kernel/backends/random.c \
 		kernel/backends/host_ops.c \

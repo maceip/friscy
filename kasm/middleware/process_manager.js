@@ -8,6 +8,7 @@
 import { ProcessWorker } from './process_worker.js';
 import { KernelWorker } from './kernel_worker.js';
 import { createChannel } from './sab_protocol.js';
+import { loadWasmModuleFromRootfs } from './rootfs_loader.js';
 
 /**
  * Process Manager - Manages all processes in the system
@@ -130,32 +131,51 @@ export class ProcessManager {
     async loadWasmModule(path) {
         // Try to load from various sources
         // 1. OPFS (Origin Private File System) - cached
-        // 2. Fetch from network
-        // 3. Embedded in rootfs
-        
-        try {
-            // Try fetch first
-            const response = await fetch(path);
-            if (response.ok) {
-                return await WebAssembly.compileStreaming(response);
-            }
-        } catch (e) {
-            console.log(`Failed to fetch ${path} from network`);
-        }
+        // 2. Rootfs assembly output
+        // 3. Fetch from network / explicit URL
         
         // Try OPFS
         try {
-            const root = await navigator.storage.getDirectory();
-            const fileHandle = await root.getFileHandle(path);
-            const file = await fileHandle.getFile();
-            const arrayBuffer = await file.arrayBuffer();
-            return await WebAssembly.compile(arrayBuffer);
+            if (typeof navigator !== 'undefined' && navigator.storage?.getDirectory) {
+                const root = await navigator.storage.getDirectory();
+                const opfsPath = path.replace(/^\/+/, '');
+                const fileHandle = await root.getFileHandle(opfsPath);
+                const file = await fileHandle.getFile();
+                const arrayBuffer = await file.arrayBuffer();
+                return await WebAssembly.compile(arrayBuffer);
+            }
         } catch (e) {
             console.log(`Failed to load ${path} from OPFS`);
         }
         
-        // Try from rootfs (in-memory)
-        // This would be implemented with the rootfs module
+        // Try from assembled rootfs tree
+        try {
+            return await loadWasmModuleFromRootfs(path);
+        } catch (e) {
+            console.log(`Failed to load ${path} from rootfs`);
+        }
+
+        // Try direct fetch for explicit URLs or dev-server paths
+        try {
+            if (typeof fetch === 'function') {
+                const response = await fetch(path);
+                if (response.ok) {
+                    if (WebAssembly.compileStreaming) {
+                        try {
+                            return await WebAssembly.compileStreaming(fetch(path));
+                        } catch (err) {
+                            // Fall back to arrayBuffer below if MIME type is wrong.
+                        }
+                    }
+
+                    const arrayBuffer = await response.arrayBuffer();
+                    return await WebAssembly.compile(arrayBuffer);
+                }
+            }
+        } catch (e) {
+            console.log(`Failed to fetch ${path} from network`);
+        }
+
         throw new Error(`Cannot load Wasm module: ${path}`);
     }
     

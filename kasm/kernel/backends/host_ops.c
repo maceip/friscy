@@ -7,6 +7,7 @@
 #include <time.h>
 #include <setjmp.h>
 #include <emscripten.h>
+#include "../lkl/tools/lkl/lib/iomem.h"
 
 // Shared with JS via a pre-allocated SAB
 struct console_ring {
@@ -196,19 +197,26 @@ static void wasm_timer_free(void *_timer) {
     free(t);
 }
 
-static void *wasm_ioremap(long addr, int size) { return (void *)addr; }
-static int wasm_iomem_access(const volatile void *addr, void *val, int size, int write) {
-    if (write) memcpy((void *)addr, val, size);
-    else memcpy(val, (void *)addr, size);
-    return 0;
-}
-
 static void wasm_jmp_buf_set(struct lkl_jmp_buf *jmpb, void (*f)(void)) {
     if (!setjmp(*(jmp_buf *)jmpb->buf)) f();
 }
 
 static void wasm_jmp_buf_longjmp(struct lkl_jmp_buf *jmpb, int val) {
     longjmp(*(jmp_buf *)jmpb->buf, val);
+}
+
+static void *wasm_ioremap(long addr, int size) {
+    (void)size;
+    return (void *)addr;
+}
+
+static int wasm_iomem_access(const volatile void *addr, void *val, int size, int write) {
+    if (write) {
+        memcpy((void *)addr, val, size);
+    } else {
+        memcpy(val, (const void *)addr, size);
+    }
+    return 0;
 }
 
 struct lkl_host_operations lkl_host_ops = {
@@ -240,8 +248,9 @@ struct lkl_host_operations lkl_host_ops = {
     .timer_alloc = wasm_timer_alloc,
     .timer_set_oneshot = wasm_timer_set_oneshot,
     .timer_free = wasm_timer_free,
-    .ioremap = wasm_ioremap,
-    .iomem_access = wasm_iomem_access,
+    .virtio_devices = lkl_virtio_devs,
+    .ioremap = lkl_ioremap,
+    .iomem_access = lkl_iomem_access,
     .jmp_buf_set = wasm_jmp_buf_set,
     .jmp_buf_longjmp = wasm_jmp_buf_longjmp,
     .memcpy = memcpy,

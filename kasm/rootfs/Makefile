@@ -8,12 +8,15 @@ BUSYBOX_WASM = ../programs/busybox/busybox.wasm
 
 # Output
 ROOTFS_TAR = rootfs.tar
+ROOTFS_EXT4 = rootfs.ext4
+MKE2FS ?= $(shell command -v mke2fs || command -v mkfs.ext4)
+ROOTFS_EXT4_SIZE_MB ?= 64
 
-.PHONY: all clean dirs install-busybox create-tar
+.PHONY: all clean dirs install-busybox create-tar create-ext4
 
-all: dirs install-busybox create-tar
-	@echo "Rootfs assembled: $(ROOTFS_TAR)"
-	@ls -lh $(ROOTFS_TAR)
+all: dirs install-busybox create-tar create-ext4
+	@echo "Rootfs assembled:"
+	@ls -lh $(ROOTFS_TAR) $(ROOTFS_EXT4)
 
 dirs:
 	@mkdir -p $(BUILD_DIR)/bin
@@ -67,9 +70,22 @@ create-tar: install-busybox
 	@tar -tf $(ROOTFS_TAR) | head -20
 	@echo "... ($(shell tar -tf $(ROOTFS_TAR) | wc -l) total entries)"
 
+create-ext4: install-busybox
+	@if [ -z "$(MKE2FS)" ]; then \
+		echo "ERROR: mke2fs or mkfs.ext4 not found"; \
+		exit 1; \
+	fi
+	@echo "Creating $(ROOTFS_EXT4)..."
+	@rm -f $(ROOTFS_EXT4)
+	@dd if=/dev/zero of=$(ROOTFS_EXT4) bs=1M count=$(ROOTFS_EXT4_SIZE_MB) status=none
+	@$(MKE2FS) -q -F -d $(BUILD_DIR) -L kasm-root -t ext4 $(ROOTFS_EXT4)
+	@echo "Ext4 image contents:"
+	@debugfs -R "ls -p /" $(ROOTFS_EXT4) 2>/dev/null | head -20 || true
+
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f $(ROOTFS_TAR)
+	rm -f $(ROOTFS_EXT4)
 
 help:
 	@echo "Rootfs Assembly"

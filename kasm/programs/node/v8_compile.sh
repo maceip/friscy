@@ -59,6 +59,7 @@ COMPILE_FLAGS="-std=c++20 -O0 -w -pthread \
     -DV8_SHORT_BUILTIN_CALLS=1 -DV8_USE_ZLIB=1 -DV8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION=1 \
     -DDISABLE_UNTRUSTED_CODE_MITIGATIONS=1 -DBUILDING_V8_SHARED=1 -DBUILDING_V8_PLATFORM_SHARED=1 \
     -D__STDC_FORMAT_MACROS=1 -D__linux__=1 -DNDEBUG \
+    -DABSL_FORCE_WAITER_MODE=4 \
     -isystem $SHIMS \
     -I$V8_DIR/include \
     -I$V8_DIR/src \
@@ -177,6 +178,7 @@ compile_file() {
 # Directories to compile (in order as specified)
 V8_DIRS=(
     "base"
+    "flags"
     "init"
     "api"
     "interpreter"
@@ -263,3 +265,27 @@ if [ $OBJ_COUNT -ge 300 ]; then
 else
     echo "⚠️  TARGET NOT REACHED: $OBJ_COUNT < 300"
 fi
+
+# ============================================================================
+# Compile real Abseil (StdcppWaiter mode — no stubs)
+# ============================================================================
+echo ""
+echo "=== Compiling Real Abseil (StdcppWaiter) ==="
+./compile_abseil.sh
+
+# V8 platform stubs (non-Abseil, still needed for JIT/snapshot/signals)
+echo ""
+echo "=== V8 Platform Stubs ==="
+mkdir -p "$OBJ_DIR/stubs"
+for stub in v8_patches/v8-internal-stubs.cc v8_patches/v8-wasm-stubs.cc v8_patches/embedded-blob-stub.cc; do
+    name=$(basename "$stub" .cc)
+    if compile_file "$stub" "$OBJ_DIR/stubs/$name.o"; then
+        echo "✅ $name compiled"
+    else
+        echo "❌ $name FAILED"
+    fi
+done
+
+echo ""
+echo "=== Final Link Command ==="
+echo "Link: V8 .o + /tmp/v8obj/abseil/*.o + stubs/v8-*.o + stubs/embedded-blob-stub.o"

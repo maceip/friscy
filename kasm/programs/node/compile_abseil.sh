@@ -31,6 +31,8 @@ if [ ! -d "$ABSEIL_DIR" ]; then
     exit 1
 fi
 
+# Clean previous build to prevent duplicate .o files
+rm -rf "$OBJ_DIR"
 mkdir -p "$OBJ_DIR"
 
 # --------------------------------------------------------------------------
@@ -206,7 +208,7 @@ if [ $FAILED -gt 0 ]; then
     echo "Fix these failures. Do NOT fall back to stubs."
 fi
 
-OBJ_COUNT=$(find "$OBJ_DIR" -name "*.o" 2>/dev/null | wc -l)
+OBJ_COUNT=$(find "$OBJ_DIR" -maxdepth 1 -name "*.o" 2>/dev/null | wc -l)
 echo "Total .o files: $OBJ_COUNT"
 echo ""
 
@@ -214,5 +216,5 @@ if [ $FAILED -eq 0 ]; then
     echo "SUCCESS: All Abseil files compiled."
     echo ""
     echo "Add to your V8 link command:"
-    echo "  \$(find $OBJ_DIR -name '*.o')"
+    echo "  \$(find $OBJ_DIR -maxdepth 1 -name '*.o')"
 fi

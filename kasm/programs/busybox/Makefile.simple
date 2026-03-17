@@ -1,0 +1,61 @@
+# Simple Busybox Emscripten Build
+# Minimal working configuration for first build attempt
+
+# Use absolute path or rely on PATH
+EMCC = emcc
+EMMAKE = emmake
+
+BUSYBOX_DIR = busybox
+
+# Basic Emscripten flags for a working build
+EMFLAGS = -O2 \
+	-sALLOW_MEMORY_GROWTH=1 \
+	-sMAXIMUM_MEMORY=32MB \
+	-sINITIAL_MEMORY=4MB \
+	-sSTACK_SIZE=1MB \
+	-sEXPORTED_FUNCTIONS="['_main','_start']" \
+	-sEXPORTED_RUNTIME_METHODS="['ccall','cwrap']" \
+	-sMODULARIZE=1 \
+	-sEXPORT_NAME="'BusyboxModule'" \
+	-sERROR_ON_UNDEFINED_SYMBOLS=0 \
+	-sASSERTIONS=1
+
+.PHONY: all config build clean
+
+all: config build
+
+config:
+	@echo "Configuring busybox for minimal static build..."
+	cd $(BUSYBOX_DIR) && \
+	sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config 2>/dev/null || echo "CONFIG_STATIC=y" >> .config && \
+	sed -i 's/^CONFIG_FEATURE_UTMP=y/# CONFIG_FEATURE_UTMP is not set/' .config && \
+	sed -i 's/^CONFIG_FEATURE_WTMP=y/# CONFIG_FEATURE_WTMP is not set/' .config && \
+	sed -i 's/^CONFIG_INETD=y/# CONFIG_INETD is not set/' .config && \
+	sed -i 's/^CONFIG_FEATURE_INETD_RPC=y/# CONFIG_FEATURE_INETD_RPC is not set/' .config && \
+	sed -i 's/^CONFIG_FEATURE_INETD_SUPPORT_BUILTIN_ECHO=y/# CONFIG_FEATURE_INETD_SUPPORT_BUILTIN_ECHO is not set/' .config && \
+	$(MAKE) oldconfig 2>/dev/null || true
+
+build: config
+	@echo "Building busybox with Emscripten..."
+	cd $(BUSYBOX_DIR) && make CC="$(EMCC) $(EMFLAGS)" CFLAGS="" LDFLAGS="" busybox 2>&1 | tee ../build.log
+	@if [ -f $(BUSYBOX_DIR)/busybox ]; then \
+		cp $(BUSYBOX_DIR)/busybox busybox.wasm ; \
+		echo "Build successful: busybox.wasm" ; \
+		ls -lh busybox.wasm ; \
+	else \
+		echo "Build failed - check build.log" ; \
+		exit 1 ; \
+	fi
+
+clean:
+	rm -f busybox.wasm build.log
+	cd $(BUSYBOX_DIR) && make clean 2>/dev/null || true
+
+help:
+	@echo "Simple Busybox Emscripten Build"
+	@echo "================================"
+	@echo "Targets:"
+	@echo "  config - Configure busybox for static build"
+	@echo "  build  - Compile busybox.wasm"
+	@echo "  clean  - Remove build artifacts"
+	@echo "  help   - Show this help"

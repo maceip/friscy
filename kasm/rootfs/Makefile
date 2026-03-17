@@ -1,0 +1,84 @@
+# Rootfs Assembly Makefile
+# Assembles rootfs.tar from busybox.wasm and overlay files
+
+ROOTFS_DIR = .
+OVERLAY_DIR = overlay
+BUILD_DIR = build
+BUSYBOX_WASM = ../programs/busybox/busybox.wasm
+
+# Output
+ROOTFS_TAR = rootfs.tar
+
+.PHONY: all clean dirs install-busybox create-tar
+
+all: dirs install-busybox create-tar
+	@echo "Rootfs assembled: $(ROOTFS_TAR)"
+	@ls -lh $(ROOTFS_TAR)
+
+dirs:
+	@mkdir -p $(BUILD_DIR)/bin
+	@mkdir -p $(BUILD_DIR)/etc
+	@mkdir -p $(BUILD_DIR)/tmp
+	@mkdir -p $(BUILD_DIR)/dev
+	@mkdir -p $(BUILD_DIR)/proc
+	@mkdir -p $(BUILD_DIR)/sys
+	@mkdir -p $(BUILD_DIR)/home
+	@mkdir -p $(BUILD_DIR)/var/run
+
+install-busybox: dirs
+	@if [ -f "$(BUSYBOX_WASM)" ]; then \
+		echo "Installing busybox.wasm..."; \
+		cp $(BUSYBOX_WASM) $(BUILD_DIR)/bin/busybox.wasm; \
+		echo "busybox.wasm installed"; \
+	else \
+		echo "WARNING: $(BUSYBOX_WASM) not found"; \
+		echo "Creating placeholder..."; \
+		echo "PLACEHOLDER" > $(BUILD_DIR)/bin/busybox.wasm.placeholder; \
+	fi
+
+# Copy overlay files (passwd, hostname, etc.)
+	@if [ -d "$(OVERLAY_DIR)" ]; then \
+		echo "Copying overlay files..."; \
+		cp -r $(OVERLAY_DIR)/* $(BUILD_DIR)/ 2>/dev/null || true; \
+	fi
+
+# Create essential device nodes (via overlay)
+	@echo "Creating essential files..."
+	@echo "root:x:0:0:root:/root:/bin/sh" > $(BUILD_DIR)/etc/passwd
+	@echo "root:x:0:" > $(BUILD_DIR)/etc/group
+	@echo "kasm" > $(BUILD_DIR)/etc/hostname
+	@echo "127.0.0.1 localhost kasm" > $(BUILD_DIR)/etc/hosts
+
+# Create init script
+	@echo '#!/bin/sh' > $(BUILD_DIR)/init
+	@echo 'echo "Kasm WebAssembly Linux"' >> $(BUILD_DIR)/init
+	@echo 'echo "====================="' >> $(BUILD_DIR)/init
+	@echo 'export PATH=/bin' >> $(BUILD_DIR)/init
+	@echo 'export HOME=/home' >> $(BUILD_DIR)/init
+	@echo 'export TERM=xterm' >> $(BUILD_DIR)/init
+	@echo 'cd /home' >> $(BUILD_DIR)/init
+	@echo '/bin/sh' >> $(BUILD_DIR)/init
+	@chmod +x $(BUILD_DIR)/init
+
+create-tar: install-busybox
+	@echo "Creating $(ROOTFS_TAR)..."
+	@cd $(BUILD_DIR) && tar -cf ../$(ROOTFS_TAR) *
+	@echo "Rootfs contents:"
+	@tar -tf $(ROOTFS_TAR) | head -20
+	@echo "... ($(shell tar -tf $(ROOTFS_TAR) | wc -l) total entries)"
+
+clean:
+	rm -rf $(BUILD_DIR)
+	rm -f $(ROOTFS_TAR)
+
+help:
+	@echo "Rootfs Assembly"
+	@echo "==============="
+	@echo ""
+	@echo "Prerequisites:"
+	@echo "  $(BUSYBOX_WASM) - compiled busybox"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all    - Assemble rootfs.tar"
+	@echo "  clean  - Remove build artifacts"
+	@echo "  help   - Show this help"

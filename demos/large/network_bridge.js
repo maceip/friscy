@@ -1,1 +1,0 @@
-../../friscy-bundle/network_bridge.js

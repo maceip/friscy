@@ -1,1 +1,0 @@
-../../friscy-bundle/friscy.js

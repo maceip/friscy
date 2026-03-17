@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Kasm - Wasm Native Linux</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #1a1a1a;
+            color: #f0f0f0;
+            font-family: 'Courier New', monospace;
+        }
+        #terminal {
+            width: 100vw;
+            height: 100vh;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        #status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: #333;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .status-ok { color: #0f0; }
+        .status-warn { color: #ff0; }
+        .status-err { color: #f00; }
+    </style>
+    <!-- xterm.js for terminal emulation -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+</head>
+<body>
+    <div id="status">Status: <span id="status-text" class="status-warn">Initializing...</span></div>
+    <div id="terminal"></div>
+
+    <script type="module">
+        import { processManager } from '../middleware/process_manager.js';
+
+        // Terminal setup
+        const term = new Terminal({
+            cols: 80,
+            rows: 24,
+            fontFamily: 'Courier New, monospace',
+            fontSize: 14,
+            theme: {
+                background: '#1a1a1a',
+                foreground: '#f0f0f0',
+                cursor: '#f0f0f0'
+            }
+        });
+
+        const terminalElement = document.getElementById('terminal');
+        term.open(terminalElement);
+
+        // Status update helper
+        function setStatus(text, className = 'status-ok') {
+            const statusText = document.getElementById('status-text');
+            statusText.textContent = text;
+            statusText.className = className;
+        }
+
+        // Main initialization
+        async function init() {
+            try {
+                term.writeln('Kasm - Wasm Native Linux');
+                term.writeln('=======================\r\n');
+
+                // Initialize process manager (starts kernel worker)
+                setStatus('Starting kernel...', 'status-warn');
+                await processManager.init();
+                setStatus('Kernel ready', 'status-ok');
+
+                term.writeln('Kernel initialized');
+                term.writeln('Loading rootfs...');
+
+                // Load rootfs (would fetch rootfs.tar and populate filesystem)
+                // For now, mock filesystem is in kernel_worker.js
+                setStatus('Rootfs ready', 'status-ok');
+                term.writeln('Rootfs mounted');
+                term.writeln('');
+
+                // Spawn shell
+                setStatus('Spawning shell...', 'status-warn');
+                const pid = await processManager.spawn(
+                    '/bin/busybox.wasm',
+                    ['sh'],
+                    { PATH: '/bin', HOME: '/home', TERM: 'xterm' }
+                );
+
+                term.writeln(`Shell spawned (pid: ${pid})`);
+                term.writeln('');
+                term.write('$ ');
+
+                // Terminal input handling
+                let inputBuffer = '';
+
+                term.onData((data) => {
+                    const code = data.charCodeAt(0);
+
+                    if (code === 13) { // Enter
+                        term.write('\r\n');
+
+                        // Parse and execute command
+                        const cmd = inputBuffer.trim();
+                        if (cmd) {
+                            executeCommand(cmd, term);
+                        }
+
+                        inputBuffer = '';
+                        term.write('$ ');
+                    } else if (code === 127) { // Backspace
+                        if (inputBuffer.length > 0) {
+                            inputBuffer = inputBuffer.slice(0, -1);
+                            term.write('\b \b');
+                        }
+                    } else if (code >= 32 && code < 127) {
+                        inputBuffer += data;
+                        term.write(data);
+                    }
+                });
+
+                setStatus('Running', 'status-ok');
+
+            } catch (error) {
+                console.error('Initialization error:', error);
+                setStatus('Error: ' + error.message, 'status-err');
+                term.writeln(`\r\nError: ${error.message}`);
+            }
+        }
+
+        // Command execution
+        async function executeCommand(cmd, term) {
+            const args = cmd.split(/\s+/);
+            const program = args[0];
+
+            // Simple built-in commands
+            if (program === 'help') {
+                term.writeln('Available commands:');
+                term.writeln('  help     - Show this help');
+                term.writeln('  echo     - Echo arguments');
+                term.writeln('  ls       - List directory');
+                term.writeln('  pwd      - Print working directory');
+                term.writeln('  clear    - Clear screen');
+                term.writeln('  status   - System status');
+                return;
+            }
+
+            if (program === 'clear') {
+                term.clear();
+                return;
+            }
+
+            if (program === 'status') {
+                const processes = processManager.listProcesses();
+                term.writeln(`Active processes: ${processes.length}`);
+                for (const p of processes) {
+                    term.writeln(`  pid ${p.pid}: ${p.state}`);
+                }
+                return;
+            }
+
+            // Try to spawn as external command
+            try {
+                const pid = await processManager.spawn(
+                    '/bin/busybox.wasm',
+                    args,
+                    { PATH: '/bin' }
+                );
+
+                // Wait for process
+                const result = await processManager.wait4(pid, 0);
+                term.writeln(`[Exit ${result.status}]`);
+
+            } catch (error) {
+                term.writeln(`${program}: not found`);
+            }
+        }
+
+        // Start initialization
+        init();
+    </script>
+</body>
+</html>

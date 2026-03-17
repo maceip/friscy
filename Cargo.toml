@@ -1,3 +1,0 @@
-[workspace]
-members = ["aot", "aot-jit"]
-resolver = "2"

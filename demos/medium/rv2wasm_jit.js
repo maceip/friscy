@@ -1,1 +1,0 @@
-../../friscy-bundle/rv2wasm_jit.js

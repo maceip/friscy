@@ -1,1 +1,0 @@
-../../friscy-bundle/jit_manager.js

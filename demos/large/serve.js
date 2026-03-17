@@ -1,1 +1,0 @@
-../../friscy-bundle/serve.js

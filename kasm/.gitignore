@@ -1,0 +1,52 @@
+# Vendored submodules
+kernel/lkl/
+programs/busybox/busybox/
+programs/node/node/
+wali-musl/
+
+# Vendored toolchains and SDKs
+emsdk/
+wali-toolchain/
+wasmlinux/
+
+# Node
+node_modules/
+
+# Build artifacts and logs
+build/
+*.o
+*.a
+*.wasm
+*.log
+kernel.js
+
+# Generated kernel files
+kernel/initcalls.defsym
+kernel/initcalls_gen.c
+kernel/initcalls_gen.s
+kernel/vmlinux_gen.c
+kernel/vmlinux_gen.h
+kernel/wasm-rt*.h
+kernel/wasm-rt*.c
+
+# Test/scratch files
+test.c
+test.h
+test_*.c
+test_*.s
+test_*.o
+
+# Text dumps / scratch notes
+*.txt
+
+# Status docs (generated)
+INTEGRATION_STATUS.md
+K1_K8_STATUS.md
+PROJECT_ANALYSIS.md
+STATUS.md
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~

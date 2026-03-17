@@ -1,1 +1,0 @@
-../../test-claude-demo-e2e.cjs

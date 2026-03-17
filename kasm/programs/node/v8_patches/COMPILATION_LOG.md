@@ -84,6 +84,47 @@ em++ -std=c++20 -O0 -c \
    - memfd_create — need stub
 4. Each error is one patch. The error count should converge to zero.
 
+### Attempt 6: Abseil Mutex __builtin_unreachable() crash
+
+**Result:** 20MB binary links but hits `__builtin_unreachable()` in real Abseil Mutex code.
+**Cause:** Mixed real Abseil .o files (mutex.o, thread_identity.o, spinlock.o, etc.) with
+a minimal `CreateThreadIdentity` stub. Real Abseil Mutex's state machine requires a fully
+initialized `ThreadIdentity` with valid `per_thread_synch` data. The stub returns a zeroed
+buffer → Mutex's internal state machine hits an "impossible" branch.
+
+**Fix:** Compile ALL of real Abseil with `-DABSL_FORCE_WAITER_MODE=4` (StdcppWaiter).
+
+Abseil has a waiter abstraction layer with 5 backends:
+- Mode 0: FutexWaiter (Linux futex syscall — not available in Wasm)
+- Mode 1: SemWaiter (POSIX sem_t)
+- Mode 2: PthreadWaiter (pthread_cond_t)
+- Mode 3: Win32Waiter
+- Mode 4: **StdcppWaiter** (std::mutex + std::condition_variable)
+
+StdcppWaiter uses ONLY C++ standard library primitives — `std::mutex` and
+`std::condition_variable` — both fully supported by Emscripten. No stubs needed.
+Non-selected waiter .cc files compile to empty translation units automatically.
+
+Added `compile_abseil.sh` which builds all required Abseil source files:
+- Synchronization: mutex.cc, notification.cc, barrier.cc, blocking_counter.cc
+- Waiters: stdcpp_waiter.cc (+ others as empty TUs)
+- Internals: thread_identity, per_thread_sem, graphcycles, kernel_timeout
+- Base: spinlock, low_level_alloc, cycleclock, raw_logging, sysinfo
+- Dependencies: hash, strings, time/cctz, containers, numeric
+
+Added `-DABSL_FORCE_WAITER_MODE=4` to both v8_compile.sh and v8_batch_compile.sh
+so V8's own code also sees the correct waiter mode when including Abseil headers.
+
+### Attempt 7: V8 Start() assertion failure — v8_flags ABI mismatch
+
+**Result:** `Check failed: Start()` at runtime after Abseil stubs linked successfully.
+**Cause:** The `v8_flags` stub was a 3-field struct (`jitless`, `single_threaded`, `no_snapshot`).
+The real `v8::internal::v8_flags` is an instance of `FlagValues` — a generated struct with
+~500 fields occupying 4-8KB. Every compiled V8 `.o` file accesses flags at compile-time-fixed
+offsets into this struct. A 3-byte stub means every flag access past byte 3 reads garbage.
+**Fix:** Compile `src/flags/flags.cc` for real (pure data, no platform deps). Added `flags`
+to V8_DIRS in v8_compile.sh. Removed the `v8_flags` stub from v8-internal-stubs.cc.
+
 ## Key Insight
 
 V8's architecture is designed with platform abstraction. The `platform-posix.cc` file

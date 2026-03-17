@@ -18,11 +18,13 @@ FLAGS="-std=c++20 -O0 -w -pthread \
   -DV8_SHORT_BUILTIN_CALLS=1 -DV8_USE_ZLIB=1 -DV8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION=1 \
   -DDISABLE_UNTRUSTED_CODE_MITIGATIONS=1 -DBUILDING_V8_SHARED=1 -DBUILDING_V8_PLATFORM_SHARED=1 \
   -D__STDC_FORMAT_MACROS=1 -D__linux__=1 -DNDEBUG \
+  -DABSL_FORCE_WAITER_MODE=4 \
   -isystem $SHIMS \
   -I$V8/include -I$V8/src -I$V8 -I$V8/third_party/abseil-cpp \
   -I$V8/third_party/fp16/src/include -I$V8/third_party/zlib \
   -I$GEN -I$GEN/generate-bytecode-output-root -I$GEN/torque-generated"
 
+# --- V8 source directories ---
 for DIR in regexp strings numbers parsing ast codegen snapshot utils zone handles roots logging debug libplatform tracing json bigint date diagnostics flags profiler tasks common; do
   echo "=== $DIR ==="
   P=0; F=0; FL=""
@@ -40,6 +42,24 @@ for DIR in regexp strings numbers parsing ast codegen snapshot utils zone handle
   echo "  $P pass, $F fail"
   [ $F -gt 0 ] && echo "  Failed:$FL"
 done
+
+# --- Real Abseil (not stubs) ---
+echo ""
+echo "=== ABSEIL (real, StdcppWaiter mode) ==="
+echo "Running compile_abseil.sh..."
+./compile_abseil.sh
+
+# --- V8 platform stubs (non-Abseil, still needed) ---
+echo ""
+echo "=== V8 STUBS (non-Abseil) ==="
+mkdir -p /tmp/v8obj/stubs
+for stub in v8_patches/v8-internal-stubs.cc v8_patches/v8-wasm-stubs.cc v8_patches/embedded-blob-stub.cc; do
+  B=$(basename "$stub" .cc)
+  em++ $FLAGS -c "$stub" -o "/tmp/v8obj/stubs/$B.o" 2>/dev/null
+  [ $? -eq 0 ] && echo "  $B: OK" || echo "  $B: FAILED"
+done
+
+echo ""
 echo "=== TOTAL ==="
 find /tmp/v8obj -name "*.o" | wc -l
 echo ".o files"

@@ -277,7 +277,7 @@ echo "=== Compiling Real Abseil (StdcppWaiter) ==="
 echo ""
 echo "=== V8 Platform Stubs ==="
 mkdir -p "$OBJ_DIR/stubs"
-for stub in v8_patches/v8-internal-stubs.cc v8_patches/v8-wasm-stubs.cc v8_patches/embedded-blob-stub.cc; do
+for stub in v8_patches/v8-internal-stubs.cc v8_patches/v8-wasm-stubs.cc v8_patches/embedded-blob-stub.cc v8_patches/platform-emscripten-overrides.cc; do
     name=$(basename "$stub" .cc)
     if compile_file "$stub" "$OBJ_DIR/stubs/$name.o"; then
         echo "✅ $name compiled"
@@ -288,4 +288,13 @@ done
 
 echo ""
 echo "=== Final Link Command ==="
-echo "Link: V8 .o + /tmp/v8obj/abseil/*.o + stubs/v8-*.o + stubs/embedded-blob-stub.o"
+echo "Link: V8 .o + /tmp/v8obj/abseil/*.o + stubs/*.o"
+echo ""
+echo "IMPORTANT: Use --wrap flags to override Emscripten's mmap/munmap/mprotect"
+echo "with page-aligned versions (fixes 'Check failed: address % CommitPageSize()'):"
+echo ""
+echo "  em++ -O0 -pthread -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB \\"
+echo "    -sERROR_ON_UNDEFINED_SYMBOLS=0 -sINITIAL_MEMORY=256MB \\"
+echo "    -Wl,--wrap=mmap -Wl,--wrap=munmap -Wl,--wrap=mprotect -Wl,--wrap=madvise \\"
+echo "    /tmp/v8obj/**/*.o /tmp/v8obj/stubs/*.o /tmp/v8obj/abseil/*.o \\"
+echo "    -o /tmp/d8.js"

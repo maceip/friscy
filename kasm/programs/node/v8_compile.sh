@@ -102,6 +102,20 @@ EXCLUDE_FILES=(
     "src/base/debug/stack_trace_fuchsia.cc"
     "src/base/debug/stack_trace_starboard.cc"
     "src/execution/clobber-registers.cc"
+    # Platform files — replaced by platform-emscripten-overrides.cc
+    # platform-posix.cc mostly works BUT has /proc/self/maps, sigaltstack,
+    # sched_setscheduler, prctl, and other Linux-isms that crash at runtime.
+    # platform-linux.cc has /proc parsing, sysconf calls that misbehave.
+    # We exclude both and provide a comprehensive Emscripten replacement.
+    "src/base/platform/platform-linux.cc"
+    "src/base/platform/platform-posix.cc"
+    "src/base/platform/platform-posix-time.cc"
+    # Profiler / sampler — not needed for jitless interpreter
+    "src/libsampler/sampler.cc"
+    "src/profiler"
+    # Diagnostics that need /proc or perf
+    "src/diagnostics/perf-jit.cc"
+    "src/diagnostics/linux-perf-support.cc"
 )
 
 # Check if file should be excluded
@@ -277,7 +291,7 @@ echo "=== Compiling Real Abseil (StdcppWaiter) ==="
 echo ""
 echo "=== V8 Platform Stubs ==="
 mkdir -p "$OBJ_DIR/stubs"
-for stub in v8_patches/v8-internal-stubs.cc v8_patches/v8-wasm-stubs.cc v8_patches/embedded-blob-stub.cc v8_patches/platform-emscripten-overrides.cc; do
+for stub in v8_patches/v8-internal-stubs.cc v8_patches/v8-wasm-stubs.cc v8_patches/embedded-blob-stub.cc v8_patches/platform-emscripten-overrides.cc v8_patches/platform-emscripten.cc; do
     name=$(basename "$stub" .cc)
     if compile_file "$stub" "$OBJ_DIR/stubs/$name.o"; then
         echo "✅ $name compiled"

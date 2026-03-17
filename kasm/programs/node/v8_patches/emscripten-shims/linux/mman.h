@@ -4,7 +4,9 @@
 #ifndef _LINUX_MMAN_H
 #define _LINUX_MMAN_H
 
-#include <sys/mman.h>
+// Pull in Emscripten's real mmap definitions (MAP_FAILED, mmap, munmap, etc.)
+// We can't use #include <sys/mman.h> because our shim shadows it.
+#include_next <sys/mman.h>
 
 #ifndef MREMAP_MAYMOVE
 #define MREMAP_MAYMOVE  1

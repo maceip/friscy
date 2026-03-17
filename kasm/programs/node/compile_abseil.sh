@@ -43,7 +43,6 @@ mkdir -p "$OBJ_DIR"
 
 ABSEIL_FLAGS="-std=c++20 -O2 -w -pthread \
     -DABSL_FORCE_WAITER_MODE=4 \
-    -DABSL_LOW_LEVEL_ALLOC_MISSING=1 \
     -D__linux__=1 \
     -DNDEBUG \
     -isystem $SHIMS \
@@ -55,7 +54,7 @@ ABSEIL_FLAGS="-std=c++20 -O2 -w -pthread \
 # These are the files needed for V8's Abseil usage:
 #   - Synchronization (Mutex, CondVar, Notification)
 #   - Threading (ThreadIdentity, PerThreadSem)
-#   - Base utilities (SpinLock, CycleClock)
+#   - Base utilities (SpinLock, LowLevelAlloc, CycleClock)
 #   - Debugging (StackTrace)
 #
 # Non-selected waiter .cc files (futex, sem, pthread, win32) compile to
@@ -86,8 +85,7 @@ ABSEIL_SOURCES=(
     # --- Base: threading and low-level ---
     "absl/base/internal/thread_identity.cc"
     "absl/base/internal/spinlock.cc"
-    # low_level_alloc.cc excluded: ABSL_LOW_LEVEL_ALLOC_MISSING=1 makes it an
-    # empty TU, and its unconditional #include of direct_mmap.h fails on Emscripten.
+    "absl/base/internal/low_level_alloc.cc"
     "absl/base/internal/cycleclock.cc"
     "absl/base/internal/unscaledcycleclock.cc"
     "absl/base/internal/raw_logging.cc"

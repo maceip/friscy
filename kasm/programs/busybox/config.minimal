@@ -1,0 +1,70 @@
+# Minimal Busybox Config for Emscripten/Wasm
+# Only core utilities needed for testing
+
+CONFIG_HAVE_DOT_CONFIG=y
+
+# Skip all the fancy features
+# CONFIG_DESKTOP is not set
+# CONFIG_INCLUDE_SUSv2 is not set
+# CONFIG_LONG_OPTS is not set
+CONFIG_SHOW_USAGE=y
+# CONFIG_FEATURE_VERBOSE_USAGE is not set
+# CONFIG_FEATURE_COMPRESS_USAGE is not set
+CONFIG_LFS=y
+# CONFIG_TIME64 is not set
+# CONFIG_FEATURE_DEVPTS is not set
+# CONFIG_FEATURE_UTMP is not set
+# CONFIG_FEATURE_WTMP is not set
+# CONFIG_FEATURE_PIDFILE is not set
+
+# Static build is required
+CONFIG_STATIC=y
+CONFIG_FEATURE_PREFER_APPLETS=y
+
+# Disable everything by default, then enable only what we need
+# ... (this would be a very long config file)
+
+# Core applets needed for Phase 2 testing:
+CONFIG_SH=y
+CONFIG_ECHO=y
+CONFIG_CAT=y
+CONFIG_LS=y
+CONFIG_PWD=y
+CONFIG_MKDIR=y
+CONFIG_RM=y
+CONFIG_CP=y
+CONFIG_MV=y
+CONFIG_CHMOD=y
+CONFIG_GREP=y
+CONFIG_TEST=y
+CONFIG_TRUE=y
+CONFIG_FALSE=y
+CONFIG_SLEEP=y
+
+# Shell options
+CONFIG_ASH=y
+# CONFIG_HUSH is not set
+# CONFIG_MSH is not set
+# CONFIG_FEATURE_SH_STANDALONE is not set
+# CONFIG_FEATURE_SH_NOFORK is not set
+
+# Disable all the linux-specific stuff
+# CONFIG_KLOGD is not set
+# CONFIG_LOGGER is not set
+# CONFIG_LOGREAD is not set
+# CONFIG_SYSLOGD is not set
+# CONFIG_INSMOD is not set
+# CONFIG_RMMOD is not set
+# CONFIG_LSMOD is not set
+# CONFIG_MODPROBE is not set
+# CONFIG_DEPMOD is not set
+
+# Disable console tools (need Linux headers)
+# CONFIG_CHVT is not set
+# CONFIG_CLEAR is not set
+# CONFIG_DEALLOCVT is not set
+# CONFIG_DUMPKMAP is not set
+# CONFIG_FGCONSOLE is not set
+# CONFIG_KBD_MODE is not set
+
+# ... would need complete config

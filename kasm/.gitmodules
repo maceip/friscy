@@ -1,0 +1,12 @@
+[submodule "kernel/lkl"]
+	path = kernel/lkl
+	url = https://github.com/lkl/linux.git
+[submodule "programs/busybox/busybox"]
+	path = programs/busybox/busybox
+	url = https://github.com/mirror/busybox.git
+[submodule "programs/node/node"]
+	path = programs/node/node
+	url = https://github.com/nodejs/node.git
+[submodule "wali-musl"]
+	path = wali-musl
+	url = https://github.com/arjunr2/wali-musl.git

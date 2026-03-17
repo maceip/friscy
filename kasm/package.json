@@ -1,0 +1,11 @@
+{
+  "name": "kasm",
+  "version": "0.1.0",
+  "description": "Wasm-Native Linux with Dual-Backend Syscall Layer",
+  "scripts": {
+    "build": "make -j4",
+    "test": "node --experimental-wasm-memory64 tests/run_tests.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

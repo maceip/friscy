@@ -28,5 +28,8 @@ Phase 1 exit criteria:
 - napi_create_string_utf8 + napi_get_value_string_utf8 round-trips
 - Handle scope create/destroy succeeds
 
+### Shim consolidation approach — LAYERED WITH MASTER INDEX
+Keep individual shim files but add a master index header (e.g. wasi-shims-index.h) that enforces strict inclusion order. Individual files are easier to debug and have clear ownership per subsystem. The master index becomes the single include point — simplicity of an uber-header without cramming everything into one file.
+
 ## Pending Questions
 (Will update as more questions come in)

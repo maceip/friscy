@@ -306,13 +306,14 @@ test('napi_create/delete_reference manages refs', () => {
 // ---- Error Handling ----
 console.log('\nError Handling:');
 
-test('napi_is_exception_pending returns false by default', () => {
+test('napi_is_exception_pending returns false when no exception', () => {
+  bridge.pendingException = null; // ensure clean state
   const resultPtr = 2600;
   imports.napi_is_exception_pending(0, resultPtr);
   assertEq(new Int32Array(memoryBuffer, resultPtr, 1)[0], 0);
 });
 
-test('napi_throw_error does not crash', () => {
+test('napi_throw_error sets pending exception', () => {
   const msgBytes = new TextEncoder().encode('test error');
   const msgView = new Uint8Array(memoryBuffer, 2700, msgBytes.length + 1);
   msgView.set(msgBytes);
@@ -320,6 +321,88 @@ test('napi_throw_error does not crash', () => {
 
   const status = imports.napi_throw_error(0, 0, 2700);
   assertEq(status, 0);
+
+  // Exception should now be pending
+  const pendingPtr = 2600;
+  imports.napi_is_exception_pending(0, pendingPtr);
+  assertEq(new Int32Array(memoryBuffer, pendingPtr, 1)[0], 1, 'exception should be pending');
+
+  // The pending exception should be an Error with the right message
+  assert(bridge.pendingException instanceof Error, 'should be Error instance');
+  assertEq(bridge.pendingException.message, 'test error');
+
+  // Clear it for subsequent tests
+  bridge.pendingException = null;
+});
+
+test('napi_throw_error preserves error code', () => {
+  // Write code "ERR_FAIL" to memory
+  const codeBytes = new TextEncoder().encode('ERR_FAIL');
+  const codeView = new Uint8Array(memoryBuffer, 2750, codeBytes.length + 1);
+  codeView.set(codeBytes);
+  codeView[codeBytes.length] = 0;
+
+  const msgBytes = new TextEncoder().encode('something failed');
+  const msgView = new Uint8Array(memoryBuffer, 2700, msgBytes.length + 1);
+  msgView.set(msgBytes);
+  msgView[msgBytes.length] = 0;
+
+  imports.napi_throw_error(0, 2750, 2700);
+  assertEq(bridge.pendingException.code, 'ERR_FAIL');
+  assertEq(bridge.pendingException.message, 'something failed');
+
+  bridge.pendingException = null;
+});
+
+test('napi_call_function stores exception on throw', () => {
+  const thrower = () => { throw new TypeError('call failed'); };
+  const fnHandle = bridge.createHandle(thrower);
+  const thisHandle = 0; // undefined
+
+  const status = imports.napi_call_function(0, thisHandle, fnHandle, 0, 0, 0);
+  assertEq(status, 10, 'should return NAPI_PENDING_EXCEPTION');
+
+  // Exception should be stored and retrievable
+  assert(bridge.pendingException instanceof TypeError, 'should preserve error type');
+  assertEq(bridge.pendingException.message, 'call failed');
+
+  // Verify napi_is_exception_pending reflects the state
+  const pendingPtr = 2600;
+  imports.napi_is_exception_pending(0, pendingPtr);
+  assertEq(new Int32Array(memoryBuffer, pendingPtr, 1)[0], 1);
+
+  bridge.pendingException = null;
+});
+
+test('napi_get_and_clear_last_exception retrieves and clears', () => {
+  // Set up a pending exception
+  bridge.pendingException = new Error('retrieve me');
+
+  const resultPtr = 2600;
+  const status = imports.napi_get_and_clear_last_exception(0, resultPtr);
+  assertEq(status, 0);
+
+  // Should have created a handle to the error
+  const handle = new Int32Array(memoryBuffer, resultPtr, 1)[0];
+  const err = bridge.getHandle(handle);
+  assert(err instanceof Error);
+  assertEq(err.message, 'retrieve me');
+
+  // Exception should now be cleared
+  assertEq(bridge.pendingException, null, 'exception should be cleared');
+
+  // Pending check should return false
+  const pendingPtr = 2604;
+  imports.napi_is_exception_pending(0, pendingPtr);
+  assertEq(new Int32Array(memoryBuffer, pendingPtr, 1)[0], 0);
+});
+
+test('napi_get_and_clear_last_exception returns undefined when no exception', () => {
+  bridge.pendingException = null;
+  const resultPtr = 2600;
+  imports.napi_get_and_clear_last_exception(0, resultPtr);
+  const handle = new Int32Array(memoryBuffer, resultPtr, 1)[0];
+  assertEq(handle, 0, 'should return undefined handle');
 });
 
 // ---- Memory Helpers ----

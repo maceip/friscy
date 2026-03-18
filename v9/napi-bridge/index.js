@@ -58,6 +58,9 @@ class NapiBridge {
 
     // Persistent pointers from Wasm → handle scope stack
     this.handleScopes = [[]];
+
+    // Exception state: stores the pending JS exception (if any)
+    this.pendingException = null;
   }
 
   // --- Handle Management ---
@@ -284,6 +287,7 @@ class NapiBridge {
           }
           return NAPI_OK;
         } catch (e) {
+          bridge.pendingException = e;
           return NAPI_PENDING_EXCEPTION;
         }
       },
@@ -345,12 +349,26 @@ class NapiBridge {
       napi_throw_error(env, codePtr, msgPtr) {
         const msg = bridge.readString(msgPtr,
           new Uint8Array(bridge.memory.buffer).indexOf(0, msgPtr) - msgPtr);
-        console.error(`[napi] Error: ${msg}`);
+        const code = codePtr ? bridge.readString(codePtr,
+          new Uint8Array(bridge.memory.buffer).indexOf(0, codePtr) - codePtr) : undefined;
+        const err = new Error(msg);
+        if (code) err.code = code;
+        bridge.pendingException = err;
         return NAPI_OK;
       },
 
       napi_is_exception_pending(env, resultPtr) {
-        bridge.writeI32(resultPtr, 0); // no exception pending
+        bridge.writeI32(resultPtr, bridge.pendingException !== null ? 1 : 0);
+        return NAPI_OK;
+      },
+
+      napi_get_and_clear_last_exception(env, resultPtr) {
+        if (bridge.pendingException !== null) {
+          bridge.writeI32(resultPtr, bridge.createHandle(bridge.pendingException));
+          bridge.pendingException = null;
+        } else {
+          bridge.writeI32(resultPtr, 0); // undefined
+        }
         return NAPI_OK;
       },
 

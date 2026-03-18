@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>v9 — EdgeJS Browser Runtime</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: #0d1117; color: #c9d1d9;
+      display: flex; flex-direction: column; height: 100vh;
+    }
+    header {
+      padding: 12px 16px; background: #161b22;
+      border-bottom: 1px solid #30363d;
+      display: flex; align-items: center; gap: 12px;
+    }
+    header h1 { font-size: 16px; font-weight: 600; }
+    header .status {
+      font-size: 12px; padding: 2px 8px; border-radius: 12px;
+      background: #1f6feb33; color: #58a6ff;
+    }
+    header .status.ready { background: #23863533; color: #3fb950; }
+    header .status.error { background: #f8514933; color: #f85149; }
+    #terminal {
+      flex: 1; overflow-y: auto; padding: 8px 16px;
+      font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+      font-size: 14px; line-height: 1.5; white-space: pre-wrap;
+    }
+    #terminal .stdout { color: #c9d1d9; }
+    #terminal .stderr { color: #f85149; }
+    #terminal .system { color: #8b949e; font-style: italic; }
+    #input-area {
+      padding: 8px 16px; background: #161b22;
+      border-top: 1px solid #30363d;
+      display: flex; gap: 8px;
+    }
+    #input-area input {
+      flex: 1; padding: 8px 12px;
+      background: #0d1117; color: #c9d1d9;
+      border: 1px solid #30363d; border-radius: 6px;
+      font-family: inherit; font-size: 14px;
+      outline: none;
+    }
+    #input-area input:focus { border-color: #58a6ff; }
+    #input-area button {
+      padding: 8px 16px; background: #238636; color: #fff;
+      border: none; border-radius: 6px; cursor: pointer;
+      font-size: 14px;
+    }
+    #input-area button:hover { background: #2ea043; }
+    #input-area button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .checks { font-size: 12px; display: flex; gap: 16px; }
+    .check { display: flex; align-items: center; gap: 4px; }
+    .check .ok { color: #3fb950; }
+    .check .fail { color: #f85149; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>v9</h1>
+    <span class="status" id="status">loading...</span>
+    <div class="checks" id="checks"></div>
+  </header>
+
+  <div id="terminal"></div>
+
+  <div id="input-area">
+    <input id="cmd" type="text" placeholder="Enter JavaScript..." autofocus
+           onkeydown="if(event.key==='Enter')runCmd()">
+    <button onclick="runCmd()" id="run-btn" disabled>Run</button>
+  </div>
+
+  <script type="module">
+    import { checkBrowserSupport } from '../napi-bridge/jspi-adapter.js';
+
+    const terminal = document.getElementById('terminal');
+    const status = document.getElementById('status');
+    const checks = document.getElementById('checks');
+    const cmdInput = document.getElementById('cmd');
+    const runBtn = document.getElementById('run-btn');
+
+    let edgeInstance = null;
+
+    // ---- Output helpers ----
+    function log(text, cls = 'stdout') {
+      const line = document.createElement('div');
+      line.className = cls;
+      line.textContent = text;
+      terminal.appendChild(line);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    window.runCmd = function() {
+      const code = cmdInput.value.trim();
+      if (!code) return;
+      cmdInput.value = '';
+
+      log(`> ${code}`, 'system');
+
+      if (edgeInstance) {
+        try {
+          const result = edgeInstance.eval(code);
+          if (result !== undefined) log(String(result));
+        } catch (e) {
+          log(`Error: ${e.message}`, 'stderr');
+        }
+      } else {
+        // Fallback: eval in browser context
+        try {
+          const result = eval(code);
+          if (result !== undefined) log(String(result));
+        } catch (e) {
+          log(`Error: ${e.message}`, 'stderr');
+        }
+      }
+    };
+
+    // ---- Browser capability checks ----
+    const { support, missing, ok } = checkBrowserSupport();
+
+    for (const [name, available] of Object.entries(support)) {
+      const el = document.createElement('span');
+      el.className = 'check';
+      el.innerHTML = `<span class="${available ? 'ok' : 'fail'}">${available ? '✓' : '✗'}</span> ${name}`;
+      checks.appendChild(el);
+    }
+
+    // ---- Initialize ----
+    async function init() {
+      log('v9 EdgeJS Browser Runtime', 'system');
+      log(`Browser support: ${ok ? 'all features available' : `missing: ${missing.join(', ')}`}`, 'system');
+
+      if (!ok) {
+        status.textContent = 'limited';
+        status.classList.add('error');
+        log('Some features may not work. JSPI requires Chrome 123+ with flags.', 'stderr');
+      }
+
+      try {
+        // Try to load EdgeJS Wasm module
+        const moduleUrl = './edgejs.js';
+        const response = await fetch(moduleUrl).catch(() => null);
+
+        if (response && response.ok) {
+          log('Loading EdgeJS runtime...', 'system');
+          const { initEdgeJS } = await import('../napi-bridge/index.js');
+          edgeInstance = await initEdgeJS({ moduleUrl });
+          status.textContent = 'ready';
+          status.classList.add('ready');
+          log('EdgeJS runtime loaded successfully.', 'system');
+        } else {
+          log('EdgeJS .wasm not found. Running in eval-only mode.', 'system');
+          log('Build with: make build', 'system');
+          status.textContent = 'eval mode';
+          status.classList.add('ready');
+        }
+
+        runBtn.disabled = false;
+        cmdInput.focus();
+      } catch (e) {
+        log(`Init error: ${e.message}`, 'stderr');
+        status.textContent = 'error';
+        status.classList.add('error');
+        runBtn.disabled = false; // Still allow eval mode
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

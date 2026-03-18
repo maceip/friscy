@@ -1,0 +1,97 @@
+# EdgeJS CMake patch for Emscripten build
+#
+# Apply with:
+#   cd edgejs-src && git apply ../patches/edgejs-emscripten.patch
+#
+# This patch:
+# 1. Adds Emscripten as a platform target alongside WASIX
+# 2. Force-includes wasi-all-fixes.h into every compilation unit
+# 3. Configures JSPI-based async I/O
+# 4. Disables V8 JIT (browser provides JS engine)
+# 5. Links against Emscripten's pthreads + JSPI
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -0,0 +1,80 @@
++# --- Emscripten platform additions for EdgeJS ---
++# Append to existing CMakeLists.txt or use as overlay
++
++if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
++    message(STATUS "EdgeJS: Configuring for Emscripten/Browser target")
++
++    # Force-include WASI shims (same pattern as node-wasix32's common.gypi)
++    if(DEFINED EDGE_EXTRA_INCLUDES)
++        set(WASI_SHIMS_DIR "${EDGE_EXTRA_INCLUDES}")
++        add_compile_options(
++            -include "${WASI_SHIMS_DIR}/wasi-all-fixes.h"
++        )
++        include_directories(SYSTEM "${WASI_SHIMS_DIR}")
++        message(STATUS "  WASI shims: ${WASI_SHIMS_DIR}")
++    endif()
++
++    # Platform defines
++    add_definitions(
++        -DEDGE_PLATFORM_EMSCRIPTEN=1
++        -DEDGE_NAPI_PROVIDER_IMPORTS=1
++        -DV8_JITLESS=1
++        -DV8_USING_WASI_SHIMS=1
++    )
++
++    # Compiler flags
++    add_compile_options(
++        -pthread
++        -msimd128
++        -mbulk-memory
++        -matomics
++        -fwasm-exceptions
++    )
++
++    # C++ standard
++    set(CMAKE_CXX_STANDARD 20)
++    set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++    # Linker flags for Emscripten
++    set(EMSCRIPTEN_LINK_FLAGS
++        "-sALLOW_MEMORY_GROWTH=1"
++        "-sMAXIMUM_MEMORY=4GB"
++        "-sINITIAL_MEMORY=128MB"
++        "-sSTACK_SIZE=8MB"
++        "-sSHARED_MEMORY=1"
++        "-pthread"
++        "-sJSPI=1"
++        "-sMODULARIZE=1"
++        "-sEXPORT_NAME='EdgeJSModule'"
++        "-sFILESYSTEM=1"
++        "-sFORCE_FILESYSTEM=1"
++        "-sERROR_ON_UNDEFINED_SYMBOLS=0"
++        "-sALLOW_UNIMPLEMENTED_SYSCALLS=1"
++        "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_napi_module_register','_edge_napi_init']"
++        "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','HEAPU8','HEAP32']"
++    )
++    string(JOIN " " EMSCRIPTEN_LINK_FLAGS_STR ${EMSCRIPTEN_LINK_FLAGS})
++    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${EMSCRIPTEN_LINK_FLAGS_STR}")
++
++    # Disable components that don't apply in browser mode
++    set(EDGE_ENABLE_INSPECTOR OFF CACHE BOOL "No inspector in browser" FORCE)
++    set(EDGE_ENABLE_DTRACE OFF CACHE BOOL "No DTrace in browser" FORCE)
++
++    # Use Emscripten's OpenSSL/BoringSSL port or stub
++    if(NOT DEFINED EDGE_OPENSSL_DIR)
++        # Emscripten has a port: -sUSE_OPENSSL=1
++        # But we may need to use a custom build for TLS via WebTransport
++        message(STATUS "  OpenSSL: Using Emscripten port or WebTransport proxy")
++    endif()
++
++    # Output naming
++    set(CMAKE_EXECUTABLE_SUFFIX ".js")
++    set_target_properties(edgejs PROPERTIES
++        OUTPUT_NAME "edgejs"
++        SUFFIX ".js"
++    )
++
++    message(STATUS "EdgeJS Emscripten configuration complete")
++    message(STATUS "  JSPI: enabled (-sJSPI=1)")
++    message(STATUS "  Threads: enabled (-pthread, SharedArrayBuffer)")
++    message(STATUS "  Memory: 128MB initial, 4GB max, growable")
++    message(STATUS "  SIMD: enabled (-msimd128)")
++endif()

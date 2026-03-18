@@ -1,0 +1,25 @@
+# Build outputs
+build/
+dist/edgejs.wasm
+dist/edgejs.js
+dist/edgejs.worker.js
+dist/*.wasm.gz
+dist/*.wasm.br
+
+# EdgeJS source (cloned separately)
+edgejs-src/
+!edgejs-src/.gitkeep
+
+# node-wasix32 reference (cloned separately)
+.node-wasix32/
+
+# Emscripten cache
+.emscripten_cache/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+*.swp
+*~

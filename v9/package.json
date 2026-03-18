@@ -1,0 +1,27 @@
+{
+  "name": "@aspect/v9-edgejs-browser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EdgeJS browser runtime — Node.js in WebAssembly via Emscripten",
+  "type": "module",
+  "main": "napi-bridge/index.js",
+  "exports": {
+    ".": "./napi-bridge/index.js",
+    "./napi-bridge": "./napi-bridge/index.js",
+    "./dist/edgejs.js": "./dist/edgejs.js"
+  },
+  "scripts": {
+    "test": "node tests/test-basic.mjs && node tests/test-napi-bridge.mjs",
+    "test:basic": "node tests/test-basic.mjs",
+    "test:napi": "node tests/test-napi-bridge.mjs",
+    "build": "bash build-emscripten.sh",
+    "build:debug": "bash build-emscripten.sh --debug",
+    "lint": "make lint",
+    "size": "make size",
+    "clean": "make clean"
+  },
+  "keywords": ["wasm", "emscripten", "nodejs", "browser", "edgejs", "napi"],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

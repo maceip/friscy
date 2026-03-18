@@ -1,5 +1,5 @@
+// Adapted from Multi-V-VM/node-wasix32 for EdgeJS Emscripten build
 // Master index of all WASI/Emscripten shim headers.
-// Adapted from Multi-V-VM/node-wasix32 for EdgeJS Emscripten build.
 //
 // Include order matters. The primary entry point is wasi-all-fixes.h,
 // which is force-included into every compilation unit via:
@@ -9,6 +9,8 @@
 
 #ifndef WASI_SHIMS_INDEX_H_
 #define WASI_SHIMS_INDEX_H_
+
+#if defined(__wasi__) || defined(__EMSCRIPTEN__)
 
 // ======== Layer 0: Minimal / Foundational ========
 #include "wasi-minimal-fixes.h"              // kSystemPointerSize
@@ -84,4 +86,5 @@
 // wasi-all-fixes.h includes a subset of the above in the correct order
 // and is the primary entry point for force-include mode.
 
+#endif  // defined(__wasi__) || defined(__EMSCRIPTEN__)
 #endif  // WASI_SHIMS_INDEX_H_
